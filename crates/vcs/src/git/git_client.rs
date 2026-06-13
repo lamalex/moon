@@ -741,7 +741,9 @@ impl Vcs for Git {
         self.worktree.type_of == GitTreeType::Worktree
     }
 
-    async fn setup_hooks(&self) -> miette::Result<Option<VcsHookEnvironment>> {
+    async fn setup_hooks(&self, hooks: &[String]) -> miette::Result<Option<VcsHookEnvironment>> {
+        validate_git_hooks(hooks)?;
+
         let mut env = VcsHookEnvironment {
             // The working directory is the worktree root, not the workspace root
             working_dir: self.worktree.work_dir.clone(),
@@ -797,7 +799,7 @@ impl Vcs for Git {
         Ok(Some(env))
     }
 
-    async fn teardown_hooks(&self) -> miette::Result<()> {
+    async fn teardown_hooks(&self, _hooks: &[String]) -> miette::Result<()> {
         // Unsetting a config key that doesn't exist errors,
         // so only unset when it has actually been set
         if self
@@ -816,5 +818,54 @@ impl Vcs for Git {
         }
 
         Ok(())
+    }
+}
+
+const GIT_HOOKS: &[&str] = &[
+    "applypatch-msg",
+    "commit-msg",
+    "p4-changelist",
+    "p4-post-changelist",
+    "p4-pre-submit",
+    "p4-prepare-changelist",
+    "post-applypatch",
+    "post-checkout",
+    "post-commit",
+    "post-index-change",
+    "post-merge",
+    "post-receive",
+    "post-rewrite",
+    "post-update",
+    "pre-applypatch",
+    "pre-auto-gc",
+    "pre-commit",
+    "pre-merge-commit",
+    "pre-push",
+    "pre-rebase",
+    "pre-receive",
+    "prepare-commit-msg",
+    "proc-receive",
+    "push-to-checkout",
+    "reference-transaction",
+    "sendemail-validate",
+    "update",
+];
+
+fn validate_git_hooks(hooks: &[String]) -> miette::Result<()> {
+    let mut unsupported = hooks
+        .iter()
+        .filter(|hook| !GIT_HOOKS.contains(&hook.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    unsupported.sort();
+    unsupported.dedup();
+
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(miette::miette!(
+            "Git does not support the following hooks: {}",
+            unsupported.join(", ")
+        ))
     }
 }
