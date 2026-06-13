@@ -9,8 +9,13 @@ init:
 build:
 	cargo build --workspace
 
+build-vcs-git:
+	cd wasm && cargo build --package vcs_git --target wasm32-wasip1 --release
+	cp wasm/target/wasm32-wasip1/release/vcs_git.wasm crates/vcs-plugin/res/vcs_git.wasm
+
 build-wasm:
 	cd wasm && cargo build --workspace --target wasm32-wasip1 --release
+	cp wasm/target/wasm32-wasip1/release/vcs_git.wasm crates/vcs-plugin/res/vcs_git.wasm
 
 # CHECKING
 
