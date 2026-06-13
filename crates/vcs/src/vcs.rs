@@ -97,12 +97,12 @@ pub trait Vcs: Debug {
     }
 
     /// Setup the hooks environment and return an absolute path to the hooks directory, when applicable.
-    async fn setup_hooks(&self) -> miette::Result<Option<VcsHookEnvironment>> {
+    async fn setup_hooks(&self, _hooks: &[String]) -> miette::Result<Option<VcsHookEnvironment>> {
         Ok(None)
     }
 
     /// Teardown the hooks environment when applicable.
-    async fn teardown_hooks(&self) -> miette::Result<()> {
+    async fn teardown_hooks(&self, _hooks: &[String]) -> miette::Result<()> {
         Ok(())
     }
 }

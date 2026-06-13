@@ -16,6 +16,7 @@ serde_json = { workspace = true }
 starbase_utils = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+version_spec = { workspace = true }
 warpgate = { workspace = true }
 
 [dev-dependencies]
