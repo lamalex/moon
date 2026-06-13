@@ -1885,6 +1885,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vcs_jj"
+version = "0.0.0"
+dependencies = [
+ "extism-pdk",
+ "moon_pdk",
+ "moon_pdk_api",
+]
+
+[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
