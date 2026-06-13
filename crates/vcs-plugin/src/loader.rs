@@ -8,7 +8,7 @@ use starbase_utils::hash;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 use warpgate::{DataLocator, Id};
 
 const USER_CONFIG_FILE: &str = "vcs.json";
@@ -24,6 +24,11 @@ impl PluginsConfig for VcsPluginsConfig {
     fn get_locator(&self, _id: &Id) -> Option<&PluginLocator> {
         None
     }
+}
+
+enum ProviderActivation {
+    NotDetected { reason: String },
+    Activated(BoxedVcs),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -59,6 +64,25 @@ pub async fn load_vcs_adapter(
     baseline: &str,
     remote_candidates: &[String],
 ) -> miette::Result<BoxedVcs> {
+    load_vcs_adapter_with_jj_plugin(
+        host_data,
+        working_dir,
+        workspace_root,
+        baseline,
+        remote_candidates,
+        None,
+    )
+    .await
+}
+
+async fn load_vcs_adapter_with_jj_plugin(
+    host_data: MoonHostData,
+    working_dir: &Path,
+    workspace_root: &Path,
+    baseline: &str,
+    remote_candidates: &[String],
+    jj_plugin_override: Option<miette::Result<Arc<VcsPlugin>>>,
+) -> miette::Result<BoxedVcs> {
     let config_path = get_user_vcs_config_path(&host_data);
     let config = load_user_vcs_config(&config_path)?;
 
@@ -70,19 +94,83 @@ pub async fn load_vcs_adapter(
             &config.sha256,
         )
         .await?;
+        let plugin_id = plugin.id.clone();
+        let plugin_name = plugin.metadata.name.clone();
 
-        return activate_provider(
+        return match activate_provider(
             plugin,
             working_dir,
             workspace_root,
             baseline,
             remote_candidates,
-            true,
         )
-        .await;
+        .await?
+        {
+            ProviderActivation::Activated(adapter) => Ok(adapter),
+            ProviderActivation::NotDetected { reason } => Err(miette::miette!(
+                "configured VCS provider `{plugin_id}` ({plugin_name}) is not active: {reason}"
+            )),
+        };
     }
 
-    if !Git::is_repository(workspace_root) {
+    let is_git_repository = Git::is_repository(workspace_root);
+
+    if is_jj_workspace(workspace_root) {
+        let jj_plugin = match jj_plugin_override {
+            Some(plugin) => plugin,
+            None => {
+                load_bundled_vcs_plugin(
+                    host_data.clone(),
+                    "jj",
+                    "data://vcs_jj",
+                    include_bytes!("../res/vcs_jj.wasm"),
+                )
+                .await
+            }
+        };
+
+        match jj_plugin {
+            Ok(plugin) => match activate_provider(
+                plugin,
+                working_dir,
+                workspace_root,
+                baseline,
+                remote_candidates,
+            )
+            .await
+            {
+                Ok(ProviderActivation::Activated(adapter)) => return Ok(adapter),
+                Ok(ProviderActivation::NotDetected { reason }) if !is_git_repository => {
+                    return Err(miette::miette!(
+                        "detected a Jujutsu workspace, but the bundled Jujutsu provider was not active: {reason}"
+                    ));
+                }
+                Ok(ProviderActivation::NotDetected { reason }) => {
+                    warn!(%reason, "Jujutsu provider was not active, falling back to Git");
+                }
+                Err(error) if is_git_repository => {
+                    warn!(
+                        error = %error,
+                        "Jujutsu provider activation failed, falling back to Git"
+                    );
+                }
+                Err(error) => return Err(error),
+            },
+            Err(error) if is_git_repository => {
+                warn!(
+                    error = %error,
+                    "Jujutsu provider failed to load, falling back to Git"
+                );
+            }
+            Err(error) => {
+                return Err(miette::miette!(
+                    "detected a Jujutsu workspace, but the bundled Jujutsu provider failed to load: {error}"
+                ));
+            }
+        }
+    }
+
+    if !is_git_repository {
         return Ok(Box::new(Git::load(
             workspace_root,
             baseline,
@@ -90,17 +178,34 @@ pub async fn load_vcs_adapter(
         )?));
     }
 
-    let plugin = load_bundled_git_plugin(host_data).await?;
+    let plugin = load_bundled_vcs_plugin(
+        host_data,
+        "git",
+        "data://vcs_git",
+        include_bytes!("../res/vcs_git.wasm"),
+    )
+    .await?;
 
-    activate_provider(
+    match activate_provider(
         plugin,
         working_dir,
         workspace_root,
         baseline,
         remote_candidates,
-        false,
     )
-    .await
+    .await?
+    {
+        ProviderActivation::Activated(adapter) => Ok(adapter),
+        ProviderActivation::NotDetected { reason } => Err(miette::miette!(
+            "bundled Git provider did not detect the repository: {reason}"
+        )),
+    }
+}
+
+fn is_jj_workspace(workspace_root: &Path) -> bool {
+    workspace_root
+        .ancestors()
+        .any(|directory| directory.join(".jj").exists())
 }
 
 async fn activate_provider(
@@ -109,8 +214,7 @@ async fn activate_provider(
     workspace_root: &Path,
     baseline: &str,
     remote_candidates: &[String],
-    require_active: bool,
-) -> miette::Result<BoxedVcs> {
+) -> miette::Result<ProviderActivation> {
     let context = MoonContext {
         // VCS guests have no filesystem access, so preserve native paths for
         // root discovery while the host independently confines command cwd.
@@ -118,7 +222,6 @@ async fn activate_provider(
         workspace_root: VirtualPath::new(workspace_root),
     };
     let provider_name = plugin.metadata.name.clone();
-    let plugin_id = plugin.id.clone();
     let initialization = plugin
         .initialize(InitializeVcsInput {
             baseline: Some(baseline.to_owned()),
@@ -128,25 +231,19 @@ async fn activate_provider(
         .await?;
     let plugin = match initialization {
         VcsPluginInitialization::NotDetected { reason } => {
-            let label = if require_active {
-                "configured VCS provider"
-            } else {
-                "VCS provider"
-            };
-
-            return Err(miette::miette!(
-                "{label} `{plugin_id}` ({provider_name}) is not active: {reason}"
-            ));
+            return Ok(ProviderActivation::NotDetected { reason });
         }
         VcsPluginInitialization::Initialized(plugin) => plugin,
     };
 
     debug!(plugin = provider_name, "Activated source-control provider");
 
-    Ok(Box::new(VcsPluginAdapter::new(
-        baseline.to_owned(),
-        WorkspaceFiles::new(workspace_root)?,
-        plugin,
+    Ok(ProviderActivation::Activated(Box::new(
+        VcsPluginAdapter::new(
+            baseline.to_owned(),
+            WorkspaceFiles::new(workspace_root)?,
+            plugin,
+        ),
     )))
 }
 
@@ -166,7 +263,13 @@ pub async fn load_verified_vcs_plugin(
         .await
 }
 
-async fn load_bundled_git_plugin(host_data: MoonHostData) -> miette::Result<Arc<VcsPlugin>> {
+async fn load_bundled_vcs_plugin(
+    host_data: MoonHostData,
+    id: &str,
+    data_url: &str,
+    bytes: &[u8],
+) -> miette::Result<Arc<VcsPlugin>> {
+    let expected_sha256 = hash::sha256::from_bytes(bytes);
     let mut moon_env = (*host_data.moon_env).clone();
     let cache_root = std::env::temp_dir().join("moon-vcs-plugins");
     moon_env.plugins_dir = cache_root.join("plugins");
@@ -177,11 +280,15 @@ async fn load_bundled_git_plugin(host_data: MoonHostData) -> miette::Result<Arc<
     };
     let registry = PluginRegistry::new(PluginType::Vcs, host_data, VcsPluginsConfig)?;
     let locator = PluginLocator::Data(Box::new(DataLocator {
-        data: "data://vcs_git".into(),
-        bytes: Some(include_bytes!("../res/vcs_git.wasm").to_vec()),
+        data: data_url.into(),
+        bytes: Some(bytes.to_vec()),
     }));
 
-    registry.load_without_config(Id::raw("git"), locator).await
+    registry
+        .load_verified_without_config(Id::raw(id), locator, move |wasm_file, bytes| {
+            verify_sha256(wasm_file, bytes, &expected_sha256)
+        })
+        .await
 }
 
 fn verify_sha256(wasm_file: &Path, bytes: &[u8], expected: &str) -> miette::Result<()> {
@@ -237,6 +344,7 @@ mod tests {
     use moon_plugin::{MoonEnvironment, ProtoEnvironment};
     use moon_vcs::ChangedStatus;
     use starbase_sandbox::create_empty_sandbox;
+    use std::collections::BTreeMap;
     use std::process::Command;
     use std::sync::Arc;
     use warpgate::FileLocator;
@@ -383,6 +491,81 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
+    fn require_jj() {
+        let output = Command::new("jj")
+            .arg("--version")
+            .output()
+            .expect("Jujutsu must be installed to run VCS provider tests");
+        assert!(
+            output.status.success(),
+            "Jujutsu failed to report its version"
+        );
+    }
+
+    fn run_jj(repository: &Path, args: &[&str]) -> String {
+        let output = Command::new("jj")
+            .args(args)
+            .current_dir(repository)
+            .env("JJ_CONFIG", "")
+            .env("NO_COLOR", "1")
+            .env("PAGER", "")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "jj failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn create_jj_repository(colocated: bool) -> starbase_sandbox::Sandbox {
+        require_jj();
+        let sandbox = create_empty_sandbox();
+        let mode = if colocated {
+            "--colocate"
+        } else {
+            "--no-colocate"
+        };
+        run_jj(sandbox.path(), &["git", "init", mode, "."]);
+        sandbox
+    }
+
+    async fn initialize_jj_plugin(
+        repository_root: &Path,
+        workspace_root: &Path,
+        baseline: &str,
+    ) -> Arc<crate::InitializedVcsPlugin> {
+        let plugin = load_bundled_vcs_plugin(
+            create_nested_host_data(repository_root, workspace_root),
+            "jj",
+            "data://vcs_jj",
+            include_bytes!("../res/vcs_jj.wasm"),
+        )
+        .await
+        .unwrap();
+        let context = MoonContext {
+            working_dir: plugin.to_virtual_path(workspace_root),
+            workspace_root: plugin.to_virtual_path(workspace_root),
+        };
+
+        match plugin
+            .initialize(InitializeVcsInput {
+                baseline: Some(baseline.into()),
+                remote_candidates: vec![],
+                context,
+            })
+            .await
+            .unwrap()
+        {
+            VcsPluginInitialization::Initialized(plugin) => plugin,
+            VcsPluginInitialization::NotDetected { reason } => {
+                panic!("Jujutsu provider was not detected: {reason}")
+            }
+        }
+    }
+
     #[test]
     fn loads_valid_user_config() {
         let sandbox = create_empty_sandbox();
@@ -416,6 +599,32 @@ mod tests {
         fs::write(&config_file, serde_json::to_string(&config).unwrap()).unwrap();
 
         assert!(load_user_vcs_config(&config_file).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bundled_provider_rejects_a_poisoned_shared_cache_entry() {
+        let id = "poisoned-bundled-git";
+        let bytes = include_bytes!("../res/vcs_git.wasm");
+        let digest = hash::sha256::from_bytes(bytes);
+        let cache_file = std::env::temp_dir()
+            .join("moon-vcs-plugins/plugins/vcs")
+            .join(format!("{id}-{digest}.wasm"));
+        fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
+        fs::write(&cache_file, b"attacker-controlled wasm").unwrap();
+        let sandbox = create_empty_sandbox();
+
+        let error = load_bundled_vcs_plugin(
+            create_host_data(sandbox.path()),
+            id,
+            "data://poisoned_bundled_git",
+            bytes,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        let _ = fs::remove_file(cache_file);
+        assert!(error.contains("integrity check failed"), "{error}");
     }
 
     #[test]
@@ -595,11 +804,452 @@ exit 1
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn plugin_instance_initializes_only_once() {
+    async fn bundled_jj_provider_supplies_complete_source_control() {
+        require_jj();
+
         let sandbox = create_git_repository();
-        let plugin = load_bundled_git_plugin(create_host_data(sandbox.path()))
+        sandbox.run_git(|command| {
+            command.args(["checkout", "-b", "feature"]);
+        });
+        sandbox.create_file("feature.txt", "feature");
+        sandbox.run_git(|command| {
+            command.args(["add", "."]);
+        });
+        sandbox.run_git(|command| {
+            command.args([
+                "-c",
+                "user.name=Moon",
+                "-c",
+                "user.email=moon@example.com",
+                "commit",
+                "-m",
+                "feature",
+            ]);
+        });
+        sandbox.run_git(|command| {
+            command.args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/moonrepo/moon.git",
+            ]);
+        });
+        sandbox.run_git(|command| {
+            command.args(["update-ref", "refs/remotes/origin/master", "master"]);
+        });
+        sandbox.run_git(|command| {
+            command.args(["branch", "-D", "master"]);
+        });
+        run_jj(sandbox.path(), &["git", "init", "--colocate", "."]);
+        sandbox.create_file("working.txt", "working");
+
+        let plugin = load_bundled_vcs_plugin(
+            create_host_data(sandbox.path()),
+            "jj",
+            "data://vcs_jj",
+            include_bytes!("../res/vcs_jj.wasm"),
+        )
+        .await
+        .unwrap();
+        let duplicate = Arc::clone(&plugin);
+        let context = MoonContext {
+            working_dir: plugin.to_virtual_path(sandbox.path()),
+            workspace_root: plugin.to_virtual_path(sandbox.path()),
+        };
+        let input = InitializeVcsInput {
+            baseline: Some("master".into()),
+            remote_candidates: vec!["origin".into()],
+            context,
+        };
+        let VcsPluginInitialization::Initialized(plugin) =
+            plugin.initialize(input.clone()).await.unwrap()
+        else {
+            panic!("Jujutsu provider was not detected");
+        };
+        let initialization = plugin.initialization();
+        assert_eq!(initialization.client.as_str(), "jj");
+        assert_ne!(initialization.current.id, initialization.recorded.id);
+        assert!(initialization.baseline.is_some());
+        assert_eq!(
+            initialization.repository_slug.as_deref(),
+            Some("moonrepo/moon")
+        );
+        let baseline = initialization
+            .baseline
+            .as_ref()
+            .unwrap()
+            .id
+            .clone()
+            .unwrap();
+
+        let working = plugin
+            .get_impacts(moon_pdk_api::VcsImpactIntent::Working)
             .await
             .unwrap();
+        let submission = plugin
+            .get_impacts(moon_pdk_api::VcsImpactIntent::Submission {
+                base: Some(baseline.clone()),
+                head: None,
+                include_working: true,
+            })
+            .await
+            .unwrap();
+        let recorded = plugin
+            .get_impacts(moon_pdk_api::VcsImpactIntent::Submission {
+                base: Some(baseline.clone()),
+                head: None,
+                include_working: false,
+            })
+            .await
+            .unwrap();
+
+        assert!(working.changes.contains_key(Path::new("working.txt")));
+        assert!(submission.changes.contains_key(Path::new("feature.txt")));
+        assert!(submission.changes.contains_key(Path::new("working.txt")));
+        assert!(recorded.changes.contains_key(Path::new("feature.txt")));
+        assert!(!recorded.changes.contains_key(Path::new("working.txt")));
+
+        sandbox.create_file("after-initialization.txt", "later");
+        let pinned = plugin
+            .get_impacts(moon_pdk_api::VcsImpactIntent::Submission {
+                base: Some(baseline),
+                head: initialization.current.id.clone(),
+                include_working: true,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !pinned
+                .changes
+                .contains_key(Path::new("after-initialization.txt"))
+        );
+        assert!(duplicate.initialize(input).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn production_loader_prefers_jj_for_a_colocated_repository() {
+        require_jj();
+
+        let sandbox = create_git_repository();
+        run_jj(sandbox.path(), &["git", "init", "--colocate", "."]);
+        let jj_revision = run_jj(
+            sandbox.path(),
+            &["log", "--no-graph", "-r", "@", "-T", "commit_id"],
+        );
+        let git_revision = git_output(sandbox.path(), &["rev-parse", "HEAD"]);
+        assert_ne!(jj_revision, git_revision);
+
+        let adapter = load_vcs_adapter(
+            create_host_data(sandbox.path()),
+            sandbox.path(),
+            sandbox.path(),
+            "master",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            adapter.get_local_branch_revision().await.unwrap().as_str(),
+            jj_revision
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn production_loader_falls_back_to_git_when_jj_fails_to_load() {
+        let sandbox = create_git_repository();
+        fs::create_dir(sandbox.path().join(".jj")).unwrap();
+        let git_revision = git_output(sandbox.path(), &["rev-parse", "HEAD"]);
+        let adapter = load_vcs_adapter_with_jj_plugin(
+            create_host_data(sandbox.path()),
+            sandbox.path(),
+            sandbox.path(),
+            "master",
+            &[],
+            Some(Err(miette::miette!(
+                "unable to resolve executable `jj` for process capability `jj`"
+            ))),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            adapter.get_local_branch_revision().await.unwrap().as_str(),
+            git_revision
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn production_loader_reports_jj_load_failures_without_git() {
+        let sandbox = create_empty_sandbox();
+        fs::create_dir(sandbox.path().join(".jj")).unwrap();
+        let error = load_vcs_adapter_with_jj_plugin(
+            create_host_data(sandbox.path()),
+            sandbox.path(),
+            sandbox.path(),
+            "master",
+            &[],
+            Some(Err(miette::miette!(
+                "unable to resolve executable `jj` for process capability `jj`"
+            ))),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("detected a Jujutsu workspace"), "{error}");
+        assert!(
+            error.contains("unable to resolve executable `jj`"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn production_loader_supports_a_non_colocated_jj_repository() {
+        let sandbox = create_jj_repository(false);
+        sandbox.create_file("working.txt", "working");
+        assert!(!sandbox.path().join(".git").exists());
+
+        let adapter = load_vcs_adapter(
+            create_host_data(sandbox.path()),
+            sandbox.path(),
+            sandbox.path(),
+            "master",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert!(adapter.is_enabled());
+        assert_eq!(
+            adapter.get_repository_root().unwrap(),
+            sandbox.path().canonicalize().unwrap()
+        );
+        assert_eq!(
+            adapter.get_working_root().unwrap(),
+            sandbox.path().canonicalize().unwrap()
+        );
+        assert!(
+            adapter
+                .get_changed_files()
+                .await
+                .unwrap()
+                .files
+                .contains_key(&WorkspaceRelativePathBuf::from("working.txt"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bundled_jj_provider_scopes_changes_to_a_nested_workspace() {
+        let sandbox = create_jj_repository(false);
+        sandbox.create_file("outside.txt", "base outside");
+        sandbox.create_file("workspace/inside.txt", "base inside");
+        run_jj(sandbox.path(), &["describe", "-m", "base"]);
+        run_jj(sandbox.path(), &["bookmark", "create", "master", "-r", "@"]);
+        run_jj(sandbox.path(), &["new", "master", "-m", "working"]);
+        sandbox.create_file("outside.txt", "changed outside");
+        sandbox.create_file("workspace/inside.txt", "changed inside");
+
+        let plugin =
+            initialize_jj_plugin(sandbox.path(), &sandbox.path().join("workspace"), "master").await;
+        let impacts = plugin
+            .get_impacts(moon_pdk_api::VcsImpactIntent::Working)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            impacts.changes,
+            BTreeMap::from([(
+                PathBuf::from("inside.txt"),
+                moon_pdk_api::VcsChangeMask::MODIFIED | moon_pdk_api::VcsChangeMask::WORKING,
+            )])
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bundled_jj_provider_supports_nested_non_colocated_submission_impacts() {
+        let sandbox = create_jj_repository(false);
+        sandbox.create_file("outside.txt", "base outside");
+        sandbox.create_file("workspace/inside.txt", "base inside");
+        run_jj(sandbox.path(), &["describe", "-m", "base"]);
+        run_jj(sandbox.path(), &["bookmark", "create", "master", "-r", "@"]);
+        run_jj(sandbox.path(), &["new", "master", "-m", "recorded"]);
+        sandbox.create_file("outside-recorded.txt", "outside");
+        sandbox.create_file("workspace/recorded.txt", "inside");
+        run_jj(sandbox.path(), &["new", "@", "-m", "working"]);
+
+        let plugin =
+            initialize_jj_plugin(sandbox.path(), &sandbox.path().join("workspace"), "master").await;
+        let baseline = plugin
+            .initialization()
+            .baseline
+            .as_ref()
+            .and_then(|state| state.id.clone())
+            .unwrap();
+
+        assert_eq!(
+            plugin.initialization().history,
+            moon_pdk_api::VcsHistoryCompleteness::Complete
+        );
+
+        let impacts = plugin
+            .get_impacts(moon_pdk_api::VcsImpactIntent::Submission {
+                base: Some(baseline),
+                head: None,
+                include_working: false,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            impacts.completeness,
+            moon_pdk_api::VcsImpactCompleteness::Exact
+        );
+        assert!(impacts.changes.contains_key(Path::new("recorded.txt")));
+        assert!(
+            !impacts
+                .changes
+                .contains_key(Path::new("outside-recorded.txt"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bundled_jj_provider_tolerates_a_missing_baseline() {
+        let sandbox = create_jj_repository(false);
+        sandbox.create_file("working.txt", "working");
+        let plugin = initialize_jj_plugin(sandbox.path(), sandbox.path(), "not-fetched").await;
+
+        assert!(plugin.initialization().baseline.is_none());
+        assert_eq!(
+            plugin
+                .get_impacts(moon_pdk_api::VcsImpactIntent::Working)
+                .await
+                .unwrap()
+                .changes[Path::new("working.txt")],
+            moon_pdk_api::VcsChangeMask::ADDED | moon_pdk_api::VcsChangeMask::WORKING
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bundled_jj_provider_synthesizes_recorded_state_for_merge_parents() {
+        let sandbox = create_jj_repository(false);
+        sandbox.create_file("base.txt", "base");
+        run_jj(sandbox.path(), &["describe", "-m", "base"]);
+        run_jj(sandbox.path(), &["bookmark", "create", "master", "-r", "@"]);
+
+        run_jj(sandbox.path(), &["new", "master", "-m", "left"]);
+        sandbox.create_file("left.txt", "left");
+        run_jj(sandbox.path(), &["bookmark", "create", "left", "-r", "@"]);
+
+        run_jj(sandbox.path(), &["new", "master", "-m", "right"]);
+        sandbox.create_file("right.txt", "right");
+        run_jj(sandbox.path(), &["bookmark", "create", "right", "-r", "@"]);
+
+        run_jj(
+            sandbox.path(),
+            &["new", "left", "right", "-m", "merge-working"],
+        );
+        sandbox.create_file("merge-only.txt", "merge");
+        let operation_before = run_jj(
+            sandbox.path(),
+            &["op", "log", "--no-graph", "-n", "1", "-T", "id"],
+        );
+
+        let plugin = initialize_jj_plugin(sandbox.path(), sandbox.path(), "master").await;
+        assert_ne!(
+            plugin.initialization().current.id,
+            plugin.initialization().recorded.id
+        );
+        assert!(plugin.initialization().recorded.label.is_none());
+
+        let working = plugin
+            .get_impacts(moon_pdk_api::VcsImpactIntent::Working)
+            .await
+            .unwrap();
+        assert_eq!(
+            working.changes[Path::new("merge-only.txt")],
+            moon_pdk_api::VcsChangeMask::ADDED | moon_pdk_api::VcsChangeMask::WORKING
+        );
+
+        let recorded = plugin
+            .get_impacts(moon_pdk_api::VcsImpactIntent::Submission {
+                base: Some("master".into()),
+                head: None,
+                include_working: false,
+            })
+            .await
+            .unwrap();
+        for path in ["left.txt", "right.txt"] {
+            assert_eq!(
+                recorded.changes[Path::new(path)],
+                moon_pdk_api::VcsChangeMask::ADDED | moon_pdk_api::VcsChangeMask::RECORDED
+            );
+        }
+        assert!(!recorded.changes.contains_key(Path::new("merge-only.txt")));
+        assert_eq!(
+            run_jj(
+                sandbox.path(),
+                &["op", "log", "--no-graph", "-n", "1", "-T", "id"]
+            ),
+            operation_before
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bundled_jj_provider_reports_actual_rename_and_copy_impacts() {
+        let sandbox = create_jj_repository(false);
+        sandbox.create_file("old.txt", "rename source");
+        sandbox.create_file("source.txt", "copy source");
+        run_jj(sandbox.path(), &["describe", "-m", "base"]);
+        run_jj(sandbox.path(), &["bookmark", "create", "master", "-r", "@"]);
+        run_jj(sandbox.path(), &["new", "master", "-m", "changes"]);
+        fs::rename(
+            sandbox.path().join("old.txt"),
+            sandbox.path().join("renamed.txt"),
+        )
+        .unwrap();
+        fs::copy(
+            sandbox.path().join("source.txt"),
+            sandbox.path().join("copied.txt"),
+        )
+        .unwrap();
+        run_jj(sandbox.path(), &["describe", "-m", "rename-and-copy"]);
+        run_jj(sandbox.path(), &["new", "-m", "working"]);
+
+        let plugin = initialize_jj_plugin(sandbox.path(), sandbox.path(), "master").await;
+        let impacts = plugin
+            .get_impacts(moon_pdk_api::VcsImpactIntent::Submission {
+                base: Some("master".into()),
+                head: None,
+                include_working: false,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            impacts.changes[Path::new("old.txt")],
+            moon_pdk_api::VcsChangeMask::DELETED | moon_pdk_api::VcsChangeMask::RECORDED
+        );
+        for path in ["renamed.txt", "copied.txt"] {
+            assert_eq!(
+                impacts.changes[Path::new(path)],
+                moon_pdk_api::VcsChangeMask::ADDED | moon_pdk_api::VcsChangeMask::RECORDED
+            );
+        }
+        assert!(!impacts.changes.contains_key(Path::new("source.txt")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plugin_instance_initializes_only_once() {
+        let sandbox = create_git_repository();
+        let plugin = load_bundled_vcs_plugin(
+            create_host_data(sandbox.path()),
+            "git",
+            "data://vcs_git",
+            include_bytes!("../res/vcs_git.wasm"),
+        )
+        .await
+        .unwrap();
         let duplicate = Arc::clone(&plugin);
         let context = MoonContext {
             working_dir: plugin.to_virtual_path(sandbox.path()),

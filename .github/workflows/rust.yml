@@ -129,10 +129,12 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: moonrepo/setup-rust@v1
         with:
-          bins: just, cargo-nextest, cargo-llvm-cov
+          bins: just, cargo-nextest, cargo-llvm-cov, jj-cli@0.44.0
           cache: false
           components: llvm-tools-preview
           targets: wasm32-wasip1
+      - name: Verify Jujutsu
+        run: jj --version
       - uses: moonrepo/setup-toolchain@v0
         with:
           auto-install: true

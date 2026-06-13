@@ -15,10 +15,15 @@ build-vcs-git:
 	cargo build --manifest-path wasm/Cargo.toml --package vcs_git --target wasm32-wasip1 --release
 	cp "{{cargo_target_dir}}/wasm32-wasip1/release/vcs_git.wasm" crates/vcs-plugin/res/vcs_git.wasm
 
+build-vcs-jj:
+	cargo build --manifest-path wasm/Cargo.toml --package vcs_jj --target wasm32-wasip1 --release
+	cp "{{cargo_target_dir}}/wasm32-wasip1/release/vcs_jj.wasm" crates/vcs-plugin/res/vcs_jj.wasm
+
 build-wasm:
 	cargo build --manifest-path wasm/Cargo.toml --workspace --target wasm32-wasip1 --release
 	cp "{{cargo_target_dir}}/wasm32-wasip1/release/process_host.wasm" crates/plugin/tests/__fixtures__/wasm/process_host.wasm
 	cp "{{cargo_target_dir}}/wasm32-wasip1/release/vcs_git.wasm" crates/vcs-plugin/res/vcs_git.wasm
+	cp "{{cargo_target_dir}}/wasm32-wasip1/release/vcs_jj.wasm" crates/vcs-plugin/res/vcs_jj.wasm
 
 # CHECKING
 
