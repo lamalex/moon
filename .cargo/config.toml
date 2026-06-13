@@ -45,3 +45,4 @@ codegen-units = 16
 GIT_CONFIG_COUNT = "1"
 GIT_CONFIG_KEY_0 = "core.fsmonitor"
 GIT_CONFIG_VALUE_0 = "false"
+WARPGATE_PLUGINS_DIR = { value = "wasm", relative = true }
