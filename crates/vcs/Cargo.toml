@@ -24,6 +24,7 @@ regex = { workspace = true }
 rustc-hash = { workspace = true }
 scc = { workspace = true }
 serde = { workspace = true }
+starbase_utils = { workspace = true, features = ["hash"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
