@@ -19,6 +19,7 @@ struct QueryCache {
 pub struct VcsPlugin {
     pub id: Id,
     pub metadata: RegisterVcsOutput,
+    supports_hook_environment: bool,
     operation_lock: Mutex<()>,
     plugin: Arc<PluginContainer>,
     initialization_claimed: Mutex<bool>,
@@ -56,12 +57,13 @@ impl Plugin for VcsPlugin {
             )
             .await?;
 
-        validate_metadata(&plugin, &metadata).await?;
+        let supports_hook_environment = validate_metadata(&plugin, &metadata).await?;
         process_host_access.configure(&metadata.process_capabilities, &workspace_root)?;
 
         Ok(Self {
             id: registration.id,
             metadata,
+            supports_hook_environment,
             operation_lock: Mutex::new(()),
             plugin,
             initialization_claimed: Mutex::new(false),
@@ -84,7 +86,7 @@ impl Plugin for VcsPlugin {
 async fn validate_metadata(
     plugin: &PluginContainer,
     metadata: &RegisterVcsOutput,
-) -> miette::Result<()> {
+) -> miette::Result<bool> {
     validate_protocol_version(metadata)?;
 
     if metadata.name.trim().is_empty() || metadata.plugin_version.trim().is_empty() {
@@ -93,12 +95,7 @@ async fn validate_metadata(
         ));
     }
 
-    for function in [
-        "initialize_vcs",
-        "get_vcs_impacts",
-        "setup_vcs_hook_environment",
-        "teardown_vcs_hook_environment",
-    ] {
+    for function in ["initialize_vcs", "get_vcs_impacts"] {
         if !plugin.has_func(function).await {
             return Err(miette::miette!(
                 "VCS plugin `{}` does not export required function `{function}`",
@@ -107,7 +104,17 @@ async fn validate_metadata(
         }
     }
 
-    Ok(())
+    let setup_hooks = plugin.has_func("setup_vcs_hook_environment").await;
+    let teardown_hooks = plugin.has_func("teardown_vcs_hook_environment").await;
+
+    if setup_hooks != teardown_hooks {
+        return Err(miette::miette!(
+            "VCS plugin `{}` must export both hook-environment functions or neither",
+            metadata.name
+        ));
+    }
+
+    Ok(setup_hooks)
 }
 
 fn validate_protocol_version(metadata: &RegisterVcsOutput) -> miette::Result<()> {
@@ -182,8 +189,12 @@ impl InitializedVcsPlugin {
         &self.plugin.metadata
     }
 
+    pub fn supports_hook_environment(&self) -> bool {
+        self.plugin.supports_hook_environment
+    }
+
     pub fn from_virtual_path(&self, path: impl AsRef<Path> + fmt::Debug) -> PathBuf {
-        self.plugin.plugin.from_virtual_path(path)
+        path.as_ref().to_path_buf()
     }
 
     pub fn to_virtual_path(&self, path: impl AsRef<Path> + fmt::Debug) -> VirtualPath {
@@ -225,7 +236,8 @@ impl InitializedVcsPlugin {
         hooks: Vec<String>,
     ) -> miette::Result<SetupVcsHookEnvironmentOutput> {
         let _operation = self.plugin.operation_lock.lock().await;
-        self.plugin
+        Ok(self
+            .plugin
             .plugin
             .call_func_with(
                 "setup_vcs_hook_environment",
@@ -235,7 +247,7 @@ impl InitializedVcsPlugin {
                     hooks,
                 },
             )
-            .await
+            .await?)
     }
 
     pub async fn teardown_hook_environment(
@@ -244,7 +256,8 @@ impl InitializedVcsPlugin {
         hooks: Vec<String>,
     ) -> miette::Result<TeardownVcsHookEnvironmentOutput> {
         let _operation = self.plugin.operation_lock.lock().await;
-        self.plugin
+        Ok(self
+            .plugin
             .plugin
             .call_func_with(
                 "teardown_vcs_hook_environment",
@@ -254,7 +267,7 @@ impl InitializedVcsPlugin {
                     hooks,
                 },
             )
-            .await
+            .await?)
     }
 }
 
@@ -270,22 +283,19 @@ fn validate_initialization(
 
     let workspace_root = context
         .workspace_root
-        .real_path()
-        .ok_or_else(|| miette::miette!("moon workspace root has no real path"))?
+        .as_path()
         .canonicalize()
         .into_diagnostic()?;
     let working_root = initialization
         .roots
         .working_root
-        .real_path()
-        .ok_or_else(|| miette::miette!("VCS working root has no real path"))?
+        .as_path()
         .canonicalize()
         .into_diagnostic()?;
     initialization
         .roots
         .repository_root
-        .real_path()
-        .ok_or_else(|| miette::miette!("VCS repository root has no real path"))?
+        .as_path()
         .canonicalize()
         .into_diagnostic()?;
 
@@ -302,12 +312,22 @@ fn validate_initialization(
     }
 
     if initialization
-        .baseline
-        .as_ref()
-        .is_some_and(|state| state.id.is_none())
+        .current
+        .id
+        .as_deref()
+        .is_some_and(str::is_empty)
+        || initialization
+            .recorded
+            .id
+            .as_deref()
+            .is_some_and(str::is_empty)
+        || initialization
+            .baseline
+            .as_ref()
+            .is_some_and(|state| state.id.as_deref().is_none_or(str::is_empty))
     {
         return Err(miette::miette!(
-            "source-control provider returned an empty baseline state ID"
+            "source-control provider returned an empty state ID"
         ));
     }
 
