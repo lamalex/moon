@@ -871,6 +871,7 @@ dependencies = [
 name = "moon_pdk_api"
 version = "2.1.3"
 dependencies = [
+ "base64",
  "bitflags",
  "derive_setters",
  "moon_common",
@@ -1095,6 +1096,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "process_host"
+version = "0.0.1"
+dependencies = [
+ "extism-pdk",
+ "moon_pdk",
+ "moon_pdk_api",
 ]
 
 [[package]]
