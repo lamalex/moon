@@ -6806,6 +6806,7 @@ dependencies = [
  "starbase_utils",
  "tokio",
  "tracing",
+ "version_spec",
  "warpgate",
 ]
 

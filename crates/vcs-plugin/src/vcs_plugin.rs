@@ -281,6 +281,8 @@ fn validate_initialization(
         ));
     }
 
+    // Providers may canonicalize paths differently than the caller (for
+    // example, `/tmp` versus `/private/tmp` on macOS).
     let workspace_root = context
         .workspace_root
         .as_path()
@@ -292,7 +294,7 @@ fn validate_initialization(
         .as_path()
         .canonicalize()
         .into_diagnostic()?;
-    initialization
+    let repository_root = initialization
         .roots
         .repository_root
         .as_path()
@@ -302,6 +304,16 @@ fn validate_initialization(
     if !workspace_root.starts_with(&working_root) {
         return Err(miette::miette!(
             "source-control provider returned a working root that does not contain the workspace"
+        ));
+    }
+
+    if repository_root.as_os_str().is_empty()
+        || repository_root
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(miette::miette!(
+            "source-control provider returned an invalid repository root"
         ));
     }
 
