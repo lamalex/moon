@@ -1,6 +1,6 @@
 ---
 source: crates/vcs-hooks/tests/hooks_generator_test.rs
-expression: "fs::read_to_string(post_push).unwrap()"
+expression: "fs::read_to_string(pre_push).unwrap()"
 ---
 #!/usr/bin/env bash
 set -eo pipefail

@@ -144,7 +144,7 @@ impl WorkspaceWatcher {
         }
 
         // Ensure the cache/state files are cleared before rebuilding
-        let cache_engine = self.session.get_cache_engine()?;
+        let cache_engine = self.session.get_cache_engine().await?;
 
         fs::remove_file(cache_engine.state.resolve_path(STATE_GRAPH_FILE_NAME))?;
         fs::remove_file(cache_engine.state.resolve_path(STATE_CACHE_FILE_NAME))?;

@@ -5021,6 +5021,7 @@ dependencies = [
  "moon_toolchain",
  "moon_toolchain_plugin",
  "moon_vcs",
+ "moon_vcs_plugin",
  "moon_workspace",
  "moon_workspace_graph",
  "open",
