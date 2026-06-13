@@ -6231,6 +6231,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "moon_vcs_plugin"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "miette 7.6.0",
+ "moon_common",
+ "moon_pdk_api",
+ "moon_plugin",
+ "moon_vcs",
+ "serde",
+ "serde_json",
+ "starbase_sandbox",
+ "starbase_utils",
+ "tokio",
+ "tracing",
+ "warpgate",
+]
+
+[[package]]
 name = "moon_workspace"
 version = "0.0.1"
 dependencies = [
