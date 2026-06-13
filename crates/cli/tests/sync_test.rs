@@ -80,7 +80,7 @@ mod sync_hooks {
                     "pre-commit".into(),
                     vec!["moon run :lint".into(), "some-command".into()],
                 ),
-                ("post-push".into(), vec!["moon check --all".into()]),
+                ("pre-push".into(), vec!["moon check --all".into()]),
             ]));
         });
 
@@ -104,11 +104,11 @@ mod sync_hooks {
         assert!(dir.exists());
 
         assert!(dir.join("pre-commit").exists());
-        assert!(dir.join("post-push").exists());
+        assert!(dir.join("pre-push").exists());
 
         if cfg!(windows) {
             assert!(dir.join("pre-commit.ps1").exists());
-            assert!(dir.join("post-push.ps1").exists());
+            assert!(dir.join("pre-push.ps1").exists());
         }
     }
 

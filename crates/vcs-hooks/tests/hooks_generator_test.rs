@@ -13,7 +13,7 @@ fn create_config() -> VcsConfig {
                 "pre-commit".into(),
                 vec!["moon run :lint".into(), "some-command $ARG1".into()],
             ),
-            ("post-push".into(), vec!["moon check --all".into()]),
+            ("pre-push".into(), vec!["moon check --all".into()]),
         ]),
         ..VcsConfig::default()
     }
@@ -72,7 +72,7 @@ mod vcs_hooks {
             &VcsConfig {
                 hooks: FxHashMap::from_iter([
                     ("pre-commit".into(), vec![]),
-                    ("post-push".into(), vec![]),
+                    ("pre-push".into(), vec![]),
                 ]),
                 ..VcsConfig::default()
             },
@@ -90,6 +90,30 @@ mod vcs_hooks {
     }
 
     #[tokio::test]
+    async fn rejects_unsupported_hooks_before_configuring_git() {
+        let sandbox = create_empty_sandbox();
+        sandbox.enable_git();
+        let mock = WorkspaceMocker::new(sandbox.path());
+        let config = VcsConfig {
+            hooks: FxHashMap::from_iter([("post-push".into(), vec!["moon check".into()])]),
+            ..VcsConfig::default()
+        };
+
+        let error = HooksGenerator::new(&mock.mock_app_context(), &config)
+            .generate()
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("post-push"), "{error}");
+        assert!(
+            !fs::read_to_string(sandbox.path().join(".git/config"))
+                .unwrap()
+                .contains("hooksPath =")
+        );
+    }
+
+    #[tokio::test]
     async fn cleans_up_hooks() {
         let sandbox = create_empty_sandbox();
         sandbox.enable_git();
@@ -97,15 +121,15 @@ mod vcs_hooks {
         run_generator(sandbox.path()).await;
 
         let pre_commit = sandbox.path().join(".moon/hooks/pre-commit");
-        let post_push = sandbox.path().join(".moon/hooks/post-push");
+        let pre_push = sandbox.path().join(".moon/hooks/pre-push");
 
         assert!(pre_commit.exists());
-        assert!(post_push.exists());
+        assert!(pre_push.exists());
 
         clean_generator(sandbox.path()).await;
 
         assert!(!pre_commit.exists());
-        assert!(!post_push.exists());
+        assert!(!pre_push.exists());
         assert!(
             !fs::read_to_string(sandbox.path().join(".git/config"))
                 .unwrap()
@@ -173,7 +197,7 @@ mod vcs_hooks {
         sandbox.enable_git();
 
         let pre_commit = sandbox.path().join(".moon/hooks/pre-commit");
-        let post_push = sandbox.path().join(".moon/hooks/post-push");
+        let pre_push = sandbox.path().join(".moon/hooks/pre-push");
 
         let mock = WorkspaceMocker::new(sandbox.path());
         let mut config = create_config();
@@ -185,7 +209,7 @@ mod vcs_hooks {
             .unwrap();
 
         assert!(pre_commit.exists());
-        assert!(post_push.exists());
+        assert!(pre_push.exists());
 
         // Second
         config.hooks.remove("pre-commit");
@@ -196,7 +220,7 @@ mod vcs_hooks {
             .unwrap();
 
         assert!(!pre_commit.exists());
-        assert!(post_push.exists());
+        assert!(pre_push.exists());
     }
 
     #[tokio::test]
@@ -228,7 +252,7 @@ mod vcs_hooks {
                 .join(".config/moon/hooks/pre-commit")
                 .exists()
         );
-        assert!(sandbox.path().join(".config/moon/hooks/post-push").exists());
+        assert!(sandbox.path().join(".config/moon/hooks/pre-push").exists());
         assert!(!sandbox.path().join(".moon/hooks").exists());
 
         // And the git config points to the correct directory. Normalize the
@@ -262,13 +286,13 @@ mod vcs_hooks {
             run_generator(sandbox.path()).await;
 
             let pre_commit = sandbox.path().join(".moon/hooks/pre-commit");
-            let post_push = sandbox.path().join(".moon/hooks/post-push");
+            let pre_push = sandbox.path().join(".moon/hooks/pre-push");
 
             assert!(pre_commit.exists());
-            assert!(post_push.exists());
+            assert!(pre_push.exists());
 
             assert_snapshot!(fs::read_to_string(pre_commit).unwrap());
-            assert_snapshot!(fs::read_to_string(post_push).unwrap());
+            assert_snapshot!(fs::read_to_string(pre_push).unwrap());
         }
 
         #[tokio::test]
@@ -299,10 +323,10 @@ mod vcs_hooks {
             run_generator(&sandbox.path().join("tree")).await;
 
             let pre_commit = sandbox.path().join("tree/.moon/hooks/pre-commit");
-            let post_push = sandbox.path().join("tree/.moon/hooks/post-push");
+            let pre_push = sandbox.path().join("tree/.moon/hooks/pre-push");
 
             assert!(pre_commit.exists());
-            assert!(post_push.exists());
+            assert!(pre_push.exists());
         }
     }
 
@@ -324,19 +348,19 @@ mod vcs_hooks {
             run_generator(sandbox.path()).await;
 
             let pre_commit = sandbox.path().join(".moon/hooks/pre-commit.ps1");
-            let post_push = sandbox.path().join(".moon/hooks/post-push.ps1");
+            let pre_push = sandbox.path().join(".moon/hooks/pre-push.ps1");
 
             assert!(pre_commit.exists());
-            assert!(post_push.exists());
+            assert!(pre_push.exists());
 
             assert_snapshot!(clean_powershell(fs::read_to_string(pre_commit).unwrap()));
-            assert_snapshot!(clean_powershell(fs::read_to_string(post_push).unwrap()));
+            assert_snapshot!(clean_powershell(fs::read_to_string(pre_push).unwrap()));
 
             let pre_commit = sandbox.path().join(".moon/hooks/pre-commit");
-            let post_push = sandbox.path().join(".moon/hooks/post-push");
+            let pre_push = sandbox.path().join(".moon/hooks/pre-push");
 
             assert!(pre_commit.exists());
-            assert!(post_push.exists());
+            assert!(pre_push.exists());
 
             assert!(
                 fs::read_to_string(pre_commit)
@@ -344,9 +368,9 @@ mod vcs_hooks {
                     .contains(".moon/hooks/pre-commit.ps1")
             );
             assert!(
-                fs::read_to_string(post_push)
+                fs::read_to_string(pre_push)
                     .unwrap()
-                    .contains(".moon/hooks/post-push.ps1")
+                    .contains(".moon/hooks/pre-push.ps1")
             );
         }
 
@@ -365,13 +389,13 @@ mod vcs_hooks {
                 .unwrap();
 
             let pre_commit = sandbox.path().join(".moon/hooks/pre-commit");
-            let post_push = sandbox.path().join(".moon/hooks/post-push");
+            let pre_push = sandbox.path().join(".moon/hooks/pre-push");
 
             assert!(pre_commit.exists());
-            assert!(post_push.exists());
+            assert!(pre_push.exists());
 
             assert_snapshot!(clean_powershell(fs::read_to_string(pre_commit).unwrap()));
-            assert_snapshot!(clean_powershell(fs::read_to_string(post_push).unwrap()));
+            assert_snapshot!(clean_powershell(fs::read_to_string(pre_push).unwrap()));
         }
 
         #[tokio::test]
@@ -386,10 +410,10 @@ mod vcs_hooks {
             run_generator(&sandbox.path().join("tree")).await;
 
             let pre_commit = sandbox.path().join("tree/.moon/hooks/pre-commit.ps1");
-            let post_push = sandbox.path().join("tree/.moon/hooks/post-push.ps1");
+            let pre_push = sandbox.path().join("tree/.moon/hooks/pre-push.ps1");
 
             assert!(pre_commit.exists());
-            assert!(post_push.exists());
+            assert!(pre_push.exists());
         }
     }
 }

@@ -18,7 +18,8 @@ pub async fn clean(session: MoonSession, args: CleanArgs) -> SessionResult {
     let lifetime = if args.all { "1 second" } else { &args.lifetime };
 
     let (files_deleted, bytes_saved) = session
-        .get_cache_engine()?
+        .get_cache_engine()
+        .await?
         .clean_stale_cache(lifetime, true)
         .await?;
 

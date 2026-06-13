@@ -25,14 +25,17 @@ use moon_process::ProcessRegistry;
 use moon_project_graph::ProjectGraph;
 use moon_task_graph::TaskGraph;
 use moon_toolchain_plugin::*;
-use moon_vcs::{BoxedVcs, git::Git};
+use moon_vcs::BoxedVcs;
+use moon_vcs_plugin::load_vcs_adapter;
 use moon_workspace::{WorkspaceBuilder, WorkspaceBuilderAsync, WorkspaceBuilderContext};
 use moon_workspace_graph::WorkspaceGraph;
 use proto_core::ProtoEnvironment;
 use starbase::{AppExitCode, AppResult, AppSession};
 use std::env;
 use std::fmt;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::OnceCell;
 use tokio::try_join;
@@ -60,7 +63,7 @@ pub struct MoonSession {
     pub(crate) project_graph: OnceLock<Arc<ProjectGraph>>,
     pub(crate) task_graph: OnceLock<Arc<TaskGraph>>,
     pub(crate) toolchain_registry: OnceCell<Arc<ToolchainRegistry>>,
-    pub(crate) vcs_adapter: OnceLock<Arc<BoxedVcs>>,
+    pub(crate) vcs_adapter: OnceCell<Arc<BoxedVcs>>,
     pub(crate) workspace_graph: OnceCell<Arc<WorkspaceGraph>>,
 
     // Configs
@@ -100,7 +103,7 @@ impl MoonSession {
             workspace_config: Arc::new(WorkspaceConfig::default()),
             workspace_graph: OnceCell::new(),
             workspace_root: PathBuf::new(),
-            vcs_adapter: OnceLock::new(),
+            vcs_adapter: OnceCell::new(),
             cli,
         }
     }
@@ -159,7 +162,7 @@ impl MoonSession {
 
     pub async fn create_workspace_graph_context(&self) -> miette::Result<WorkspaceBuilderContext> {
         Ok(WorkspaceBuilderContext {
-            cache_engine: self.get_cache_engine()?,
+            cache_engine: self.get_cache_engine().await?,
             config_loader: self.config_loader.clone(),
             enabled_toolchains: self.toolchains_config.get_enabled(),
             extensions_config: Arc::clone(&self.extensions_config),
@@ -167,7 +170,7 @@ impl MoonSession {
             inherited_tasks: Arc::clone(&self.tasks_config),
             toolchains_config: Arc::clone(&self.toolchains_config),
             toolchain_registry: self.get_toolchain_registry().await?,
-            vcs: Some(self.get_vcs_adapter()?),
+            vcs: Some(self.get_vcs_adapter().await?),
             working_dir: self.working_dir.clone(),
             workspace_config: Arc::clone(&self.workspace_config),
             workspace_root: self.workspace_root.clone(),
@@ -177,7 +180,7 @@ impl MoonSession {
     pub async fn get_app_context(&self) -> miette::Result<Arc<AppContext>> {
         Ok(Arc::new(AppContext {
             cli_version: self.cli_version.clone(),
-            cache_engine: self.get_cache_engine()?,
+            cache_engine: self.get_cache_engine().await?,
             config_dir: self.config_dir.clone(),
             config_exts: self.config_loader.extensions.clone(),
             console: self.get_console()?,
@@ -188,14 +191,14 @@ impl MoonSession {
             extension_registry: self.get_extension_registry().await?,
             toolchains_config: Arc::clone(&self.toolchains_config),
             toolchain_registry: self.get_toolchain_registry().await?,
-            vcs: self.get_vcs_adapter()?,
+            vcs: self.get_vcs_adapter().await?,
             working_dir: self.working_dir.clone(),
             workspace_config: Arc::clone(&self.workspace_config),
             workspace_root: self.workspace_root.clone(),
         }))
     }
 
-    pub fn get_cache_engine(&self) -> miette::Result<Arc<CacheEngine>> {
+    pub async fn get_cache_engine(&self) -> miette::Result<Arc<CacheEngine>> {
         if self.cache_engine.get().is_none() {
             let mut context = CacheContext {
                 cache_dir: self.config_dir.join("cache"),
@@ -208,7 +211,7 @@ impl MoonSession {
             };
 
             if context.cache_config.shared_worktree_cache {
-                let vcs = self.get_vcs_adapter()?;
+                let vcs = self.get_vcs_adapter().await?;
 
                 if vcs.is_worktree() {
                     let repo_root = vcs.get_repository_root()?;
@@ -327,20 +330,34 @@ impl MoonSession {
             .map(Arc::clone)
     }
 
-    pub fn get_vcs_adapter(&self) -> miette::Result<Arc<BoxedVcs>> {
-        if self.vcs_adapter.get().is_none() {
-            let config = &self.workspace_config.vcs;
+    pub fn get_vcs_adapter(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = miette::Result<Arc<BoxedVcs>>> + Send + '_>> {
+        Box::pin(async {
+            self.vcs_adapter
+                .get_or_try_init(async || {
+                    let config = &self.workspace_config.vcs;
+                    let adapter = load_vcs_adapter(
+                        MoonHostData {
+                            moon_env: Arc::clone(&self.moon_env),
+                            proto_env: Arc::clone(&self.proto_env),
+                            extensions_config: Arc::clone(&self.extensions_config),
+                            toolchains_config: Arc::clone(&self.toolchains_config),
+                            workspace_config: Arc::clone(&self.workspace_config),
+                            workspace_graph: Arc::new(OnceLock::new()),
+                        },
+                        &self.working_dir,
+                        &self.workspace_root,
+                        &config.default_branch,
+                        &config.remote_candidates,
+                    )
+                    .await?;
 
-            let git: BoxedVcs = Box::new(Git::load(
-                &self.workspace_root,
-                &config.default_branch,
-                &config.remote_candidates,
-            )?);
-
-            let _ = self.vcs_adapter.set(Arc::new(git));
-        }
-
-        Ok(self.vcs_adapter.get().map(Arc::clone).unwrap())
+                    Ok(Arc::new(adapter))
+                })
+                .await
+                .map(Arc::clone)
+        })
     }
 
     pub async fn get_workspace_graph(&self) -> miette::Result<Arc<WorkspaceGraph>> {
@@ -493,13 +510,13 @@ impl AppSession for MoonSession {
             analyze::validate_version_constraint(constraint, &self.cli_version)?;
         }
 
-        let vcs = self.get_vcs_adapter()?;
+        let vcs = self.get_vcs_adapter().await?;
 
         analyze::extract_repo_info(&vcs).await?;
 
         // Preload components
         if self.requires_workspace_configured() {
-            let _ = self.get_cache_engine()?;
+            let _ = self.get_cache_engine().await?;
         }
 
         Ok(None)
@@ -510,7 +527,11 @@ impl AppSession for MoonSession {
         // Connect to the storage backends as early as possible,
         // but only for commands that will actually read/write to it
         if self.is_pipeline_command() || self.is_daemon_server_command() {
-            self.get_cache_engine()?.storage.connect_backends().await?;
+            self.get_cache_engine()
+                .await?
+                .storage
+                .connect_backends()
+                .await?;
         }
 
         // Check for a new version and log to the console

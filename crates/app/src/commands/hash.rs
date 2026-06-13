@@ -37,7 +37,8 @@ async fn load_hash_manifest(
     partial_hash: &str,
 ) -> miette::Result<(String, String, JsonValue)> {
     if let Some(manifest_path) = session
-        .get_cache_engine()?
+        .get_cache_engine()
+        .await?
         .hash
         .find_manifest_path(partial_hash)?
     {

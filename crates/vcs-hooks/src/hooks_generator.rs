@@ -73,7 +73,10 @@ impl<'app> HooksGenerator<'app> {
         }
 
         if self.app_context.vcs.is_enabled() {
-            self.app_context.vcs.teardown_hooks().await?;
+            self.app_context
+                .vcs
+                .teardown_hooks(&state.data.hook_names)
+                .await?;
         }
 
         if let Some(dir) = &state.data.relative_hooks_dir {
@@ -138,7 +141,10 @@ impl<'app> HooksGenerator<'app> {
             return Ok(false);
         }
 
-        let Some(env) = vcs.setup_hooks().await? else {
+        let mut hook_names = self.config.hooks.keys().cloned().collect::<Vec<_>>();
+        hook_names.sort();
+
+        let Some(env) = vcs.setup_hooks(&hook_names).await? else {
             return Ok(false);
         };
 
@@ -148,7 +154,7 @@ impl<'app> HooksGenerator<'app> {
 
         self.create_hook_files(&env)?;
 
-        state.data.hook_names = self.config.hooks.keys().cloned().collect();
+        state.data.hook_names = hook_names;
         state.data.relative_hooks_dir = env
             .hooks_dir
             .relative_to(&self.app_context.workspace_root)

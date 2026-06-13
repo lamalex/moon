@@ -19,7 +19,7 @@ pub async fn check_for_new_version(
     };
 
     let console = &session.console;
-    let cache_engine = session.get_cache_engine()?;
+    let cache_engine = session.get_cache_engine().await?;
 
     match launchpad
         .check_version(&cache_engine, false, manifest_url)
