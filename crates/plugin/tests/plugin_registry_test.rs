@@ -19,7 +19,9 @@ struct TestPlugin {
 
 #[async_trait]
 impl Plugin for TestPlugin {
-    async fn new(reg: PluginRegistration) -> miette::Result<Self> {
+    async fn new(mut reg: PluginRegistration) -> miette::Result<Self> {
+        assert!(reg.take_process_host_access().is_err());
+
         Ok(TestPlugin { id: reg.id })
     }
 
@@ -27,12 +29,38 @@ impl Plugin for TestPlugin {
         &self.id
     }
 
-    fn get_type(&self) -> PluginType {
+    fn get_type() -> PluginType {
         PluginType::Extension
     }
 
     async fn has_func(&self, name: &str) -> bool {
         name != "missing_func"
+    }
+}
+
+#[derive(Debug)]
+struct TestVcsPlugin {
+    id: Id,
+}
+
+#[async_trait]
+impl Plugin for TestVcsPlugin {
+    async fn new(mut reg: PluginRegistration) -> miette::Result<Self> {
+        reg.take_process_host_access()?;
+
+        Ok(Self { id: reg.id })
+    }
+
+    fn get_id(&self) -> &Id {
+        &self.id
+    }
+
+    fn get_type() -> PluginType {
+        PluginType::Vcs
+    }
+
+    async fn has_func(&self, _name: &str) -> bool {
+        true
     }
 }
 
@@ -100,6 +128,19 @@ fn create_registry(sandbox: &Path, config: TestConfig) -> PluginRegistry<TestCon
     }
 
     registry
+}
+
+fn create_vcs_registry(sandbox: &Path) -> PluginRegistry<TestConfig, TestVcsPlugin> {
+    PluginRegistry::new(
+        PluginType::Vcs,
+        MoonHostData {
+            moon_env: Arc::new(MoonEnvironment::new_testing(sandbox)),
+            proto_env: Arc::new(ProtoEnvironment::new_testing(sandbox).unwrap()),
+            ..Default::default()
+        },
+        TestConfig::default(),
+    )
+    .unwrap()
 }
 
 fn create_test_plugin(id: &str) -> TestPlugin {
@@ -537,5 +578,118 @@ mod registry_caller {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn verifies_plugin_before_registration() {
+        let sandbox = create_sandbox("wasm");
+        let registry = create_registry(sandbox.path(), TestConfig::default());
+        let wasm_file = sandbox.path().join("test.wasm");
+
+        registry
+            .load_verified_without_config(
+                Id::raw("verified"),
+                PluginLocator::File(Box::new(FileLocator {
+                    file: "".into(),
+                    path: Some(wasm_file.clone()),
+                })),
+                |path, bytes| {
+                    assert_eq!(path, wasm_file);
+                    assert_eq!(bytes, fs::read(&wasm_file).unwrap());
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_plugin_that_fails_verification() {
+        let sandbox = create_sandbox("wasm");
+        let registry = create_registry(sandbox.path(), TestConfig::default());
+
+        let error = registry
+            .load_verified_without_config(
+                Id::raw("untrusted"),
+                PluginLocator::File(Box::new(FileLocator {
+                    file: "".into(),
+                    path: Some(sandbox.path().join("test.wasm")),
+                })),
+                |_, _| Err(miette::miette!("plugin digest mismatch")),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("plugin digest mismatch"));
+        assert!(!registry.is_registered(&Id::raw("untrusted")).await);
+    }
+
+    #[tokio::test]
+    async fn verifies_an_already_registered_plugin() {
+        let sandbox = create_sandbox("wasm");
+        let registry = create_registry(sandbox.path(), TestConfig::default());
+        let locator = PluginLocator::File(Box::new(FileLocator {
+            file: "".into(),
+            path: Some(sandbox.path().join("test.wasm")),
+        }));
+
+        registry
+            .load_without_config(Id::raw("existing"), locator.clone())
+            .await
+            .unwrap();
+
+        let error = registry
+            .load_verified_without_config(Id::raw("existing"), locator, |_, _| {
+                Err(miette::miette!("existing plugin digest mismatch"))
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("existing plugin digest mismatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn instantiates_the_exact_verified_bytes() {
+        let sandbox = create_sandbox("wasm");
+        let registry = create_registry(sandbox.path(), TestConfig::default());
+        let wasm_file = sandbox.path().join("test.wasm");
+        let verified_bytes = fs::read(&wasm_file).unwrap();
+
+        registry
+            .load_verified_without_config(
+                Id::raw("immutable"),
+                PluginLocator::File(Box::new(FileLocator {
+                    file: "".into(),
+                    path: Some(wasm_file.clone()),
+                })),
+                |path, bytes| {
+                    assert_eq!(bytes, verified_bytes);
+                    fs::write(path, b"not wasm").unwrap();
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(fs::read(wasm_file).unwrap(), b"not wasm");
+    }
+
+    #[tokio::test]
+    async fn rejects_changes_to_host_owned_vcs_manifest_policy() {
+        let sandbox = create_sandbox("wasm");
+        let registry = create_vcs_registry(sandbox.path());
+        let error = registry
+            .load_with_config(Id::raw("vcs"), create_locator(sandbox.path()), |manifest| {
+                manifest.allowed_hosts = Some(vec!["example.com".into()]);
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("policy is host-owned"));
     }
 }

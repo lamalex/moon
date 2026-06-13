@@ -1,5 +1,5 @@
 use crate::host::*;
-use crate::plugin::{Plugin, PluginRegistration};
+use crate::plugin::{Plugin, PluginRegistration, PluginType};
 use crate::plugin_error::PluginError;
 use crate::plugin_registry::*;
 use futures::StreamExt;
@@ -7,10 +7,12 @@ use futures::stream::FuturesOrdered;
 use miette::IntoDiagnostic;
 use moon_common::{Id, IdExt};
 use scc::hash_map::Entry;
+use starbase_utils::fs;
 use std::fmt::Debug;
+use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, instrument};
-use warpgate::{PluginContainer, PluginLocator, host::HostData};
+use warpgate::{PluginContainer, PluginLocator, PluginManifest, Wasm, host::HostData};
 
 impl<Cfg: PluginsConfig, Inst: Plugin> PluginRegistry<Cfg, Inst> {
     pub async fn load<I>(&self, id: I) -> miette::Result<Arc<Inst>>
@@ -106,6 +108,73 @@ impl<Cfg: PluginsConfig, Inst: Plugin> PluginRegistry<Cfg, Inst> {
         I: AsRef<str> + Debug,
         L: AsRef<PluginLocator> + Debug,
     {
+        self.load_with_config_and_verifier(
+            id,
+            locator,
+            false,
+            |_, _| Ok(()),
+            |id, host_data, manifest| self.config_data.configure_manifest(id, host_data, manifest),
+        )
+        .await
+    }
+
+    #[instrument(skip(self, op))]
+    pub async fn load_with_config<I, L, F>(
+        &self,
+        id: I,
+        locator: L,
+        op: F,
+    ) -> miette::Result<Arc<Inst>>
+    where
+        I: AsRef<str> + Debug,
+        L: AsRef<PluginLocator> + Debug,
+        F: FnMut(&mut PluginManifest) -> miette::Result<()>,
+    {
+        let mut op = op;
+
+        self.load_with_config_and_verifier(
+            id,
+            locator,
+            false,
+            |_, _| Ok(()),
+            |_, _, manifest| op(manifest),
+        )
+        .await
+    }
+
+    pub async fn load_verified_with_config<I, L, V, F>(
+        &self,
+        id: I,
+        locator: L,
+        verify: V,
+        op: F,
+    ) -> miette::Result<Arc<Inst>>
+    where
+        I: AsRef<str> + Debug,
+        L: AsRef<PluginLocator> + Debug,
+        V: FnMut(&Path, &[u8]) -> miette::Result<()>,
+        F: FnMut(&mut PluginManifest) -> miette::Result<()>,
+    {
+        let mut op = op;
+
+        self.load_with_config_and_verifier(id, locator, true, verify, |_, _, manifest| op(manifest))
+            .await
+    }
+
+    async fn load_with_config_and_verifier<I, L, V, F>(
+        &self,
+        id: I,
+        locator: L,
+        verify_registered: bool,
+        mut verify: V,
+        mut op: F,
+    ) -> miette::Result<Arc<Inst>>
+    where
+        I: AsRef<str> + Debug,
+        L: AsRef<PluginLocator> + Debug,
+        V: FnMut(&Path, &[u8]) -> miette::Result<()>,
+        F: FnMut(&Id, &MoonHostData, &mut PluginManifest) -> miette::Result<()>,
+    {
         let id = Id::raw(id.as_ref());
         let locator = locator.as_ref();
 
@@ -114,8 +183,33 @@ impl<Cfg: PluginsConfig, Inst: Plugin> PluginRegistry<Cfg, Inst> {
         // doing so serializes loads that collide on a bucket and can deadlock
         // under concurrent loads (e.g. `load_many`), since a guard held across
         // an `.await` blocks other tasks (and map resizes) from making progress.
-        if let Some(existing) = self.plugins.get_async(&id).await {
-            return Ok(Arc::clone(existing.get()));
+        let existing = self
+            .plugins
+            .get_async(&id)
+            .await
+            .map(|entry| Arc::clone(entry.get()));
+
+        if !verify_registered && let Some(existing) = existing {
+            return Ok(existing);
+        }
+
+        // Verified loads must check the acquired file even if an instance is
+        // already registered under this ID.
+        let plugin_file = self.loader.load_plugin(&id, locator).await?;
+        let verified_bytes = if verify_registered {
+            let bytes = std::fs::read(&plugin_file).into_diagnostic()?;
+            verify(&plugin_file, &bytes)?;
+            Some(bytes)
+        } else {
+            None
+        };
+
+        if existing.is_some() {
+            return Err(PluginError::ExistingId {
+                id: id.to_string(),
+                ty: self.type_of,
+            }
+            .into());
         }
 
         debug!(
@@ -124,11 +218,12 @@ impl<Cfg: PluginsConfig, Inst: Plugin> PluginRegistry<Cfg, Inst> {
             "Attempting to load and register plugin",
         );
 
-        // Load the WASM file (this must happen first because of async)
-        let plugin_file = self.loader.load_plugin(&id, locator).await?;
+        let process_host_access =
+            matches!(self.type_of, PluginType::Vcs).then(ProcessHostAccess::default);
 
         // Create host functions (provided by warpgate)
         let functions = create_host_functions(
+            self.type_of,
             self.host_data.clone(),
             HostData {
                 cache_dir: self.host_data.moon_env.cache_dir.clone(),
@@ -136,13 +231,51 @@ impl<Cfg: PluginsConfig, Inst: Plugin> PluginRegistry<Cfg, Inst> {
                 virtual_paths: self.virtual_paths.clone(),
                 working_dir: self.host_data.moon_env.working_dir.clone(),
             },
+            process_host_access.clone(),
         );
 
         // Create the manifest and let the consumer configure it
-        let mut manifest = self.create_manifest(&id, plugin_file.clone())?;
+        let mut manifest = if let Some(bytes) = verified_bytes {
+            self.create_manifest_with_wasm(&id, Wasm::data(bytes))?
+        } else {
+            self.create_manifest(&id, plugin_file.clone())?
+        };
 
-        self.config_data
-            .configure_manifest(&id, &self.host_data, &mut manifest)?;
+        // VCS sandbox policy is host-owned. Configure it before the callback so
+        // consumers can inspect it, then reject attempts to change it.
+        if matches!(self.type_of, PluginType::Vcs) {
+            manifest.allowed_hosts = Some(vec![]);
+            manifest.allowed_paths = Some(Default::default());
+            manifest.timeout_ms = Some(VCS_PLUGIN_TIMEOUT_MS);
+        }
+
+        let vcs_policy = matches!(self.type_of, PluginType::Vcs).then(|| {
+            (
+                manifest.allowed_hosts.clone(),
+                manifest.allowed_paths.clone(),
+                manifest.timeout_ms,
+            )
+        });
+
+        op(&id, &self.host_data, &mut manifest)?;
+
+        if let Some((allowed_hosts, allowed_paths, timeout_ms)) = vcs_policy
+            && (manifest.allowed_hosts != allowed_hosts
+                || manifest.allowed_paths != allowed_paths
+                || manifest.timeout_ms != timeout_ms)
+        {
+            return Err(miette::miette!(
+                "VCS plugin network, filesystem, and timeout policy is host-owned"
+            ));
+        }
+
+        // Ensure the final set of virtual host paths exists, otherwise WASI
+        // (via extism) will throw a cryptic file/directory not found error.
+        if let Some(paths) = &manifest.allowed_paths {
+            for host_path in paths.keys() {
+                fs::create_dir_all(host_path)?;
+            }
+        }
 
         debug!(
             plugin_type = self.type_of.get_label(),
@@ -164,6 +297,7 @@ impl<Cfg: PluginsConfig, Inst: Plugin> PluginRegistry<Cfg, Inst> {
             id_stable: stable_id,
             moon_env: Arc::clone(&self.host_data.moon_env),
             proto_env: Arc::clone(&self.host_data.proto_env),
+            process_host_access,
             wasm_file: plugin_file,
         })
         .await?;
@@ -179,12 +313,40 @@ impl<Cfg: PluginsConfig, Inst: Plugin> PluginRegistry<Cfg, Inst> {
         // Insert into the registry, holding the bucket lock only around the
         // synchronous insert (never across an `.await`). If another task loaded
         // the same plugin concurrently, discard ours and use the race winner.
-        Ok(match self.plugins.entry_async(id).await {
-            Entry::Occupied(entry) => Arc::clone(entry.get()),
+        match self.plugins.entry_async(id.clone()).await {
+            Entry::Occupied(_) if verify_registered => Err(PluginError::ExistingId {
+                id: id.to_string(),
+                ty: self.type_of,
+            }
+            .into()),
+            Entry::Occupied(entry) => Ok(Arc::clone(entry.get())),
             Entry::Vacant(entry) => {
                 entry.insert_entry(Arc::clone(&instance));
-                instance
+                Ok(instance)
             }
-        })
+        }
+    }
+
+    pub async fn load_without_config<I, L>(&self, id: I, locator: L) -> miette::Result<Arc<Inst>>
+    where
+        I: AsRef<str> + Debug,
+        L: AsRef<PluginLocator> + Debug,
+    {
+        self.load_with_config(id, locator, |_| Ok(())).await
+    }
+
+    pub async fn load_verified_without_config<I, L, V>(
+        &self,
+        id: I,
+        locator: L,
+        verify: V,
+    ) -> miette::Result<Arc<Inst>>
+    where
+        I: AsRef<str> + Debug,
+        L: AsRef<PluginLocator> + Debug,
+        V: FnMut(&Path, &[u8]) -> miette::Result<()>,
+    {
+        self.load_verified_with_config(id, locator, verify, |_| Ok(()))
+            .await
     }
 }
