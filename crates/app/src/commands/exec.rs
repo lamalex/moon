@@ -215,7 +215,8 @@ impl ExecWorkflow {
         // so unaffected tasks still run while affected files are still passed.
         if self.args.force {
             self.session
-                .get_cache_engine()?
+                .get_cache_engine()
+                .await?
                 .force_mode(CacheMode::Write);
         }
 
@@ -328,7 +329,7 @@ impl ExecWorkflow {
     async fn load_changed_files(&mut self) -> miette::Result<FxHashSet<WorkspaceRelativePathBuf>> {
         self.print_step("Loading changed files")?;
 
-        let vcs = self.session.get_vcs_adapter()?;
+        let vcs = self.session.get_vcs_adapter().await?;
 
         if !vcs.is_enabled() {
             self.affected = false;
