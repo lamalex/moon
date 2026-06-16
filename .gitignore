@@ -54,3 +54,7 @@ dockerManifest.json
 # AI / agents
 .claude/settings.local.json
 .claude/worktrees
+
+# nix
+result
+result/**
