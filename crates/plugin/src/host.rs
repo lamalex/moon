@@ -1,3 +1,4 @@
+use crate::PluginType;
 use extism::{CurrentPlugin, Error, Function, UserData, Val, ValType};
 use moon_common::{Id, color};
 use moon_config::{
@@ -11,9 +12,12 @@ use proto_core::ProtoEnvironment;
 use rustc_hash::FxHashMap;
 use starbase_utils::json::merge as json_merge;
 use std::fmt;
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use tracing::{instrument, trace};
-use warpgate::host::{HostData, create_host_functions as create_shared_host_functions};
+use warpgate::{from_virtual_path, host::HostData};
+use warpgate_api::{ExecCommandInput, ExecCommandOutput};
 
 #[derive(Clone, Default)]
 pub struct MoonHostData {
@@ -37,9 +41,35 @@ impl fmt::Debug for MoonHostData {
     }
 }
 
-pub fn create_host_functions(data: MoonHostData, shared_data: HostData) -> Vec<Function> {
-    let mut functions = vec![];
-    functions.extend(create_shared_host_functions(shared_data));
+#[derive(Clone)]
+struct VcsHostData {
+    shared: HostData,
+    workspace_root: PathBuf,
+}
+
+pub fn create_host_functions(
+    plugin_type: PluginType,
+    data: MoonHostData,
+    shared_data: HostData,
+) -> Vec<Function> {
+    let mut functions = warpgate::host::create_host_functions(shared_data.clone());
+
+    if matches!(plugin_type, PluginType::Vcs) {
+        functions.retain(|function| function.name() == "host_log");
+        functions.push(Function::new(
+            "exec_command",
+            [ValType::I64],
+            [ValType::I64],
+            UserData::new(VcsHostData {
+                shared: shared_data,
+                workspace_root: data.moon_env.workspace_root.clone(),
+            }),
+            exec_vcs_command,
+        ));
+
+        return functions;
+    }
+
     functions.extend(vec![
         Function::new(
             "load_extension_config_by_id",
@@ -85,6 +115,104 @@ pub fn create_host_functions(data: MoonHostData, shared_data: HostData) -> Vec<F
         ),
     ]);
     functions
+}
+
+fn exec_vcs_command(
+    plugin: &mut CurrentPlugin,
+    inputs: &[Val],
+    outputs: &mut [Val],
+    user_data: UserData<VcsHostData>,
+) -> Result<(), Error> {
+    let input: ExecCommandInput = serde_json::from_str(plugin.memory_get_val(&inputs[0])?)?;
+    validate_vcs_command(&input)?;
+
+    let data = user_data.get()?;
+    let data = data.lock().unwrap();
+    let cwd = input
+        .cwd
+        .as_ref()
+        .map(|path| from_virtual_path(&data.shared.virtual_paths, path))
+        .unwrap_or_else(|| data.shared.working_dir.clone());
+    let workspace_root = data.workspace_root.canonicalize()?;
+    let cwd = cwd.canonicalize()?;
+
+    if !cwd.starts_with(&workspace_root) {
+        return Err(Error::msg(
+            "VCS plugin command working directory must be inside the workspace",
+        ));
+    }
+
+    let result = Command::new("jj")
+        .args(&input.args)
+        .current_dir(cwd)
+        .output()?;
+    let output = ExecCommandOutput {
+        command: input.command,
+        exit_code: result.status.code().unwrap_or(-1),
+        stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+        stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
+        streamed: false,
+    };
+
+    plugin.memory_set_val(&mut outputs[0], serde_json::to_string(&output)?)?;
+
+    Ok(())
+}
+
+fn validate_vcs_command(input: &ExecCommandInput) -> Result<(), Error> {
+    if input.command != "jj"
+        || input.shell.is_some()
+        || input.stream
+        || input.set_executable
+        || !input.env.is_empty()
+        || !input.paths.is_empty()
+    {
+        return Err(Error::msg(
+            "VCS plugins may only execute a piped jj command without host overrides",
+        ));
+    }
+
+    if input.args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--config" | "--config-file" | "--repository" | "-R" | "--tool"
+        ) || arg.starts_with("--config=")
+            || arg.starts_with("--config-file=")
+            || arg.starts_with("--repository=")
+            || arg.starts_with("--tool=")
+    }) {
+        return Err(Error::msg(
+            "VCS plugin jj command contains a forbidden option",
+        ));
+    }
+
+    let mut args = input.args.iter();
+    let mut isolated_operation = false;
+    let subcommand = loop {
+        let Some(arg) = args.next() else {
+            return Err(Error::msg("VCS plugin jj command has no subcommand"));
+        };
+
+        if arg == "--ignore-working-copy" || arg.starts_with("--at-operation=") {
+            continue;
+        }
+
+        if arg == "--no-integrate-operation" {
+            isolated_operation = true;
+            continue;
+        }
+
+        break arg.as_str();
+    };
+
+    match subcommand {
+        "root" | "log" | "diff" => Ok(()),
+        "op" if args.next().is_some_and(|arg| arg == "log") => Ok(()),
+        "new" if isolated_operation => Ok(()),
+        _ => Err(Error::msg(format!(
+            "VCS plugins may not execute `jj {subcommand}`"
+        ))),
+    }
 }
 
 fn map_error(error: miette::Report) -> Error {
@@ -387,4 +515,52 @@ fn load_toolchain_config_by_id(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod vcs_host_tests {
+    use super::*;
+
+    #[test]
+    fn allows_read_only_jj_operations() {
+        for args in [
+            vec!["--ignore-working-copy", "root"],
+            vec!["--at-operation=abc", "log", "-r", "@"],
+            vec!["--at-operation=abc", "diff", "-r", "@"],
+            vec!["op", "log", "-n", "1"],
+            vec![
+                "--at-operation=abc",
+                "--no-integrate-operation",
+                "new",
+                "left",
+                "right",
+            ],
+        ] {
+            assert!(validate_vcs_command(&ExecCommandInput::pipe("jj", args)).is_ok());
+        }
+    }
+
+    #[test]
+    fn rejects_other_commands_and_mutating_jj_operations() {
+        assert!(validate_vcs_command(&ExecCommandInput::pipe("sh", ["-c", "true"])).is_err());
+        assert!(
+            validate_vcs_command(&ExecCommandInput::pipe("jj", ["util", "exec", "sh"])).is_err()
+        );
+        assert!(validate_vcs_command(&ExecCommandInput::pipe("jj", ["new"])).is_err());
+    }
+
+    #[test]
+    fn rejects_jj_configuration_and_external_tools() {
+        assert!(
+            validate_vcs_command(&ExecCommandInput::pipe(
+                "jj",
+                ["log", "--config", "aliases.x='util exec sh'"],
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_vcs_command(&ExecCommandInput::pipe("jj", ["diff", "--tool=malicious"],))
+                .is_err()
+        );
+    }
 }

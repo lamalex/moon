@@ -12,6 +12,57 @@ build:
 build-wasm:
 	cd wasm && cargo build --workspace --target wasm32-wasip1 --release
 
+# PROTOTYPES
+
+# PROTOTYPE: Build and explore the VCS WASM overlay seam.
+prototype-vcs:
+	cargo build --manifest-path wasm/Cargo.toml -p vcs_jj_prototype --target wasm32-wasip1 --release
+	cargo run -p moon_vcs_plugin_prototype
+
+# PROTOTYPE: Compare Git and jj against Moon-level VCS query semantics.
+prototype-vcs-conformance:
+	cargo build --manifest-path wasm/Cargo.toml -p vcs_jj_prototype --target wasm32-wasip1 --release
+	cargo run -p moon_vcs_plugin_prototype -- --conformance
+
+# PROTOTYPE: Compare VCS plugin boundary latency against built-in Git.
+prototype-vcs-benchmark:
+	cargo build --manifest-path wasm/Cargo.toml -p vcs_jj_prototype --target wasm32-wasip1 --release
+	cargo run --release -p moon_vcs_plugin_prototype -- --benchmark
+
+# PROTOTYPE: Fail when release VCS plugin p95 latency exceeds its budget.
+prototype-vcs-benchmark-check:
+	cargo build --manifest-path wasm/Cargo.toml -p vcs_jj_prototype --target wasm32-wasip1 --release
+	cargo run --release -p moon_vcs_plugin_prototype -- --benchmark-check
+
+# PROTOTYPE: Compare master/current Git performance and isolate WASM overhead.
+prototype-vcs-benchmark-comparison:
+	bash "{{justfile_directory()}}/scripts/benchmark/vcsPlugin.sh"
+
+# PROTOTYPE: Resolve the user-scoped VCS overlay activation policy.
+prototype-vcs-policy:
+	cargo run -p moon_vcs_plugin_prototype -- --user-policy
+
+# PROTOTYPE: Pin and activate a user-scoped VCS plugin.
+prototype-vcs-policy-install locator sha256:
+	cargo run -p moon_vcs_plugin_prototype -- --user-policy-install "{{locator}}" "{{sha256}}"
+
+# PROTOTYPE: Pin and activate the locally built jj VCS guest.
+prototype-vcs-policy-install-local:
+	cargo build --manifest-path wasm/Cargo.toml -p vcs_jj_prototype --target wasm32-wasip1 --release
+	cargo run -p moon_vcs_plugin_prototype -- --user-policy-install-local "{{justfile_directory()}}/wasm/target/wasm32-wasip1/release/vcs_jj_prototype.wasm"
+
+# PROTOTYPE: Verify signed provenance and activate its pinned VCS plugin.
+prototype-vcs-policy-install-signed manifest signature public_key:
+	cargo run -p moon_vcs_plugin_prototype -- --user-policy-install-signed "{{manifest}}" "{{signature}}" "{{public_key}}"
+
+# PROTOTYPE: Enable the configured user-scoped VCS plugin.
+prototype-vcs-policy-enable:
+	cargo run -p moon_vcs_plugin_prototype -- --user-policy-enable
+
+# PROTOTYPE: Disable the configured user-scoped VCS plugin.
+prototype-vcs-policy-disable:
+	cargo run -p moon_vcs_plugin_prototype -- --user-policy-disable
+
 # CHECKING
 
 check:
