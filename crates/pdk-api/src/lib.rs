@@ -4,6 +4,7 @@ mod extension;
 mod host;
 mod macros;
 mod prompts;
+mod protocol;
 mod toolchain;
 
 pub use common::*;
@@ -19,6 +20,7 @@ pub use proto_pdk_api::{
     Range, Requirement, SendRequestInput, SendRequestOutput, UnresolvedVersionSpec, Version,
     VersionSpec,
 };
+pub use protocol::*;
 pub use toolchain::*;
 pub use warpgate_api::*;
 
