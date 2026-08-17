@@ -85,6 +85,7 @@
               ./crates/docker/templates/Dockerfile.tera
               ./crates/app/src/commands/graph/html.tera
               ./crates/query/src/mql.pest
+              ./crates/vcs-plugin/res
             ];
           };
 

@@ -130,3 +130,10 @@ assigning_clones = "allow"
 
 [workspace.metadata.cargo-shear]
 ignored = ["serde"]
+
+# Remove after starbase_process is published.
+[patch.crates-io]
+starbase_console = { git = "https://github.com/lamalex/starbase.git", rev = "7a07baab2f78c6ffb1e7f8efec5f1e95a80bf643" }
+starbase_process = { git = "https://github.com/lamalex/starbase.git", rev = "7a07baab2f78c6ffb1e7f8efec5f1e95a80bf643" }
+starbase_shell = { git = "https://github.com/lamalex/starbase.git", rev = "7a07baab2f78c6ffb1e7f8efec5f1e95a80bf643" }
+starbase_styles = { git = "https://github.com/lamalex/starbase.git", rev = "7a07baab2f78c6ffb1e7f8efec5f1e95a80bf643" }
