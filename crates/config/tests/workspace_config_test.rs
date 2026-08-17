@@ -42,8 +42,124 @@ mod workspace_config {
     fn loads_defaults() {
         let config = test_load_config(FILENAME, "{}", load_config_from_root);
 
+        assert!(config.id.is_none());
         assert!(config.telemetry);
         assert!(config.version_constraint.is_none());
+        assert!(config.workspaces.is_empty());
+    }
+
+    mod identity {
+        use super::*;
+
+        #[test]
+        fn supports_a_canonical_id() {
+            let config = test_load_config(FILENAME, "id: acme/platform", load_config_from_root);
+
+            assert_eq!(config.id, Some(Id::raw("acme/platform")));
+        }
+
+        #[test]
+        #[should_panic(expected = "Invalid identifier format for")]
+        fn rejects_an_invalid_id() {
+            test_load_config(FILENAME, "id: 'invalid:id'", load_config_from_root);
+        }
+    }
+
+    mod workspaces {
+        use super::*;
+
+        #[test]
+        fn supports_local_aliases_paths_and_expected_ids() {
+            let config = test_load_config(
+                FILENAME,
+                r"
+workspaces:
+  frontend:
+    path: ../web
+    id: acme/web
+  api:
+    path: ../api
+",
+                load_config_from_root,
+            );
+
+            assert_eq!(config.workspaces.len(), 2);
+            assert_eq!(
+                config.workspaces[&Id::raw("frontend")].id,
+                Some(Id::raw("acme/web"))
+            );
+            assert_eq!(config.workspaces[&Id::raw("frontend")].path, "../web");
+            assert_eq!(config.workspaces[&Id::raw("api")].id, None);
+        }
+
+        #[test]
+        #[should_panic(expected = "path must not be empty")]
+        fn requires_a_path() {
+            test_load_config(
+                FILENAME,
+                r"
+workspaces:
+  frontend: {}
+",
+                load_config_from_root,
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "absolute paths are not supported")]
+        fn rejects_absolute_paths() {
+            test_load_config(
+                FILENAME,
+                r"
+workspaces:
+  frontend:
+    path: /code/web
+",
+                load_config_from_root,
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "absolute paths are not supported")]
+        fn rejects_windows_absolute_paths() {
+            test_load_config(
+                FILENAME,
+                r"
+workspaces:
+  frontend:
+    path: 'C:\code\web'
+",
+                load_config_from_root,
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "workspace paths must use forward slashes")]
+        fn rejects_windows_relative_separators() {
+            test_load_config(
+                FILENAME,
+                r"
+workspaces:
+  frontend:
+    path: '..\web'
+",
+                load_config_from_root,
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "globs are not supported")]
+        fn rejects_globs() {
+            test_load_config(
+                FILENAME,
+                r"
+workspaces:
+  frontend:
+    path: ../web/*
+",
+                load_config_from_root,
+            );
+        }
     }
 
     mod extends {

@@ -21,6 +21,7 @@ use crate::commands::project_graph::ProjectGraphArgs;
 use crate::commands::projects::ProjectsArgs;
 use crate::commands::query::QueryCommands;
 use crate::commands::run::RunArgs;
+use crate::commands::sources::SourcesArgs;
 use crate::commands::sync::SyncCommands;
 use crate::commands::task::TaskArgs;
 use crate::commands::task_graph::TaskGraphArgs;
@@ -184,6 +185,12 @@ pub enum Commands {
         about = "Run one or many tasks in the action pipeline."
     )]
     Run(RunArgs),
+
+    #[command(
+        name = "sources",
+        about = "List and diagnose configured source workspaces."
+    )]
+    Sources(SourcesArgs),
 
     #[command(
         name = "setup",

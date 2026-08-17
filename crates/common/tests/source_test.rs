@@ -1,9 +1,29 @@
 use moon_common::{SourcePathBuf, SourceRegistry, SourceRootId};
+use std::path::PathBuf;
 
 #[test]
 fn defaults_to_a_stable_primary_id() {
     assert_eq!(SourceRootId::primary().as_str(), "workspace");
     assert_eq!(SourceRootId::default(), SourceRootId::primary());
+}
+
+#[test]
+fn compatibility_paths_resolve_against_a_configured_primary_id() {
+    let root = PathBuf::from("/workspace");
+    let primary = SourceRootId::new("acme/platform").unwrap();
+    let mut sources = SourceRegistry::new(primary, root.clone());
+
+    assert_eq!(
+        sources
+            .resolve(&SourcePathBuf::primary("file.txt"))
+            .unwrap(),
+        root.join("file.txt")
+    );
+    assert!(
+        sources
+            .register(SourceRootId::primary(), PathBuf::from("/child"))
+            .is_err()
+    );
 }
 
 #[test]

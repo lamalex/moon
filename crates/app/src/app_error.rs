@@ -1,5 +1,6 @@
 use miette::Diagnostic;
-use moon_common::{Style, Stylize};
+use moon_common::{SourceAlias, SourceRootId, Style, Stylize};
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug, Diagnostic)]
@@ -46,6 +47,43 @@ pub enum AppError {
     #[diagnostic(code(app::missing_working_dir))]
     #[error("Unable to determine your current working directory.")]
     MissingWorkingDir,
+
+    #[diagnostic(code(app::workspace::discovered_id_required))]
+    #[error("Discovered workspace {alias} at {root:?} must declare a canonical `id`.")]
+    DiscoveredWorkspaceIdRequired { alias: SourceAlias, root: PathBuf },
+
+    #[diagnostic(code(app::workspace::discovered_id_mismatch))]
+    #[error(
+        "Discovered workspace {alias} at {root:?} declares ID {actual}, but {expected} was expected."
+    )]
+    DiscoveredWorkspaceIdMismatch {
+        actual: SourceRootId,
+        alias: SourceAlias,
+        expected: SourceRootId,
+        root: PathBuf,
+    },
+
+    #[diagnostic(code(app::workspace::discovered_id_conflict))]
+    #[error(
+        "Discovered workspace {alias} declares ID {id}, but that ID is already registered at {existing_root:?} instead of {root:?}."
+    )]
+    DiscoveredWorkspaceIdConflict {
+        alias: SourceAlias,
+        existing_root: PathBuf,
+        id: SourceRootId,
+        root: PathBuf,
+    },
+
+    #[diagnostic(code(app::workspace::discovered_root_conflict))]
+    #[error(
+        "Discovered workspace {alias} declares ID {id}, but its root {root:?} is already registered as {existing_id}."
+    )]
+    DiscoveredWorkspaceRootConflict {
+        alias: SourceAlias,
+        existing_id: SourceRootId,
+        id: SourceRootId,
+        root: PathBuf,
+    },
 
     #[diagnostic(code(app::upgrade::requires_internet))]
     #[error("Upgrading moon requires an internet connection!")]

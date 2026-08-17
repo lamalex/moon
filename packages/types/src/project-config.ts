@@ -3,21 +3,9 @@
 /* eslint-disable */
 
 import type { Id } from './common';
-import type {
-	Input,
-	MergeStrategy,
-	PartialTaskConfig,
-	PartialTaskOptionsConfig,
-	TaskConfig,
-	TaskOptionsConfig,
-} from './tasks-config';
+import type { Input, MergeStrategy, PartialTaskConfig, PartialTaskOptionsConfig, TaskConfig, TaskOptionsConfig } from './tasks-config';
 import type { PartialToolchainPluginConfig, ToolchainPluginConfig } from './toolchains-config';
-import type {
-	DockerFileConfig,
-	DockerScaffoldConfig,
-	PartialDockerFileConfig,
-	PartialDockerScaffoldConfig,
-} from './workspace-config';
+import type { DockerFileConfig, DockerScaffoldConfig, PartialDockerFileConfig, PartialDockerScaffoldConfig } from './workspace-config';
 
 /** The relationship scope of a dependency. */
 export type DependencyScope = 'build' | 'development' | 'peer' | 'production' | 'root';
@@ -70,34 +58,10 @@ export interface ProjectDockerConfig {
 }
 
 /** Supported programming languages that each project can be written in. */
-export type LanguageType =
-	| 'bash'
-	| 'batch'
-	| 'cplusplus'
-	| 'csharp'
-	| 'dotnet'
-	| 'go'
-	| 'java'
-	| 'javascript'
-	| 'kotlin'
-	| 'php'
-	| 'python'
-	| 'ruby'
-	| 'rust'
-	| 'swift'
-	| 'typescript'
-	| 'unknown'
-	| string;
+export type LanguageType = 'bash' | 'batch' | 'cplusplus' | 'csharp' | 'dotnet' | 'go' | 'java' | 'javascript' | 'kotlin' | 'php' | 'python' | 'ruby' | 'rust' | 'swift' | 'typescript' | 'unknown' | string;
 
 /** The layer within the technology stack, for categorizing. */
-export type LayerType =
-	| 'application'
-	| 'automation'
-	| 'configuration'
-	| 'library'
-	| 'scaffolding'
-	| 'tool'
-	| 'unknown';
+export type LayerType = 'application' | 'automation' | 'configuration' | 'library' | 'scaffolding' | 'tool' | 'unknown';
 
 export type OwnersPaths = string[] | Record<string, string[]>;
 
@@ -406,8 +370,7 @@ export interface PartialProjectMetadataConfigBase {
 }
 
 /** Expanded information about the project. */
-export type PartialProjectMetadataConfig = PartialProjectMetadataConfigBase &
-	PartialProjectMetadataConfigMetadata;
+export type PartialProjectMetadataConfig = PartialProjectMetadataConfigBase & PartialProjectMetadataConfigMetadata;
 
 export type PartialProjectToolchainEntry = null | boolean | PartialToolchainPluginConfig;
 
@@ -430,8 +393,7 @@ export interface PartialProjectToolchainsConfigBase {
 }
 
 /** Overrides top-level toolchain settings, scoped to this project. */
-export type PartialProjectToolchainsConfig = PartialProjectToolchainsConfigBase &
-	PartialProjectToolchainsConfigPlugins;
+export type PartialProjectToolchainsConfig = PartialProjectToolchainsConfigBase & PartialProjectToolchainsConfigPlugins;
 
 /** Controls how workspace-level tasks are inherited. */
 export interface PartialProjectWorkspaceInheritedTasksConfig {

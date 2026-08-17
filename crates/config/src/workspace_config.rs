@@ -3,8 +3,49 @@ use crate::workspace::*;
 use crate::{config_enum, config_struct, config_unit_enum};
 use moon_common::Id;
 use rustc_hash::FxHashMap;
-use schematic::{Config, ConfigEnum, PathSegment, ValidateError, env, validate};
+use schematic::{Config, ConfigEnum, PathSegment, ValidateError, ValidateResult, env, validate};
+use std::path::{Component, Path};
 use version_spec::Range;
+
+fn validate_workspace_path<D, C>(
+    value: &str,
+    _data: &D,
+    _context: &C,
+    _finalize: bool,
+) -> ValidateResult {
+    if value.is_empty() {
+        return Err(ValidateError::new("path must not be empty"));
+    }
+
+    let bytes = value.as_bytes();
+    let has_windows_drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+
+    if has_windows_drive
+        || value.starts_with('\\')
+        || Path::new(value)
+            .components()
+            .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+    {
+        return Err(ValidateError::new("absolute paths are not supported"));
+    }
+
+    if value.contains('\\') {
+        return Err(ValidateError::new(
+            "workspace paths must use forward slashes",
+        ));
+    }
+
+    if value
+        .chars()
+        .any(|char| matches!(char, '*' | '?' | '[' | ']' | '{' | '}'))
+    {
+        return Err(ValidateError::new(
+            "globs are not supported, expected a literal workspace path",
+        ));
+    }
+
+    Ok(())
+}
 
 // We can't use serde based types in the enum below to handle validation,
 // as serde fails to parse correctly. So we must manually validate here.
@@ -77,6 +118,20 @@ config_unit_enum!(
 );
 
 config_struct!(
+    /// Declares another Moon workspace to discover.
+    #[derive(Config)]
+    pub struct WorkspaceDiscoveryConfig {
+        /// Expected canonical ID declared by the discovered workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<Id>,
+
+        /// Path to the workspace, relative to the declaring workspace root.
+        #[setting(validate = validate_workspace_path)]
+        pub path: String,
+    }
+);
+
+config_struct!(
     /// Configures projects in the workspace, using both globs and explicit source paths.
     #[derive(Config)]
     pub struct WorkspaceProjectsConfig {
@@ -145,6 +200,10 @@ config_struct!(
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub default_project: Option<Id>,
 
+        /// Stable canonical identity for this workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<Id>,
+
         /// Configures Docker integration for the workspace.
         /// @since 1.27.0
         #[setting(nested)]
@@ -183,6 +242,11 @@ config_struct!(
         /// or both values.
         #[setting(nested, validate = validate_projects)]
         pub projects: WorkspaceProjects,
+
+        /// Other Moon workspaces to discover, keyed by a local alias.
+        #[setting(nested)]
+        #[serde(default, skip_serializing_if = "FxHashMap::is_empty")]
+        pub workspaces: FxHashMap<Id, WorkspaceDiscoveryConfig>,
 
         /// Configures aspects of the remote service.
         #[setting(nested)]

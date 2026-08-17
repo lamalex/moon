@@ -2,6 +2,7 @@ use crate::app::{Cli, Commands};
 use crate::app_error::AppError;
 use crate::commands::daemon::DaemonCommands;
 use crate::systems::*;
+use crate::{DiscoveredWorkspace, DiscoveredWorkspaceFailure, SourceContext};
 use async_trait::async_trait;
 use moon_action_graph::{ActionGraphBuilder, ActionGraphBuilderOptions};
 use moon_api::Launchpad;
@@ -10,7 +11,9 @@ use moon_cache::{CacheContext, CacheEngine};
 use moon_cache_local::LocalStorage;
 use moon_cache_remote::{GrpcRemoteStorage, HttpRemoteStorage};
 use moon_codegen::CodeGenerator;
-use moon_common::{SourceRegistry, is_docker, is_formatted_output, is_test_env};
+use moon_common::{
+    SourceAlias, SourceRegistry, SourceRootId, is_docker, is_formatted_output, is_test_env,
+};
 use moon_config::{
     ExtensionsConfig, InheritedTasksManager, RemoteApi, ToolchainsConfig, WorkspaceConfig,
 };
@@ -30,6 +33,7 @@ use moon_vcs_plugin::load_vcs_adapter;
 use moon_workspace::{WorkspaceBuilder, WorkspaceBuilderAsync, WorkspaceBuilderContext};
 use moon_workspace_graph::WorkspaceGraph;
 use proto_core::ProtoEnvironment;
+use rustc_hash::FxHashMap;
 use starbase::{AppExitCode, AppResult, AppSession};
 use std::env;
 use std::fmt;
@@ -73,6 +77,10 @@ pub struct MoonSession {
     pub workspace_config: Arc<WorkspaceConfig>,
 
     // Sources
+    pub source_aliases: Arc<FxHashMap<SourceAlias, SourceRootId>>,
+    pub source_contexts: Arc<FxHashMap<SourceRootId, SourceContext>>,
+    pub source_discovery_failures: Arc<Vec<DiscoveredWorkspaceFailure>>,
+    pub source_workspaces: Arc<FxHashMap<SourceRootId, DiscoveredWorkspace>>,
     pub sources: Arc<SourceRegistry>,
 
     // Paths
@@ -98,6 +106,10 @@ impl MoonSession {
             moon_env: Arc::new(MoonEnvironment::default()),
             project_graph: OnceLock::new(),
             proto_env: Arc::new(ProtoEnvironment::default()),
+            source_aliases: Arc::new(FxHashMap::default()),
+            source_contexts: Arc::new(FxHashMap::default()),
+            source_discovery_failures: Arc::new(Vec::new()),
+            source_workspaces: Arc::new(FxHashMap::default()),
             sources: Arc::new(SourceRegistry::default()),
             task_graph: OnceLock::new(),
             tasks_config: Arc::new(InheritedTasksManager::default()),
@@ -467,8 +479,6 @@ impl AppSession for MoonSession {
             self.working_dir.clone()
         };
 
-        self.sources = Arc::new(SourceRegistry::single(self.workspace_root.clone()));
-
         self.config_dir = self.config_loader.locate_dir(&self.workspace_root);
 
         // Load environments
@@ -481,8 +491,37 @@ impl AppSession for MoonSession {
         // Load configs
 
         if self.requires_workspace_configured() {
-            let (workspace_config, tasks_config, extensions_config, toolchains_config) = try_join!(
-                startup::load_workspace_config(self.config_loader.clone(), &self.workspace_root),
+            self.workspace_config =
+                startup::load_workspace_config(self.config_loader.clone(), &self.workspace_root)
+                    .await?;
+
+            let source_diagnostics = matches!(self.cli.command, Commands::Sources(_));
+            let discovery = if source_diagnostics {
+                startup::discover_workspaces_for_diagnostics(
+                    &self.config_loader,
+                    &self.workspace_root,
+                    Arc::clone(&self.workspace_config),
+                )
+                .await?
+            } else {
+                startup::discover_workspaces(
+                    &self.config_loader,
+                    &self.workspace_root,
+                    Arc::clone(&self.workspace_config),
+                )
+                .await?
+            };
+            let source_contexts =
+                startup::load_source_contexts(&self.config_loader, &discovery, source_diagnostics)
+                    .await?;
+
+            self.source_aliases = Arc::new(discovery.aliases);
+            self.source_contexts = Arc::new(source_contexts);
+            self.source_discovery_failures = Arc::new(discovery.failures);
+            self.source_workspaces = Arc::new(discovery.workspaces);
+            self.sources = discovery.sources;
+
+            let (tasks_config, extensions_config, toolchains_config) = try_join!(
                 startup::load_tasks_configs(self.config_loader.clone(), &self.workspace_root),
                 startup::load_extensions_config(self.config_loader.clone(), &self.workspace_root),
                 startup::load_toolchains_config(
@@ -493,10 +532,16 @@ impl AppSession for MoonSession {
                 ),
             )?;
 
-            self.workspace_config = workspace_config;
             self.extensions_config = extensions_config;
             self.toolchains_config = toolchains_config;
             self.tasks_config = tasks_config;
+
+            GlobalEnvBag::instance().set(
+                "PROTO_CLI_VERSION",
+                self.toolchains_config.proto.version.to_string(),
+            );
+        } else {
+            self.sources = Arc::new(SourceRegistry::single(self.workspace_root.clone()));
         }
 
         startup::register_feature_flags(&self.workspace_config)?;
@@ -517,12 +562,20 @@ impl AppSession for MoonSession {
             analyze::validate_version_constraint(constraint, &self.cli_version)?;
         }
 
-        let vcs = self.get_vcs_adapter().await?;
+        let source_diagnostics = matches!(self.cli.command, Commands::Sources(_));
 
-        analyze::extract_repo_info(&vcs).await?;
+        if !source_diagnostics {
+            let vcs = self.get_vcs_adapter().await?;
+
+            analyze::extract_repo_info(&vcs).await?;
+        }
+
+        for source in self.source_contexts.values() {
+            source.initialize_vcs().await;
+        }
 
         // Preload components
-        if self.requires_workspace_configured() {
+        if self.requires_workspace_configured() && !source_diagnostics {
             let _ = self.get_cache_engine().await?;
         }
 
@@ -566,6 +619,10 @@ impl AppSession for MoonSession {
             engine.storage.wait_for_background_tasks().await?;
         }
 
+        for source in self.source_contexts.values() {
+            source.wait_for_cache_tasks().await?;
+        }
+
         // Ensure all child processes have finished
         ProcessRegistry::instance()
             .wait_for_running_to_shutdown()
@@ -584,6 +641,9 @@ impl fmt::Debug for MoonSession {
             .field("cli_version", &self.cli_version)
             .field("moon_env", &self.moon_env)
             .field("proto_env", &self.proto_env)
+            .field("source_aliases", &self.source_aliases)
+            .field("source_context_ids", &self.source_contexts.keys())
+            .field("source_workspaces", &self.source_workspaces)
             .field("sources", &self.sources)
             .field("tasks_config", &self.tasks_config)
             .field("extensions_config", &self.extensions_config)

@@ -5,8 +5,8 @@
 Manymoons is a design and implementation effort. The external configuration and command syntax
 described by this document are intentionally undecided unless explicitly marked otherwise.
 
-Milestone 1, internal source-root qualification, is complete. Milestone 2, direct multi-workspace
-discovery, is in progress.
+Milestone 1, internal source-root qualification, and Milestone 2, direct multi-workspace discovery,
+are complete. Milestone 3, aggregated querying, is next.
 
 ## End Goal
 
@@ -278,6 +278,9 @@ declaring workspace and may be reused elsewhere.
 
 Exit criteria: multiple sources can be listed and diagnosed, while all existing unqualified
 commands remain scoped to the current or primary source.
+
+Live child-root watcher routing remains deferred to Milestone 7. Milestone 2 loads and isolates
+every direct source for each session, while daemon file events remain primary-root scoped.
 
 ### Milestone 3: Aggregated Querying
 

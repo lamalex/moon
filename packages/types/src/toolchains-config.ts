@@ -148,8 +148,7 @@ export interface PartialToolchainPluginConfigBase {
 }
 
 /** Configures an individual toolchain. */
-export type PartialToolchainPluginConfig = PartialToolchainPluginConfigBase &
-	PartialToolchainPluginConfigConfig;
+export type PartialToolchainPluginConfig = PartialToolchainPluginConfigBase & PartialToolchainPluginConfigConfig;
 
 /** Configures how moon integrates with proto. */
 export interface PartialProtoConfig {

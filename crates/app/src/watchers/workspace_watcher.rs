@@ -1,4 +1,5 @@
 use crate::session::MoonSession;
+use crate::systems::startup;
 use async_trait::async_trait;
 use moon_common::path::WorkspaceRelativePath;
 use moon_config::WorkspaceProjects;
@@ -138,8 +139,12 @@ impl WorkspaceWatcher {
     }
 
     async fn rebuild_graphs(&mut self, state: &AtomicDaemonState) -> miette::Result<()> {
-        // Abort any existing graph building
+        // Abort any existing graph or context building
         if let Some(handle) = self.graph_handle.take() {
+            handle.abort();
+        }
+
+        if let Some(handle) = self.context_handle.take() {
             handle.abort();
         }
 
@@ -237,6 +242,10 @@ impl WorkspaceWatcher {
             .should_invalidate(&toolchains_config);
 
         self.session.toolchains_config = Arc::new(toolchains_config);
+        moon_env_var::GlobalEnvBag::instance().set(
+            "PROTO_CLI_VERSION",
+            self.session.toolchains_config.proto.version.to_string(),
+        );
 
         // Invalidate the toolchain registry if the toolchains config changed
         if invalidate {
@@ -252,11 +261,34 @@ impl WorkspaceWatcher {
     async fn reset_workspace(&mut self, state: &AtomicDaemonState) -> miette::Result<()> {
         debug!("Updating workspace config");
 
-        let workspace_config = self
-            .session
-            .config_loader
-            .load_workspace_config(&self.session.workspace_root)?;
+        let workspace_config = Arc::new(
+            self.session
+                .config_loader
+                .load_workspace_config(&self.session.workspace_root)?,
+        );
         let mut rebuild = false;
+        let rediscover = workspace_config.id != self.session.workspace_config.id
+            || workspace_config.workspaces != self.session.workspace_config.workspaces;
+        let discovery = if rediscover {
+            Some(
+                startup::discover_workspaces(
+                    &self.session.config_loader,
+                    &self.session.workspace_root,
+                    Arc::clone(&workspace_config),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let source_contexts = if let Some(discovery) = &discovery {
+            Some(
+                startup::load_source_contexts(&self.session.config_loader, discovery, false)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         // Invalidate the VCS adapter if the VCS config changed
         if self
@@ -283,7 +315,27 @@ impl WorkspaceWatcher {
             let _ = client.stop().await;
         }
 
-        self.session.workspace_config = Arc::new(workspace_config);
+        self.session.workspace_config = workspace_config;
+
+        if let Some(discovery) = discovery {
+            for source in self.session.source_contexts.values() {
+                source.wait_for_cache_tasks().await?;
+            }
+
+            self.session.source_aliases = Arc::new(discovery.aliases);
+            self.session.source_contexts = Arc::new(
+                source_contexts.expect("Source contexts must exist after workspace discovery."),
+            );
+            self.session.source_discovery_failures = Arc::new(discovery.failures);
+            self.session.source_workspaces = Arc::new(discovery.workspaces);
+            self.session.sources = discovery.sources;
+            self.session.reset_components();
+            rebuild = true;
+        } else if let Some(primary) = Arc::make_mut(&mut self.session.source_workspaces)
+            .get_mut(self.session.sources.primary_id())
+        {
+            primary.workspace_config = Arc::clone(&self.session.workspace_config);
+        }
 
         // Must run after the new config has been set!
         if rebuild {

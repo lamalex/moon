@@ -250,28 +250,10 @@ export type TaskOutputStyle = 'buffer' | 'buffer-only-failure' | 'hash' | 'none'
 export type TaskPriority = 'critical' | 'high' | 'normal' | 'low';
 
 /** A list of available shells on Unix. */
-export type TaskUnixShell =
-	| 'bash'
-	| 'elvish'
-	| 'fish'
-	| 'ion'
-	| 'murex'
-	| 'nu'
-	| 'pwsh'
-	| 'sh'
-	| 'xonsh'
-	| 'zsh';
+export type TaskUnixShell = 'bash' | 'elvish' | 'fish' | 'ion' | 'murex' | 'nu' | 'pwsh' | 'sh' | 'xonsh' | 'zsh';
 
 /** A list of available shells on Windows. */
-export type TaskWindowsShell =
-	| 'bash'
-	| 'elvish'
-	| 'fish'
-	| 'murex'
-	| 'nu'
-	| 'pwsh'
-	| 'powershell'
-	| 'xonsh';
+export type TaskWindowsShell = 'bash' | 'elvish' | 'fish' | 'murex' | 'nu' | 'pwsh' | 'powershell' | 'xonsh';
 
 /** Options to control task inheritance, execution, and more. */
 export interface TaskOptionsConfig {
@@ -477,10 +459,7 @@ export interface TaskCheckFingerprintConfig {
 	script: string;
 }
 
-export type TaggedTaskCheck =
-	| TaskCheckConditionConfig
-	| TaskCheckRequirementConfig
-	| TaskCheckFingerprintConfig;
+export type TaggedTaskCheck = TaskCheckConditionConfig | TaskCheckRequirementConfig | TaskCheckFingerprintConfig;
 
 export type TaskCheck = string | TaggedTaskCheck;
 

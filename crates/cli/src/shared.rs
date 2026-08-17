@@ -259,6 +259,7 @@ pub async fn run_cli(args: Vec<OsString>) -> MainResult {
                     }
                 },
                 Commands::Run(args) => commands::run::run(session, args).await,
+                Commands::Sources(args) => commands::sources::sources(session, args).await,
                 Commands::Setup => commands::setup::setup(session).await,
                 Commands::Sync { command } => match command {
                     Some(SyncCommands::Codeowners(args)) => {

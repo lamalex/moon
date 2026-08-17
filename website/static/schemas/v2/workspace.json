@@ -101,6 +101,18 @@
         }
       ]
     },
+    "id": {
+      "title": "id",
+      "description": "Stable canonical identity for this workspace.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Id"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "notifier": {
       "title": "notifier",
       "description": "Configures how and where notifications are sent.",
@@ -178,6 +190,17 @@
         }
       ],
       "markdownDescription": "Requires a specific version of the `moon` binary."
+    },
+    "workspaces": {
+      "title": "workspaces",
+      "description": "Other Moon workspaces to discover, keyed by a local alias.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/WorkspaceDiscoveryConfig"
+      },
+      "propertyNames": {
+        "$ref": "#/definitions/Id"
+      }
     }
   },
   "additionalProperties": false,
@@ -291,7 +314,10 @@
     "CodeownersOrderBy": {
       "description": "How to order ownership rules within the generated file.",
       "type": "string",
-      "enum": ["file-source", "project-id"]
+      "enum": [
+        "file-source",
+        "project-id"
+      ]
     },
     "ConstraintsConfig": {
       "description": "Configures boundaries and constraints between projects.",
@@ -597,12 +623,18 @@
     "HasherOptimization": {
       "description": "The optimization to use when hashing.",
       "type": "string",
-      "enum": ["accuracy", "performance"]
+      "enum": [
+        "accuracy",
+        "performance"
+      ]
     },
     "HasherWalkStrategy": {
       "description": "The strategy to use when walking the file system.",
       "type": "string",
-      "enum": ["glob", "vcs"]
+      "enum": [
+        "glob",
+        "vcs"
+      ]
     },
     "Id": {
       "type": "string"
@@ -647,7 +679,13 @@
     "NotifierEventType": {
       "description": "The types of events in which to send notifications.",
       "type": "string",
-      "enum": ["never", "always", "failure", "success", "task-failure"]
+      "enum": [
+        "never",
+        "always",
+        "failure",
+        "success",
+        "task-failure"
+      ]
     },
     "PipelineActionSwitch": {
       "description": "Toggles the state of actions within the pipeline.",
@@ -739,7 +777,10 @@
     "RemoteApi": {
       "description": "The API format of the remote service. @since 1.32.0",
       "type": "string",
-      "enum": ["grpc", "http"]
+      "enum": [
+        "grpc",
+        "http"
+      ]
     },
     "RemoteAuthConfig": {
       "description": "Configures basic HTTP authentication. @since 1.32.0",
@@ -808,7 +849,10 @@
     "RemoteCompression": {
       "description": "Supported blob compression levels for gRPC APIs. @since 1.31.0",
       "type": "string",
-      "enum": ["none", "zstd"]
+      "enum": [
+        "none",
+        "zstd"
+      ]
     },
     "RemoteConfig": {
       "description": "Configures the remote service, powered by the Bazel Remote Execution API. @since 1.30.0",
@@ -961,7 +1005,9 @@
     "VcsClient": {
       "description": "The VCS being utilized by the repository.",
       "type": "string",
-      "enum": ["git"]
+      "enum": [
+        "git"
+      ]
     },
     "VcsConfig": {
       "description": "Configures the version control system (VCS).",
@@ -1037,17 +1083,53 @@
     "VcsHookFormat": {
       "description": "The format to use for generated VCS hook files. @since 1.29.0",
       "type": "string",
-      "enum": ["bash", "native"]
+      "enum": [
+        "bash",
+        "native"
+      ]
     },
     "VcsProvider": {
       "description": "The upstream version control provider, where the repository source code is stored.",
       "type": "string",
-      "enum": ["bitbucket", "bitbucket-legacy", "github", "gitlab", "other"]
+      "enum": [
+        "bitbucket",
+        "bitbucket-legacy",
+        "github",
+        "gitlab",
+        "other"
+      ]
+    },
+    "WorkspaceDiscoveryConfig": {
+      "description": "Declares another Moon workspace to discover.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "id",
+          "description": "Expected canonical ID declared by the discovered workspace.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "path": {
+          "title": "path",
+          "description": "Path to the workspace, relative to the declaring workspace root.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     },
     "WorkspaceProjectGlobFormat": {
       "description": "The project identifier format for glob located projects.",
       "type": "string",
-      "enum": ["dir-name", "source-path"]
+      "enum": [
+        "dir-name",
+        "source-path"
+      ]
     },
     "WorkspaceProjects": {
       "description": "Configures projects in the workspace.",

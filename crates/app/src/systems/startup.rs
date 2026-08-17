@@ -1,12 +1,18 @@
 use crate::app_error::AppError;
-use miette::IntoDiagnostic;
-use moon_common::path::locate_config_dir;
+use crate::{
+    DiscoveredWorkspace, DiscoveredWorkspaceFailure, SourceContext, SourceLoadFailure,
+    WorkspaceDiscovery,
+};
+use miette::{Context, IntoDiagnostic};
+use moon_common::path::{clean_components, locate_config_dir};
+use moon_common::{SourceAlias, SourceRegistry, SourceRootId};
 use moon_config::{ExtensionsConfig, InheritedTasksManager, ToolchainsConfig, WorkspaceConfig};
 use moon_config_loader::ConfigLoader;
 use moon_env::MoonEnvironment;
 use moon_env_var::GlobalEnvBag;
 use moon_feature_flags::FeatureFlags;
 use proto_core::ProtoEnvironment;
+use rustc_hash::FxHashMap;
 use starbase_styles::color;
 use starbase_utils::dirs;
 use std::path::{Path, PathBuf};
@@ -45,6 +51,11 @@ pub fn find_workspace_root(working_dir: &Path) -> miette::Result<PathBuf> {
         let root: PathBuf = root
             .parse()
             .map_err(|_| AppError::InvalidWorkspaceRootEnvVar)?;
+        let root = if root.is_absolute() {
+            clean_components(root)
+        } else {
+            clean_components(working_dir.join(root))
+        };
 
         if !locate_config_dir(&root).exists() {
             return Err(AppError::MissingConfigDir.into());
@@ -133,6 +144,313 @@ pub async fn load_workspace_config(
     Ok(Arc::new(config))
 }
 
+/// Discover direct workspace declarations without traversing declarations in child workspaces.
+pub async fn discover_workspaces(
+    config_loader: &ConfigLoader,
+    primary_root: &Path,
+    primary_config: Arc<WorkspaceConfig>,
+) -> miette::Result<WorkspaceDiscovery> {
+    discover_workspaces_internal(config_loader, primary_root, primary_config, false).await
+}
+
+/// Discover workspaces while retaining child failures for the diagnostics command.
+pub async fn discover_workspaces_for_diagnostics(
+    config_loader: &ConfigLoader,
+    primary_root: &Path,
+    primary_config: Arc<WorkspaceConfig>,
+) -> miette::Result<WorkspaceDiscovery> {
+    discover_workspaces_internal(config_loader, primary_root, primary_config, true).await
+}
+
+async fn discover_workspaces_internal(
+    config_loader: &ConfigLoader,
+    primary_root: &Path,
+    primary_config: Arc<WorkspaceConfig>,
+    retain_failures: bool,
+) -> miette::Result<WorkspaceDiscovery> {
+    let primary_id = match &primary_config.id {
+        Some(id) => SourceRootId::new(id.as_str())?,
+        None => SourceRootId::primary(),
+    };
+    let mut sources = SourceRegistry::new(primary_id.clone(), primary_root.to_path_buf());
+    let mut aliases = FxHashMap::default();
+    let mut failures = Vec::new();
+    let mut workspaces = FxHashMap::default();
+    let primary_physical_root = primary_root
+        .canonicalize()
+        .into_diagnostic()
+        .wrap_err("Failed to resolve the primary workspace root")?;
+    let mut physical_roots = FxHashMap::default();
+    let mut identity_roots = FxHashMap::default();
+
+    physical_roots.insert(primary_physical_root.clone(), primary_id.clone());
+    identity_roots.insert(primary_id.clone(), primary_physical_root);
+
+    workspaces.insert(
+        primary_id.clone(),
+        DiscoveredWorkspace {
+            config_dir: config_loader.dir.clone(),
+            id: primary_id,
+            root: primary_root.to_path_buf(),
+            workspace_config: Arc::clone(&primary_config),
+        },
+    );
+
+    let mut declarations = primary_config.workspaces.iter().collect::<Vec<_>>();
+    declarations.sort_by_key(|(alias, _)| *alias);
+
+    for (alias, declaration) in declarations {
+        let alias = SourceAlias::new(alias.as_str())?;
+        let root = clean_components(primary_root.join(&declaration.path));
+        let physical_root =
+            match root.canonicalize().into_diagnostic().wrap_err_with(|| {
+                format!("Failed to resolve discovered workspace {alias} at {root:?}")
+            }) {
+                Ok(root) => root,
+                Err(error) if retain_failures => {
+                    failures.push(DiscoveredWorkspaceFailure {
+                        alias,
+                        message: error.to_string(),
+                        root,
+                        stage: "resolve-path".into(),
+                    });
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+        let child_loader = config_loader.for_workspace_root(&root);
+        let child_config = match load_workspace_config(child_loader.clone(), &root)
+            .await
+            .wrap_err_with(|| format!("Failed to load discovered workspace {alias} at {root:?}"))
+        {
+            Ok(config) => config,
+            Err(error) if retain_failures => {
+                failures.push(DiscoveredWorkspaceFailure {
+                    alias,
+                    message: error.to_string(),
+                    root,
+                    stage: "workspace-config".into(),
+                });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(configured_id) = &child_config.id else {
+            let error: miette::Report = AppError::DiscoveredWorkspaceIdRequired {
+                alias: alias.clone(),
+                root: root.clone(),
+            }
+            .into();
+
+            if retain_failures {
+                failures.push(DiscoveredWorkspaceFailure {
+                    alias,
+                    message: error.to_string(),
+                    root,
+                    stage: "workspace-identity".into(),
+                });
+                continue;
+            }
+
+            return Err(error);
+        };
+        let id = SourceRootId::new(configured_id.as_str())?;
+
+        if let Some(expected_id) = &declaration.id {
+            let expected = SourceRootId::new(expected_id.as_str())?;
+
+            if expected != id {
+                let error: miette::Report = AppError::DiscoveredWorkspaceIdMismatch {
+                    actual: id.clone(),
+                    alias: alias.clone(),
+                    expected,
+                    root: root.clone(),
+                }
+                .into();
+
+                if retain_failures {
+                    failures.push(DiscoveredWorkspaceFailure {
+                        alias,
+                        message: error.to_string(),
+                        root,
+                        stage: "workspace-identity".into(),
+                    });
+                    continue;
+                }
+
+                return Err(error);
+            }
+        }
+
+        if let Some(existing_root) = identity_roots.get(&id) {
+            if existing_root == &physical_root {
+                aliases.insert(alias, id);
+                continue;
+            }
+
+            let error: miette::Report = AppError::DiscoveredWorkspaceIdConflict {
+                alias: alias.clone(),
+                existing_root: sources.get(&id)?.to_path_buf(),
+                id: id.clone(),
+                root: root.clone(),
+            }
+            .into();
+
+            if retain_failures {
+                failures.push(DiscoveredWorkspaceFailure {
+                    alias,
+                    message: error.to_string(),
+                    root,
+                    stage: "workspace-identity".into(),
+                });
+                continue;
+            }
+
+            return Err(error);
+        }
+
+        if let Some(existing_id) = physical_roots.get(&physical_root) {
+            let error: miette::Report = AppError::DiscoveredWorkspaceRootConflict {
+                alias: alias.clone(),
+                existing_id: existing_id.clone(),
+                id: id.clone(),
+                root: root.clone(),
+            }
+            .into();
+
+            if retain_failures {
+                failures.push(DiscoveredWorkspaceFailure {
+                    alias,
+                    message: error.to_string(),
+                    root,
+                    stage: "workspace-identity".into(),
+                });
+                continue;
+            }
+
+            return Err(error);
+        }
+
+        if let Err(error) = sources.register(id.clone(), root.clone()) {
+            if retain_failures {
+                failures.push(DiscoveredWorkspaceFailure {
+                    alias,
+                    message: error.to_string(),
+                    root,
+                    stage: "workspace-identity".into(),
+                });
+                continue;
+            }
+
+            return Err(error);
+        }
+        aliases.insert(alias, id.clone());
+        identity_roots.insert(id.clone(), physical_root.clone());
+        physical_roots.insert(physical_root, id.clone());
+        workspaces.insert(
+            id.clone(),
+            DiscoveredWorkspace {
+                config_dir: child_loader.dir,
+                id,
+                root,
+                workspace_config: child_config,
+            },
+        );
+    }
+
+    Ok(WorkspaceDiscovery {
+        aliases,
+        failures,
+        sources: Arc::new(sources),
+        workspaces,
+    })
+}
+
+/// Load source-local configuration and service state for each discovered child workspace.
+pub async fn load_source_contexts(
+    config_loader: &ConfigLoader,
+    discovery: &WorkspaceDiscovery,
+    retain_failures: bool,
+) -> miette::Result<FxHashMap<SourceRootId, SourceContext>> {
+    let mut sources = discovery.workspaces.values().collect::<Vec<_>>();
+    sources.sort_by_key(|source| source.id.clone());
+
+    let mut contexts = FxHashMap::default();
+
+    for source in sources {
+        if &source.id == discovery.sources.primary_id() {
+            continue;
+        }
+
+        let loader = config_loader.for_workspace_root(&source.root);
+        let moon_env = detect_moon_environment(&source.root, &source.root)?;
+        let proto_env = detect_proto_environment(&source.root, &source.root)?;
+        let (tasks_result, extensions_result, toolchains_result) = tokio::join!(
+            load_tasks_configs(loader.clone(), &source.root),
+            load_extensions_config(loader.clone(), &source.root),
+            load_toolchains_config(
+                loader.clone(),
+                Arc::clone(&proto_env),
+                &source.root,
+                &source.root,
+            ),
+        );
+        let mut failures = Vec::new();
+        let tasks_config = match tasks_result {
+            Ok(config) => config,
+            Err(error) if retain_failures => {
+                failures.push(SourceLoadFailure {
+                    message: error.to_string(),
+                    stage: "tasks-config".into(),
+                });
+                Arc::new(InheritedTasksManager::default())
+            }
+            Err(error) => return Err(error),
+        };
+        let extensions_config = match extensions_result {
+            Ok(config) => config,
+            Err(error) if retain_failures => {
+                failures.push(SourceLoadFailure {
+                    message: error.to_string(),
+                    stage: "extensions-config".into(),
+                });
+                Arc::new(ExtensionsConfig::default())
+            }
+            Err(error) => return Err(error),
+        };
+        let toolchains_config = match toolchains_result {
+            Ok(config) => config,
+            Err(error) if retain_failures => {
+                failures.push(SourceLoadFailure {
+                    message: error.to_string(),
+                    stage: "toolchains-config".into(),
+                });
+                Arc::new(ToolchainsConfig::default())
+            }
+            Err(error) => return Err(error),
+        };
+
+        contexts.insert(
+            source.id.clone(),
+            SourceContext::new(
+                source.id.clone(),
+                source.root.clone(),
+                source.root.clone(),
+                loader,
+                moon_env,
+                proto_env,
+                Arc::clone(&source.workspace_config),
+                tasks_config,
+                extensions_config,
+                toolchains_config,
+                failures,
+            ),
+        );
+    }
+
+    Ok(contexts)
+}
+
 /// Load the toolchain configuration file from the `.moon` directory if it exists.
 #[instrument(skip(config_loader, proto_env))]
 pub async fn load_toolchains_config(
@@ -154,8 +472,6 @@ pub async fn load_toolchains_config(
     })
     .await
     .into_diagnostic()??;
-
-    GlobalEnvBag::instance().set("PROTO_CLI_VERSION", config.proto.version.to_string());
 
     Ok(Arc::new(config))
 }
@@ -209,4 +525,282 @@ pub fn register_feature_flags(_config: &WorkspaceConfig) -> miette::Result<()> {
     FeatureFlags::default().register();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SourceVcsState;
+    use moon_common::Id;
+    use starbase_sandbox::create_empty_sandbox;
+
+    async fn discover(
+        primary_config: &str,
+        child_config: Option<&str>,
+    ) -> miette::Result<WorkspaceDiscovery> {
+        let sandbox = create_empty_sandbox();
+        let primary_root = sandbox.path().join("platform");
+
+        sandbox.create_file("platform/.moon/workspace.yml", primary_config);
+
+        if let Some(config) = child_config {
+            sandbox.create_file("web/.moon/workspace.yml", config);
+        }
+
+        let mut loader = ConfigLoader::default();
+        loader.locate_dir(&primary_root);
+        let config = load_workspace_config(loader.clone(), &primary_root).await?;
+        discover_workspaces(&loader, &primary_root, config).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discovers_direct_workspaces_by_their_self_declared_id() {
+        let discovery = discover(
+            r"
+id: acme/platform
+workspaces:
+  frontend:
+    path: ../web
+    id: acme/web
+",
+            Some(
+                r"
+id: acme/web
+workspaces:
+  ignored:
+    path: ../ignored
+",
+            ),
+        )
+        .await
+        .unwrap();
+
+        let platform = SourceRootId::new("acme/platform").unwrap();
+        let web = SourceRootId::new("acme/web").unwrap();
+
+        assert_eq!(discovery.sources.primary_id(), &platform);
+        assert_eq!(discovery.sources.len(), 2);
+        assert_eq!(
+            discovery
+                .aliases
+                .get(&SourceAlias::new("frontend").unwrap()),
+            Some(&web)
+        );
+        assert_eq!(discovery.workspaces.len(), 2);
+        assert_eq!(
+            discovery.workspaces[&web].workspace_config.id,
+            Some(Id::raw("acme/web"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uses_the_compatibility_id_for_an_unidentified_primary_workspace() {
+        let discovery = discover("{}", None).await.unwrap();
+
+        assert_eq!(discovery.sources.primary_id(), &SourceRootId::primary());
+        assert_eq!(discovery.sources.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requires_discovered_workspaces_to_declare_an_id() {
+        let error = discover(
+            r"
+workspaces:
+  frontend:
+    path: ../web
+",
+            Some("{}"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("must declare a canonical `id`"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verifies_the_expected_workspace_id() {
+        let error = discover(
+            r"
+workspaces:
+  frontend:
+    path: ../web
+    id: acme/expected
+",
+            Some("id: acme/actual"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("acme/actual"));
+        assert!(error.to_string().contains("acme/expected"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deduplicates_aliases_for_the_same_canonical_workspace() {
+        let discovery = discover(
+            r"
+workspaces:
+  frontend:
+    path: ../web
+  ui:
+    path: ../web
+",
+            Some("id: acme/web"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(discovery.sources.len(), 2);
+        assert_eq!(discovery.aliases.len(), 2);
+        assert_eq!(
+            discovery.aliases[&SourceAlias::new("frontend").unwrap()],
+            discovery.aliases[&SourceAlias::new("ui").unwrap()]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_the_same_canonical_id_at_different_roots() {
+        let sandbox = create_empty_sandbox();
+        let primary_root = sandbox.path().join("platform");
+
+        sandbox.create_file(
+            "platform/.moon/workspace.yml",
+            r"
+workspaces:
+  frontend:
+    path: ../web
+  frontend-copy:
+    path: ../web-copy
+",
+        );
+        sandbox.create_file("web/.moon/workspace.yml", "id: acme/web");
+        sandbox.create_file("web-copy/.moon/workspace.yml", "id: acme/web");
+
+        let mut loader = ConfigLoader::default();
+        loader.locate_dir(&primary_root);
+        let config = load_workspace_config(loader.clone(), &primary_root)
+            .await
+            .unwrap();
+        let error = discover_workspaces(&loader, &primary_root, config)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("already registered"));
+        assert!(error.to_string().contains("frontend-copy"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deduplicates_real_and_symlinked_workspace_roots() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = create_empty_sandbox();
+        let primary_root = sandbox.path().join("platform");
+
+        sandbox.create_file(
+            "platform/.moon/workspace.yml",
+            r"
+workspaces:
+  frontend:
+    path: ../web
+  ui:
+    path: ../web-link
+",
+        );
+        sandbox.create_file("web/.moon/workspace.yml", "id: acme/web");
+        symlink(sandbox.path().join("web"), sandbox.path().join("web-link")).unwrap();
+
+        let mut loader = ConfigLoader::default();
+        loader.locate_dir(&primary_root);
+        let config = load_workspace_config(loader.clone(), &primary_root)
+            .await
+            .unwrap();
+        let discovery = discover_workspaces(&loader, &primary_root, config)
+            .await
+            .unwrap();
+
+        assert_eq!(discovery.sources.len(), 2);
+        assert_eq!(discovery.aliases.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loads_independent_source_contexts_and_reuses_their_vcs_observation() {
+        let sandbox = create_empty_sandbox();
+        let primary_root = sandbox.path().join("platform");
+
+        sandbox.create_file(
+            "platform/.moon/workspace.yml",
+            r"
+id: acme/platform
+workspaces:
+  frontend:
+    path: ../web
+",
+        );
+        sandbox.create_file("web/.moon/workspace.yml", "id: acme/web");
+        sandbox.create_file(
+            "web/.moon/tasks/child.yml",
+            r"
+tasks:
+  child:
+    command: noop
+",
+        );
+        sandbox.create_file(
+            "web/.moon/extensions.yml",
+            r"
+child-extension:
+  plugin: https://example.com/plugin.wasm
+",
+        );
+        sandbox.create_file("web/.moon/toolchains.yml", "node: {}");
+
+        let mut loader = ConfigLoader::default();
+        loader.locate_dir(&primary_root);
+        let config = load_workspace_config(loader.clone(), &primary_root)
+            .await
+            .unwrap();
+        let discovery = discover_workspaces(&loader, &primary_root, config)
+            .await
+            .unwrap();
+        let contexts = load_source_contexts(&loader, &discovery, false)
+            .await
+            .unwrap();
+        let web = &contexts[&SourceRootId::new("acme/web").unwrap()];
+
+        assert_eq!(web.root, sandbox.path().join("web"));
+        assert_eq!(web.working_dir, web.root);
+        assert_eq!(web.moon_env.workspace_root, web.root);
+        assert_eq!(web.proto_env.working_dir, web.root);
+        assert_eq!(web.tasks_config.configs.len(), 1);
+        assert!(
+            web.extensions_config
+                .plugins
+                .contains_key("child-extension")
+        );
+        assert!(web.toolchains_config.plugins.contains_key("node"));
+        assert!(web.failures.is_empty());
+
+        let first_cache = web.get_cache_engine().await.unwrap();
+        let second_cache = web.get_cache_engine().await.unwrap();
+        assert!(Arc::ptr_eq(&first_cache, &second_cache));
+
+        let first_extensions = web.get_extension_registry().await.unwrap();
+        let second_extensions = web.get_extension_registry().await.unwrap();
+        assert!(Arc::ptr_eq(&first_extensions, &second_extensions));
+
+        let first_toolchains = web.get_toolchain_registry().await.unwrap();
+        let second_toolchains = web.get_toolchain_registry().await.unwrap();
+        assert!(Arc::ptr_eq(&first_toolchains, &second_toolchains));
+
+        match (web.initialize_vcs().await, web.initialize_vcs().await) {
+            (SourceVcsState::Ready(first), SourceVcsState::Ready(second)) => {
+                assert!(Arc::ptr_eq(&first, &second));
+            }
+            (SourceVcsState::Failed(first), SourceVcsState::Failed(second)) => {
+                assert!(Arc::ptr_eq(&first, &second));
+            }
+            _ => panic!("Source VCS state must be cached."),
+        }
+    }
 }

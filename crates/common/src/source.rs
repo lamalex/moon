@@ -12,6 +12,32 @@ pub const PRIMARY_SOURCE_ROOT_ID: &str = "workspace";
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
+pub struct SourceAlias(Id);
+
+impl SourceAlias {
+    pub fn new(id: impl AsRef<str>) -> miette::Result<Self> {
+        Ok(Self(Id::new(id.as_ref())?))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl AsRef<str> for SourceAlias {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for SourceAlias {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct SourceRootId(Id);
 
 impl SourceRootId {
@@ -127,6 +153,9 @@ pub enum SourceRegistryError {
     #[error("Source root path {root:?} has already been registered as {id}.")]
     DuplicateSourceRootPath { id: SourceRootId, root: PathBuf },
 
+    #[error("Source root ID {id} is reserved for primary-workspace compatibility.")]
+    ReservedSourceRoot { id: SourceRootId },
+
     #[error("Source root {id} has not been registered.")]
     #[diagnostic(help("Register the source root before resolving source-qualified paths."))]
     UnknownSourceRoot { id: SourceRootId },
@@ -166,6 +195,12 @@ impl SourceRegistry {
     }
 
     pub fn get(&self, id: &SourceRootId) -> miette::Result<&Path> {
+        let id = if id.as_str() == PRIMARY_SOURCE_ROOT_ID {
+            &self.primary
+        } else {
+            id
+        };
+
         self.roots
             .get(id)
             .map(PathBuf::as_path)
@@ -180,6 +215,18 @@ impl SourceRegistry {
 
     pub fn primary_id(&self) -> &SourceRootId {
         &self.primary
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&SourceRootId, &Path)> {
+        self.roots.iter().map(|(id, root)| (id, root.as_path()))
+    }
+
+    pub fn len(&self) -> usize {
+        self.roots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.roots.is_empty()
     }
 
     pub fn qualify(&self, path: &Path) -> miette::Result<SourcePathBuf> {
@@ -204,6 +251,10 @@ impl SourceRegistry {
     }
 
     pub fn register(&mut self, id: SourceRootId, root: PathBuf) -> miette::Result<()> {
+        if id.as_str() == PRIMARY_SOURCE_ROOT_ID && id != self.primary {
+            return Err(SourceRegistryError::ReservedSourceRoot { id }.into());
+        }
+
         if self.roots.contains_key(&id) {
             return Err(SourceRegistryError::DuplicateSourceRoot { id }.into());
         }

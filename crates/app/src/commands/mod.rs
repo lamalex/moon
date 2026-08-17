@@ -22,6 +22,7 @@ pub mod projects;
 pub mod query;
 pub mod run;
 pub mod setup;
+pub mod sources;
 pub mod sync;
 pub mod syncs;
 pub mod task;

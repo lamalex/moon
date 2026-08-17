@@ -43,6 +43,13 @@ impl ConfigLoader {
         self.dir.clone()
     }
 
+    /// Create an independent loader rooted at another Moon workspace.
+    pub fn for_workspace_root(&self, workspace_root: &Path) -> Self {
+        let mut loader = self.clone();
+        loader.locate_dir(workspace_root);
+        loader
+    }
+
     pub fn create_extensions_loader<P: AsRef<Path>>(
         &self,
         workspace_root: P,

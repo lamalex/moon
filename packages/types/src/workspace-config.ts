@@ -643,6 +643,14 @@ export interface VcsConfig {
 
 export type Range = string;
 
+/** Declares another Moon workspace to discover. */
+export interface WorkspaceDiscoveryConfig {
+	/** Expected canonical ID declared by the discovered workspace. */
+	id?: Id | null;
+	/** Path to the workspace, relative to the declaring workspace root. */
+	path: string;
+}
+
 /**
  * Configures all aspects of the moon workspace.
  * Docs: https://moonrepo.dev/docs/config/workspace
@@ -704,6 +712,8 @@ export interface WorkspaceConfig {
 	generator: GeneratorConfig;
 	/** Configures aspects of the content hashing engine. */
 	hasher: HasherConfig;
+	/** Stable canonical identity for this workspace. */
+	id?: Id | null;
 	/** Configures how and where notifications are sent. */
 	notifier: NotifierConfig;
 	/** Configures aspects of the action pipeline. */
@@ -730,6 +740,8 @@ export interface WorkspaceConfig {
 	vcs: VcsConfig;
 	/** Requires a specific version of the `moon` binary. */
 	versionConstraint?: Range | null;
+	/** Other Moon workspaces to discover, keyed by a local alias. */
+	workspaces?: Record<Id, WorkspaceDiscoveryConfig>;
 }
 
 /** Configures aspects of the content-addressable storage (CAS) cache. */
@@ -1114,10 +1126,7 @@ export interface PartialWorkspaceProjectsConfig {
 	sources?: Record<Id, string> | null;
 }
 
-export type PartialWorkspaceProjects =
-	| PartialWorkspaceProjectsConfig
-	| string[]
-	| Record<Id, string>;
+export type PartialWorkspaceProjects = PartialWorkspaceProjectsConfig | string[] | Record<Id, string>;
 
 /**
  * Configures basic HTTP authentication.
@@ -1321,6 +1330,14 @@ export interface PartialVcsConfig {
 	sync?: boolean | null;
 }
 
+/** Declares another Moon workspace to discover. */
+export interface PartialWorkspaceDiscoveryConfig {
+	/** Expected canonical ID declared by the discovered workspace. */
+	id?: Id | null;
+	/** Path to the workspace, relative to the declaring workspace root. */
+	path?: string | null;
+}
+
 /**
  * Configures all aspects of the moon workspace.
  * Docs: https://moonrepo.dev/docs/config/workspace
@@ -1382,6 +1399,8 @@ export interface PartialWorkspaceConfig {
 	generator?: PartialGeneratorConfig | null;
 	/** Configures aspects of the content hashing engine. */
 	hasher?: PartialHasherConfig | null;
+	/** Stable canonical identity for this workspace. */
+	id?: Id | null;
 	/** Configures how and where notifications are sent. */
 	notifier?: PartialNotifierConfig | null;
 	/** Configures aspects of the action pipeline. */
@@ -1408,4 +1427,6 @@ export interface PartialWorkspaceConfig {
 	vcs?: PartialVcsConfig | null;
 	/** Requires a specific version of the `moon` binary. */
 	versionConstraint?: Range | null;
+	/** Other Moon workspaces to discover, keyed by a local alias. */
+	workspaces?: Record<Id, PartialWorkspaceDiscoveryConfig> | null;
 }

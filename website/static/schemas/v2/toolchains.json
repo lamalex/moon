@@ -151,7 +151,14 @@
         }
       },
       "additionalProperties": {
-        "type": ["boolean", "object", "array", "number", "string", "integer"]
+        "type": [
+          "boolean",
+          "object",
+          "array",
+          "number",
+          "string",
+          "integer"
+        ]
       }
     },
     "ToolchainPluginVersionFrom": {
