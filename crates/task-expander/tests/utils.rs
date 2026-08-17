@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-use moon_common::Id;
 use moon_common::path::WorkspaceRelativePathBuf;
+use moon_common::{Id, SourceRegistry};
 use moon_config::{Input, TaskOptionCache};
 use moon_graph_utils::GraphExpanderContext;
 use moon_project::{FileGroup, Project, ProjectError};
@@ -65,6 +65,7 @@ impl TaskLookup for MapTaskLookup {
 
 pub fn create_context(workspace_root: &Path) -> GraphExpanderContext {
     GraphExpanderContext {
+        sources: Arc::new(SourceRegistry::single(workspace_root.to_path_buf())),
         vcs_branch: Arc::new(String::from("master")),
         vcs_repository: Arc::new(String::from("moonrepo/moon")),
         vcs_revision: Arc::new(String::from("abcd1234")),

@@ -9,8 +9,8 @@ use daggy::Dag;
 use miette::IntoDiagnostic;
 use moon_cache::CacheEngine;
 use moon_common::{
-    Id, color,
-    path::{PathExt, WorkspaceRelativePathBuf, is_root_level_source},
+    Id, SourceRegistry, color,
+    path::{PathExt, WorkspaceRelativePathBuf, is_root_level_source, paths_are_equal},
 };
 use moon_config::{
     DependencyScope, ExtensionsConfig, InheritedTasksManager, ProjectDependencyConfig,
@@ -54,12 +54,29 @@ pub struct WorkspaceBuilderContext {
     pub extensions_config: Arc<ExtensionsConfig>,
     pub extension_registry: Arc<ExtensionRegistry>,
     pub inherited_tasks: Arc<InheritedTasksManager>,
+    pub sources: Arc<SourceRegistry>,
     pub toolchains_config: Arc<ToolchainsConfig>,
     pub toolchain_registry: Arc<ToolchainRegistry>,
     pub vcs: Option<Arc<BoxedVcs>>,
     pub working_dir: PathBuf,
     pub workspace_config: Arc<WorkspaceConfig>,
     pub workspace_root: PathBuf,
+}
+
+impl WorkspaceBuilderContext {
+    pub(crate) fn validate_sources(&self) -> miette::Result<()> {
+        let primary_root = self.sources.get_primary();
+
+        if !paths_are_equal(primary_root, &self.workspace_root) {
+            return Err(miette::miette!(
+                "Primary source root {} does not match workspace root {}.",
+                primary_root.display(),
+                self.workspace_root.display(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 /// A dependency edge that was skipped while recursively loading projects,
@@ -133,6 +150,7 @@ impl WorkspaceBuilder {
     #[instrument(skip_all)]
     pub async fn new(context: WorkspaceBuilderContext) -> miette::Result<WorkspaceBuilder> {
         debug!("Building workspace graph (project and task graphs)");
+        context.validate_sources()?;
 
         let mut graph = WorkspaceBuilder {
             aliases: FxHashMap::default(),
@@ -267,6 +285,7 @@ impl WorkspaceBuilder {
         let mut graph_context = GraphExpanderContext {
             config_dir: context.config_loader.dir.clone(),
             extensions_config: context.extensions_config.clone(),
+            sources: Arc::clone(&context.sources),
             toolchains_config: context.toolchains_config.clone(),
             working_dir: context.working_dir.to_owned(),
             workspace_config: context.workspace_config.clone(),
@@ -356,10 +375,10 @@ impl WorkspaceBuilder {
 
         let task_graph = Arc::new(task_graph);
 
-        Ok(WorkspaceGraph::new(
+        Ok(WorkspaceGraph::new_with_sources(
             project_graph,
             task_graph,
-            context.workspace_root.to_path_buf(),
+            Arc::clone(&context.sources),
         ))
     }
 
@@ -1194,6 +1213,7 @@ impl WorkspaceBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace_builder_async::WorkspaceBuilderAsync;
     use moon_cache::CacheContext;
     use moon_extension_plugin::ExtensionRegistry;
     use moon_graph_utils::GraphConnections;
@@ -1204,23 +1224,43 @@ mod tests {
         CacheEngine::new(CacheContext::new(root)).unwrap()
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn reindexes_project_graph_after_filtering_loading_nodes() {
-        let sandbox = create_empty_moon_sandbox();
-        let context = WorkspaceBuilderContext {
-            cache_engine: Arc::new(create_cache_engine(sandbox.path())),
+    fn create_builder_context(root: &std::path::Path) -> WorkspaceBuilderContext {
+        WorkspaceBuilderContext {
+            cache_engine: Arc::new(create_cache_engine(root)),
             config_loader: ConfigLoader::default(),
             enabled_toolchains: vec![],
             extensions_config: Arc::new(ExtensionsConfig::default()),
             extension_registry: Arc::new(ExtensionRegistry::default()),
             inherited_tasks: Arc::new(InheritedTasksManager::default()),
+            sources: Arc::new(SourceRegistry::single(root.to_path_buf())),
             toolchains_config: Arc::new(ToolchainsConfig::default()),
             toolchain_registry: Arc::new(ToolchainRegistry::default()),
             vcs: None,
-            working_dir: sandbox.path().to_path_buf(),
+            working_dir: root.to_path_buf(),
             workspace_config: Arc::new(WorkspaceConfig::default()),
-            workspace_root: sandbox.path().to_path_buf(),
-        };
+            workspace_root: root.to_path_buf(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_a_primary_source_that_does_not_match_the_workspace_root() {
+        let sandbox = create_empty_moon_sandbox();
+        let mut sync_context = create_builder_context(sandbox.path());
+        sync_context.sources = Arc::new(SourceRegistry::single(sandbox.path().join("other")));
+
+        assert!(WorkspaceBuilder::new(sync_context).await.is_err());
+
+        let mut async_context = create_builder_context(sandbox.path());
+        async_context.sources = Arc::new(SourceRegistry::single(sandbox.path().join("other")));
+
+        assert!(WorkspaceBuilderAsync::new(async_context).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reindexes_project_graph_after_filtering_loading_nodes() {
+        let sandbox = create_empty_moon_sandbox();
+        let context = create_builder_context(sandbox.path());
+        let sources = Arc::clone(&context.sources);
 
         let mut project_graph = DiGraph::new();
         let _ghost = project_graph.add_node(NodeState::Loading);
@@ -1256,6 +1296,11 @@ mod tests {
 
         let app = graph.get_project("app").unwrap();
 
+        assert!(Arc::ptr_eq(&sources, &graph.sources));
+        assert!(Arc::ptr_eq(&sources, &graph.projects.context.sources));
+        assert!(Arc::ptr_eq(&sources, &graph.tasks.context.sources));
+        assert_eq!(graph.root, sandbox.path());
+
         assert_eq!(
             graph.projects.dependencies_of(app.as_ref()),
             vec![Id::raw("dep")]
@@ -1275,20 +1320,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn reindexes_task_graph_after_filtering_loading_nodes() {
         let sandbox = create_empty_moon_sandbox();
-        let context = WorkspaceBuilderContext {
-            cache_engine: Arc::new(create_cache_engine(sandbox.path())),
-            config_loader: ConfigLoader::default(),
-            enabled_toolchains: vec![],
-            extensions_config: Arc::new(ExtensionsConfig::default()),
-            extension_registry: Arc::new(ExtensionRegistry::default()),
-            inherited_tasks: Arc::new(InheritedTasksManager::default()),
-            toolchains_config: Arc::new(ToolchainsConfig::default()),
-            toolchain_registry: Arc::new(ToolchainRegistry::default()),
-            vcs: None,
-            working_dir: sandbox.path().to_path_buf(),
-            workspace_config: Arc::new(WorkspaceConfig::default()),
-            workspace_root: sandbox.path().to_path_buf(),
-        };
+        let context = create_builder_context(sandbox.path());
+        let sources = Arc::clone(&context.sources);
 
         let mut project_graph = DiGraph::new();
         project_graph.add_node(NodeState::Loaded(Project {
@@ -1335,6 +1368,11 @@ mod tests {
         .unwrap();
 
         let build_task = graph.get_task(&build_target).unwrap();
+
+        assert!(Arc::ptr_eq(&sources, &graph.sources));
+        assert!(Arc::ptr_eq(&sources, &graph.projects.context.sources));
+        assert!(Arc::ptr_eq(&sources, &graph.tasks.context.sources));
+        assert_eq!(graph.root, sandbox.path());
 
         assert_eq!(
             graph.tasks.dependencies_of(build_task.as_ref()),

@@ -10,7 +10,7 @@ use moon_cache::{CacheContext, CacheEngine};
 use moon_cache_local::LocalStorage;
 use moon_cache_remote::{GrpcRemoteStorage, HttpRemoteStorage};
 use moon_codegen::CodeGenerator;
-use moon_common::{is_docker, is_formatted_output, is_test_env};
+use moon_common::{SourceRegistry, is_docker, is_formatted_output, is_test_env};
 use moon_config::{
     ExtensionsConfig, InheritedTasksManager, RemoteApi, ToolchainsConfig, WorkspaceConfig,
 };
@@ -72,6 +72,9 @@ pub struct MoonSession {
     pub toolchains_config: Arc<ToolchainsConfig>,
     pub workspace_config: Arc<WorkspaceConfig>,
 
+    // Sources
+    pub sources: Arc<SourceRegistry>,
+
     // Paths
     pub config_dir: PathBuf,
     pub working_dir: PathBuf,
@@ -95,6 +98,7 @@ impl MoonSession {
             moon_env: Arc::new(MoonEnvironment::default()),
             project_graph: OnceLock::new(),
             proto_env: Arc::new(ProtoEnvironment::default()),
+            sources: Arc::new(SourceRegistry::default()),
             task_graph: OnceLock::new(),
             tasks_config: Arc::new(InheritedTasksManager::default()),
             toolchains_config: Arc::new(ToolchainsConfig::default()),
@@ -168,6 +172,7 @@ impl MoonSession {
             extensions_config: Arc::clone(&self.extensions_config),
             extension_registry: self.get_extension_registry().await?,
             inherited_tasks: Arc::clone(&self.tasks_config),
+            sources: Arc::clone(&self.sources),
             toolchains_config: Arc::clone(&self.toolchains_config),
             toolchain_registry: self.get_toolchain_registry().await?,
             vcs: Some(self.get_vcs_adapter().await?),
@@ -462,6 +467,8 @@ impl AppSession for MoonSession {
             self.working_dir.clone()
         };
 
+        self.sources = Arc::new(SourceRegistry::single(self.workspace_root.clone()));
+
         self.config_dir = self.config_loader.locate_dir(&self.workspace_root);
 
         // Load environments
@@ -577,6 +584,7 @@ impl fmt::Debug for MoonSession {
             .field("cli_version", &self.cli_version)
             .field("moon_env", &self.moon_env)
             .field("proto_env", &self.proto_env)
+            .field("sources", &self.sources)
             .field("tasks_config", &self.tasks_config)
             .field("extensions_config", &self.extensions_config)
             .field("toolchains_config", &self.toolchains_config)

@@ -29,6 +29,7 @@ pub struct WorkspaceBuilderAsync {
 impl WorkspaceBuilderAsync {
     pub async fn new(context: WorkspaceBuilderContext) -> miette::Result<Self> {
         debug!("Building workspace graph asynchronously (project and task graphs)");
+        context.validate_sources()?;
 
         let context = Arc::new(context);
 
@@ -205,6 +206,7 @@ impl WorkspaceBuilderAsync {
         let mut graph_context = GraphExpanderContext {
             config_dir: context.config_loader.dir.clone(),
             extensions_config: context.extensions_config.clone(),
+            sources: Arc::clone(&context.sources),
             toolchains_config: context.toolchains_config.clone(),
             working_dir: context.working_dir.to_owned(),
             workspace_config: context.workspace_config.clone(),
@@ -235,10 +237,10 @@ impl WorkspaceBuilderAsync {
                 .finalize(graph_context, Arc::clone(&project_graph)),
         );
 
-        Ok(WorkspaceGraph::new(
+        Ok(WorkspaceGraph::new_with_sources(
             project_graph,
             task_graph,
-            context.workspace_root.to_path_buf(),
+            Arc::clone(&context.sources),
         ))
     }
 

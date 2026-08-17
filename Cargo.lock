@@ -5323,6 +5323,7 @@ dependencies = [
  "rustc-hash",
  "schematic",
  "serde",
+ "serde_json",
  "starbase_id",
  "starbase_styles",
  "thiserror 2.0.20",
@@ -5911,6 +5912,7 @@ dependencies = [
  "regex",
  "schematic",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tracing",
 ]

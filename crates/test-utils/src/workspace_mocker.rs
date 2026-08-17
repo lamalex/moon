@@ -3,7 +3,7 @@ use moon_action_pipeline::ActionPipeline;
 use moon_app_context::AppContext;
 use moon_cache::{CacheContext, CacheEngine};
 use moon_cache_local::LocalStorage;
-use moon_common::{Id, IdExt, path::WorkspaceRelativePathBuf};
+use moon_common::{Id, IdExt, SourceRegistry, path::WorkspaceRelativePathBuf};
 use moon_config::*;
 use moon_config_loader::{ConfigLoader, ExtensionsConfigExt, ToolchainsConfigExt};
 use moon_console::{Console, MoonReporter};
@@ -32,6 +32,7 @@ pub struct WorkspaceMocker {
     pub monorepo: bool,
     pub moon_env: MoonEnvironment,
     pub proto_env: ProtoEnvironment,
+    pub sources: Arc<SourceRegistry>,
     pub extensions_config: ExtensionsConfig,
     pub toolchains_config: ToolchainsConfig,
     pub working_dir: PathBuf,
@@ -51,6 +52,7 @@ impl WorkspaceMocker {
             monorepo: true,
             moon_env: MoonEnvironment::new_testing(root),
             proto_env: ProtoEnvironment::new_testing(root).unwrap(),
+            sources: Arc::new(SourceRegistry::single(root.to_path_buf())),
             working_dir: root.to_path_buf(),
             workspace_root: root.to_path_buf(),
             extensions_config: {
@@ -431,6 +433,7 @@ impl WorkspaceMocker {
             extensions_config: Arc::new(self.extensions_config.clone()),
             extension_registry: Arc::new(self.mock_extension_registry()),
             inherited_tasks: Arc::new(self.inherited_tasks.clone()),
+            sources: Arc::clone(&self.sources),
             toolchains_config: Arc::new(self.toolchains_config.clone()),
             toolchain_registry: Arc::new(self.mock_toolchain_registry()),
             vcs: if self.workspace_root.join(".git").exists() {

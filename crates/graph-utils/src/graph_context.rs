@@ -1,3 +1,4 @@
+use moon_common::SourceRegistry;
 use moon_config::{ExtensionsConfig, ToolchainsConfig, WorkspaceConfig};
 use std::{path::PathBuf, sync::Arc};
 
@@ -5,6 +6,7 @@ use std::{path::PathBuf, sync::Arc};
 pub struct GraphExpanderContext {
     pub config_dir: PathBuf,
     pub extensions_config: Arc<ExtensionsConfig>,
+    pub sources: Arc<SourceRegistry>,
     pub toolchains_config: Arc<ToolchainsConfig>,
     pub vcs_branch: Arc<String>,
     pub vcs_repository: Arc<String>,

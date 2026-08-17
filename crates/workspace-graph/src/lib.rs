@@ -1,7 +1,7 @@
 mod query_projects;
 mod query_tasks;
 
-use moon_common::Id;
+use moon_common::{Id, SourceRegistry, SourceRootId};
 use moon_project_graph::{Project, ProjectGraph};
 use moon_task_graph::{Target, Task, TaskGraph};
 use scc::HashMap;
@@ -15,7 +15,9 @@ pub use moon_task_graph as tasks;
 #[derive(Default)]
 pub struct WorkspaceGraph {
     pub projects: Arc<ProjectGraph>,
+    pub sources: Arc<SourceRegistry>,
     pub tasks: Arc<TaskGraph>,
+    /// Root of the primary source. Retained for single-source compatibility.
     pub root: PathBuf,
 
     /// Cache of query results, mapped by query input to project IDs.
@@ -27,13 +29,28 @@ pub struct WorkspaceGraph {
 
 impl WorkspaceGraph {
     pub fn new(projects: Arc<ProjectGraph>, tasks: Arc<TaskGraph>, root: PathBuf) -> Self {
+        Self::new_with_sources(projects, tasks, Arc::new(SourceRegistry::single(root)))
+    }
+
+    pub fn new_with_sources(
+        projects: Arc<ProjectGraph>,
+        tasks: Arc<TaskGraph>,
+        sources: Arc<SourceRegistry>,
+    ) -> Self {
+        let root = sources.get_primary().to_path_buf();
+
         Self {
             projects,
+            sources,
             tasks,
             root,
             project_query_cache: HashMap::default(),
             task_query_cache: HashMap::default(),
         }
+    }
+
+    pub fn get_primary_source_id(&self) -> &SourceRootId {
+        self.sources.primary_id()
     }
 
     pub fn get_default_project(&self) -> miette::Result<Arc<Project>> {

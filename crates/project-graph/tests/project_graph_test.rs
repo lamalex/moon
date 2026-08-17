@@ -1,4 +1,4 @@
-use moon_common::{Id, path::WorkspaceRelativePathBuf};
+use moon_common::{Id, SourceRegistry, SourceRootId, path::WorkspaceRelativePathBuf};
 use moon_config::{
     DependencyScope, DependencySource, ProjectDependencyConfig, TaskDependencyCacheStrategy,
     TaskDependencyConfig, WorkspaceProjectGlobFormat, WorkspaceProjects, WorkspaceProjectsConfig,
@@ -87,6 +87,40 @@ pub async fn build_graph_from_fixture_for_builder(
 
 mod project_graph {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn threads_source_registry_through_both_builders() {
+        for async_graph in [false, true] {
+            let sandbox = create_moon_sandbox("dependencies");
+            let mut mocker = create_workspace_mocker(sandbox.path());
+            let mut registry = SourceRegistry::single(sandbox.path().to_path_buf());
+
+            registry
+                .register(
+                    SourceRootId::new("secondary").unwrap(),
+                    sandbox.path().join("secondary"),
+                )
+                .unwrap();
+
+            mocker.sources = Arc::new(registry);
+            mocker.workspace_config.experiments.async_graph_building = async_graph;
+
+            let sources = Arc::clone(&mocker.sources);
+            let graph = mocker.mock_workspace_graph().await;
+
+            assert!(Arc::ptr_eq(&sources, &graph.sources));
+            assert!(Arc::ptr_eq(&sources, &graph.projects.context.sources));
+            assert!(Arc::ptr_eq(&sources, &graph.tasks.context.sources));
+            assert_eq!(graph.root, sandbox.path());
+            assert_eq!(
+                graph
+                    .sources
+                    .get(&SourceRootId::new("secondary").unwrap())
+                    .unwrap(),
+                sandbox.path().join("secondary")
+            );
+        }
+    }
 
     fn dep(target: &str) -> TaskDependencyConfig {
         TaskDependencyConfig {
@@ -496,6 +530,14 @@ mod project_graph {
                         graph.tasks.get_node_keys(),
                         cached_graph.tasks.get_node_keys()
                     );
+                    assert!(Arc::ptr_eq(
+                        &cached_graph.sources,
+                        &cached_graph.projects.context.sources,
+                    ));
+                    assert!(Arc::ptr_eq(
+                        &cached_graph.sources,
+                        &cached_graph.tasks.context.sources,
+                    ));
                 }
 
                 #[tokio::test(flavor = "multi_thread")]

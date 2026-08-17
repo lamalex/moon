@@ -19,5 +19,8 @@ starbase_id = { workspace = true }
 starbase_styles = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [lints]
 workspace = true
