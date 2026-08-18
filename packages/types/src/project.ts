@@ -32,6 +32,7 @@ export interface Project {
 	layer: LayerType;
 	root: string;
 	source: string;
+	sourceId?: string;
 	stack: StackType;
 	tasks?: Record<Id, Task>;
 	taskTargets?: string[];

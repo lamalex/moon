@@ -25,6 +25,7 @@ use moon_project::{Project, ProjectAlias, ProjectError};
 use moon_project_builder::{ProjectBuilder, ProjectBuilderContext};
 use moon_project_constraints::{enforce_layer_relationships, enforce_tag_relationships};
 use moon_project_graph::{ProjectGraph, ProjectGraphError, ProjectNode, would_cycle_in_scope};
+use moon_target::ProjectKey;
 use moon_task::{Target, Task};
 use moon_task_builder::TaskDepsBuilder;
 use moon_task_graph::{GraphExpanderContext, NodeState, TaskGraph, TaskGraphError, TaskNode};
@@ -44,8 +45,8 @@ use std::sync::Arc;
 use tracing::{debug, instrument};
 
 pub const LOCK_FILE_NAME: &str = "workspaceGraph.lock";
-pub const STATE_GRAPH_FILE_NAME: &str = "workspaceGraph.json";
-pub const STATE_CACHE_FILE_NAME: &str = "workspaceGraphStateV1.json";
+pub const STATE_GRAPH_FILE_NAME: &str = "workspaceGraphV2.json";
+pub const STATE_CACHE_FILE_NAME: &str = "workspaceGraphStateV2.json";
 
 pub struct WorkspaceBuilderContext {
     pub cache_engine: Arc<CacheEngine>,
@@ -200,10 +201,7 @@ impl WorkspaceBuilder {
 
         // Load the previous state, as input files discovered by plugins
         // during the last build must contribute to the hash
-        let mut state = context
-            .cache_engine
-            .state
-            .load_state::<WorkspaceGraphCacheState>(STATE_CACHE_FILE_NAME)?;
+        let mut state = load_workspace_graph_cache_state(&context.cache_engine);
         let cache_path = context
             .cache_engine
             .state
@@ -220,24 +218,31 @@ impl WorkspaceBuilder {
         );
 
         if digest.hash == state.data.last_hash && cache_path.exists() {
-            let mut cache: WorkspaceBuilder = json::read_file(&cache_path)?;
+            let cache_result = json::read_file::<WorkspaceBuilder>(&cache_path);
 
-            // Verify that the cached projects match the current projects
-            // on disk. If a project has been added or removed since the
-            // cache was created, we need to rebuild the graph
-            let cached_ids: FxHashSet<&Id> = cache.project_data.keys().collect();
-            let current_ids: FxHashSet<&Id> = graph.project_data.keys().collect();
+            match cache_result {
+                Ok(mut cache) => {
+                    // Verify that the cached projects match the current projects
+                    // on disk. If a project has been added or removed since the
+                    // cache was created, we need to rebuild the graph
+                    let cached_ids: FxHashSet<&Id> = cache.project_data.keys().collect();
+                    let current_ids: FxHashSet<&Id> = graph.project_data.keys().collect();
 
-            if cached_ids == current_ids {
-                debug!(
-                    cache = ?cache_path,
-                    "Loading workspace graph with {} projects from cache",
-                    cache.project_data.len(),
-                );
+                    if cached_ids == current_ids {
+                        debug!(
+                            cache = ?cache_path,
+                            "Loading workspace graph with {} projects from cache",
+                            cache.project_data.len(),
+                        );
 
-                cache.context = graph.context;
+                        cache.context = graph.context;
 
-                return Ok(cache);
+                        return Ok(cache);
+                    }
+                }
+                Err(error) => {
+                    debug!(cache = ?cache_path, error = ?error, "Ignoring invalid workspace graph cache");
+                }
             }
 
             debug!(
@@ -309,9 +314,25 @@ impl WorkspaceBuilder {
         }
 
         // Build the graphs
+        let source_id = context.sources.primary_id().clone();
         let mut project_graph = ProjectGraph::new(graph_context.clone());
-        project_graph.default_id = context.workspace_config.default_project.clone();
-        project_graph.aliases.extend(self.aliases);
+        project_graph.default_key = context
+            .workspace_config
+            .default_project
+            .clone()
+            .map(|id| ProjectKey::new(source_id.clone(), id))
+            .transpose()?;
+        project_graph.aliases.extend(
+            self.aliases
+                .into_iter()
+                .map(|(alias, id)| {
+                    Ok((
+                        (source_id.clone(), alias),
+                        ProjectKey::new(source_id.clone(), id)?,
+                    ))
+                })
+                .collect::<miette::Result<FxHashMap<_, _>>>()?,
+        );
         let mut loaded_projects = FxHashMap::default();
 
         let graph = self.project_graph.filter_map(
@@ -329,12 +350,12 @@ impl WorkspaceBuilder {
         for index in graph.node_indices() {
             let old_index = *graph.node_weight(index).unwrap();
             let project = loaded_projects.remove(&old_index).unwrap();
-            let id = project.id.clone();
+            let key = project.key();
 
-            project_graph.indexes.insert(index, id.clone());
+            project_graph.indexes.insert(index, key.clone());
             project_graph
                 .nodes
-                .insert(id, ProjectNode { index, project });
+                .insert(key, ProjectNode { index, project });
         }
 
         project_graph.set_graph(graph)?;
@@ -567,6 +588,7 @@ impl WorkspaceBuilder {
                 enabled_toolchains: &context.enabled_toolchains,
                 monorepo: self.repo_type.is_monorepo(),
                 root_project_id: self.root_project_id.as_ref(),
+                source_id: context.sources.primary_id(),
                 toolchains_config: &context.toolchains_config,
                 toolchain_registry: context.toolchain_registry.clone(),
                 workspace_root: &context.workspace_root,
@@ -1045,6 +1067,16 @@ impl WorkspaceBuilder {
         }
 
         let project_sources = self.map_project_sources();
+        let source_id = context.sources.primary_id().clone();
+        let project_keys = project_sources
+            .iter()
+            .map(|(id, source)| {
+                Ok((
+                    ProjectKey::new(source_id.clone(), id.clone())?,
+                    source.clone(),
+                ))
+            })
+            .collect::<miette::Result<BTreeMap<_, _>>>()?;
 
         debug!("Extending project graph from extension plugins");
 
@@ -1054,6 +1086,9 @@ impl WorkspaceBuilder {
             .extend_project_graph_all(|extension| ExtendProjectGraphInput {
                 context: registry.create_context(),
                 project_sources: project_sources.clone(),
+                graph_schema_version: 2,
+                project_keys: project_keys.clone(),
+                source_id: source_id.clone(),
                 extension_config: registry.create_config(&extension.id),
                 ..Default::default()
             })
@@ -1074,6 +1109,16 @@ impl WorkspaceBuilder {
         }
 
         let project_sources = self.map_project_sources();
+        let source_id = context.sources.primary_id().clone();
+        let project_keys = project_sources
+            .iter()
+            .map(|(id, source)| {
+                Ok((
+                    ProjectKey::new(source_id.clone(), id.clone())?,
+                    source.clone(),
+                ))
+            })
+            .collect::<miette::Result<BTreeMap<_, _>>>()?;
 
         debug!("Extending project graph from toolchain plugins");
 
@@ -1083,6 +1128,9 @@ impl WorkspaceBuilder {
             .extend_project_graph_all(|toolchain| ExtendProjectGraphInput {
                 context: registry.create_context(),
                 project_sources: project_sources.clone(),
+                graph_schema_version: 2,
+                project_keys: project_keys.clone(),
+                source_id: source_id.clone(),
                 toolchain_config: registry.create_config(&toolchain.id),
                 ..Default::default()
             })
@@ -1301,19 +1349,22 @@ mod tests {
         assert!(Arc::ptr_eq(&sources, &graph.tasks.context.sources));
         assert_eq!(graph.root, sandbox.path());
 
+        let app_key = ProjectKey::for_primary(&sources, Id::raw("app")).unwrap();
+        let dep_key = ProjectKey::for_primary(&sources, Id::raw("dep")).unwrap();
+
         assert_eq!(
             graph.projects.dependencies_of(app.as_ref()),
-            vec![Id::raw("dep")]
+            vec![dep_key.clone()]
         );
 
         // Weight-based lookups must also resolve the reindexed nodes
         let mut keys = graph.projects.get_node_keys();
         keys.sort();
 
-        assert_eq!(keys, vec![Id::raw("app"), Id::raw("dep")]);
+        assert_eq!(keys, vec![app_key, dep_key.clone()]);
         assert_eq!(
             graph.projects.deep_dependencies_of(app.as_ref()),
-            vec![Id::raw("dep")]
+            vec![dep_key]
         );
     }
 

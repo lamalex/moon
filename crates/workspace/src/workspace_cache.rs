@@ -1,6 +1,6 @@
 use crate::workspace_builder::WorkspaceBuilderContext;
 use miette::IntoDiagnostic;
-use moon_cache::{ContentHash, cache_item};
+use moon_cache::{CacheEngine, CacheItem, ContentHash, cache_item};
 use moon_common::path::{PathExt, WorkspaceRelativePathBuf};
 use moon_common::{Id, is_docker};
 use moon_env_var::GlobalEnvBag;
@@ -9,7 +9,7 @@ use moon_pdk_api::VirtualPath;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
-use tracing::trace;
+use tracing::{debug, trace};
 
 cache_item!(
     pub struct WorkspaceGraphCacheState {
@@ -22,9 +22,35 @@ cache_item!(
     }
 );
 
+pub fn load_workspace_graph_cache_state(
+    cache_engine: &CacheEngine,
+) -> CacheItem<WorkspaceGraphCacheState> {
+    match cache_engine
+        .state
+        .load_state::<WorkspaceGraphCacheState>(crate::workspace_builder::STATE_CACHE_FILE_NAME)
+    {
+        Ok(state) => state,
+        Err(error) => {
+            let path = cache_engine
+                .state
+                .resolve_path(crate::workspace_builder::STATE_CACHE_FILE_NAME);
+
+            debug!(cache = ?path, ?error, "Ignoring invalid workspace graph cache state");
+
+            CacheItem {
+                data: WorkspaceGraphCacheState::default(),
+                path,
+            }
+        }
+    }
+}
+
 fingerprint!(
     #[derive(Debug)]
     pub struct WorkspaceGraphFingerprint<'graph> {
+        // Internal schema version for serialized graph identity.
+        schema_version: u8,
+
         // Project sources derived from the workspace graph builder.
         projects: BTreeMap<&'graph Id, &'graph WorkspaceRelativePathBuf>,
 
@@ -62,6 +88,7 @@ impl Default for WorkspaceGraphFingerprint<'_> {
     fn default() -> Self {
         WorkspaceGraphFingerprint {
             projects: BTreeMap::default(),
+            schema_version: 2,
             async_graph_building: false,
             inputs: BTreeMap::default(),
             env: BTreeMap::default(),
@@ -235,4 +262,22 @@ pub async fn generate_graph_cache_digest(
         .cache_engine
         .hash
         .save_manifest_without_hasher("workspace-graph", &fingerprint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use moon_cache::CacheContext;
+    use starbase_sandbox::create_empty_sandbox;
+
+    #[test]
+    fn treats_invalid_cache_state_as_a_miss() {
+        let sandbox = create_empty_sandbox();
+        let cache_engine = CacheEngine::new(CacheContext::new(sandbox.path())).unwrap();
+        sandbox.create_file(".moon/cache/states/workspaceGraphStateV2.json", "not json");
+
+        let state = load_workspace_graph_cache_state(&cache_engine);
+
+        assert_eq!(state.data, WorkspaceGraphCacheState::default());
+    }
 }

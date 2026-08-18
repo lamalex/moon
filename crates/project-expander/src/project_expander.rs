@@ -39,7 +39,8 @@ impl<'graph> ProjectExpander<'graph> {
                 .context
                 .aliases
                 .get(dep_config.id.as_str())
-                .map(|id| (*id).to_owned())
+                .filter(|key| key.source_id() == self.context.source_id)
+                .map(|key| key.project_id().to_owned())
                 .unwrap_or(dep_config.id);
 
             // Use a map so that aliases and IDs get flattened

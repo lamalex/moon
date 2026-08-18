@@ -3,7 +3,9 @@ use clap::Args;
 use iocraft::prelude::{Size, element};
 use moon_common::Id;
 use moon_console::ui::*;
+use moon_target::TaskKey;
 use starbase_utils::json;
+use std::collections::BTreeMap;
 use tracing::instrument;
 
 #[derive(Args, Clone, Debug)]
@@ -17,9 +19,14 @@ pub struct TasksArgs {
 
 #[instrument(skip(session))]
 pub async fn tasks(session: MoonSession, args: TasksArgs) -> SessionResult {
-    let workspace_graph = session.get_workspace_graph().await?;
+    let aggregate = args.project.is_none();
+    let workspace_graph = if aggregate {
+        session.get_aggregate_workspace_graph().await?
+    } else {
+        session.get_workspace_graph().await?
+    };
 
-    let mut tasks = if let Some(project_id) = &args.project {
+    let mut tasks: Vec<(Option<TaskKey>, _)> = if let Some(project_id) = &args.project {
         let tasks = workspace_graph.get_tasks_from_project(project_id)?;
 
         if tasks.is_empty() {
@@ -36,18 +43,37 @@ pub async fn tasks(session: MoonSession, args: TasksArgs) -> SessionResult {
             return Ok(None);
         }
 
-        tasks
+        tasks.into_iter().map(|task| (None, task)).collect()
     } else {
-        workspace_graph.get_tasks()?
+        workspace_graph
+            .get_all_tasks_with_keys()?
+            .into_iter()
+            .map(|(key, task)| (Some(key), task))
+            .collect()
     };
 
-    tasks.sort_by(|a, d| a.target.cmp(&d.target));
+    tasks.sort_by(|a, b| match (&a.0, &b.0) {
+        (Some(a), Some(b)) => a.cmp(b),
+        _ => a.1.target.cmp(&b.1.target),
+    });
 
     if args.json {
-        session
-            .console
-            .out
-            .write_line(json::format(&tasks, true)?)?;
+        if aggregate && workspace_graph.sources.len() > 1 {
+            let tasks = tasks
+                .into_iter()
+                .filter_map(|(key, task)| key.map(|key| (key, task)))
+                .collect::<BTreeMap<_, _>>();
+            session
+                .console
+                .out
+                .write_line(json::format(&tasks, true)?)?;
+        } else {
+            let tasks = tasks.into_iter().map(|(_, task)| task).collect::<Vec<_>>();
+            session
+                .console
+                .out
+                .write_line(json::format(&tasks, true)?)?;
+        }
 
         return Ok(None);
     }
@@ -66,11 +92,18 @@ pub async fn tasks(session: MoonSession, args: TasksArgs) -> SessionResult {
 
     let id_width = tasks
         .iter()
-        .fold(0, |acc, task| acc.max(task.target.as_str().len()))
+        .fold(0, |acc, (key, task)| {
+            acc.max(
+                key.as_ref()
+                    .filter(|_| workspace_graph.sources.len() > 1)
+                    .map(|key| key.to_string().len())
+                    .unwrap_or_else(|| task.target.as_str().len()),
+            )
+        })
         .max(3);
     let command_width = tasks
         .iter()
-        .fold(0, |acc, task| acc.max(task.command.len()))
+        .fold(0, |acc, (_, task)| acc.max(task.command.len()))
         .max(3);
 
     session.console.render(element! {
@@ -85,12 +118,15 @@ pub async fn tasks(session: MoonSession, args: TasksArgs) -> SessionResult {
                     TableHeader::new("Description", Size::Auto).hide_below(100),
                 ]
             ) {
-                #(tasks.into_iter().enumerate().map(|(i, task)| {
+                #(tasks.into_iter().enumerate().map(|(i, (key, task))| {
                     element! {
                         TableRow(row: i as i32) {
                             TableCol(col: 0) {
                                 StyledText(
-                                    content: task.target.to_string(),
+                                    content: key
+                                        .filter(|_| workspace_graph.sources.len() > 1)
+                                        .map(|key| key.to_string())
+                                        .unwrap_or_else(|| task.target.to_string()),
                                     style: Style::Id
                                 )
                             }

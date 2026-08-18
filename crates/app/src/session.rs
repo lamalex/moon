@@ -35,6 +35,7 @@ use moon_workspace_graph::WorkspaceGraph;
 use proto_core::ProtoEnvironment;
 use rustc_hash::FxHashMap;
 use starbase::{AppExitCode, AppResult, AppSession};
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 use std::future::Future;
@@ -61,6 +62,7 @@ pub struct MoonSession {
     pub proto_env: Arc<ProtoEnvironment>,
 
     // Lazy components
+    pub(crate) aggregate_workspace_graph: OnceCell<Arc<WorkspaceGraph>>,
     pub(crate) cache_engine: OnceLock<Arc<CacheEngine>>,
     pub(crate) daemon_client: OnceLock<DaemonClient>,
     pub(crate) extension_registry: OnceCell<Arc<ExtensionRegistry>>,
@@ -94,6 +96,7 @@ impl MoonSession {
         debug!("Creating new application session");
 
         Self {
+            aggregate_workspace_graph: OnceCell::new(),
             exit_code: AppExitCode::default(),
             cache_engine: OnceLock::new(),
             cli_version: Version::parse(&cli_version).unwrap(),
@@ -213,6 +216,14 @@ impl MoonSession {
             workspace_config: Arc::clone(&self.workspace_config),
             workspace_root: self.workspace_root.clone(),
         }))
+    }
+
+    /// Return the read-only graph composed from all successfully loaded sources.
+    pub async fn get_aggregate_workspace_graph(&self) -> miette::Result<Arc<WorkspaceGraph>> {
+        self.aggregate_workspace_graph
+            .get_or_try_init(async || self.load_aggregate_workspace_graph().await)
+            .await
+            .map(Arc::clone)
     }
 
     pub async fn get_cache_engine(&self) -> miette::Result<Arc<CacheEngine>> {
@@ -453,6 +464,42 @@ impl MoonSession {
         let _ = self.workspace_graph.set(workspace_graph.clone());
 
         Ok(workspace_graph)
+    }
+
+    async fn load_aggregate_workspace_graph(&self) -> miette::Result<Arc<WorkspaceGraph>> {
+        let primary = self.get_workspace_graph().await?;
+        let mut source_ids = self.source_contexts.keys().cloned().collect::<Vec<_>>();
+        source_ids.sort();
+
+        let mut project_graphs = vec![Arc::clone(&primary.projects)];
+        let mut task_graphs = BTreeMap::from([(
+            self.sources.primary_id().clone(),
+            Arc::clone(&primary.tasks),
+        )]);
+
+        for source_id in source_ids {
+            if &source_id == self.sources.primary_id() {
+                continue;
+            }
+
+            let source_graph = self.source_contexts[&source_id]
+                .get_workspace_graph()
+                .await?;
+            project_graphs.push(Arc::clone(&source_graph.projects));
+            task_graphs.insert(source_id, Arc::clone(&source_graph.tasks));
+        }
+
+        let projects = Arc::new(ProjectGraph::compose(
+            Arc::clone(&self.sources),
+            project_graphs,
+        )?);
+
+        Ok(Arc::new(WorkspaceGraph::new_with_source_task_graphs(
+            projects,
+            Arc::clone(&primary.tasks),
+            Arc::clone(&self.sources),
+            task_graphs,
+        )))
     }
 }
 

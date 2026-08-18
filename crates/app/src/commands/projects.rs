@@ -3,6 +3,7 @@ use clap::Args;
 use iocraft::prelude::{Size, element};
 use moon_console::ui::*;
 use starbase_utils::json;
+use std::collections::BTreeMap;
 use tracing::instrument;
 
 #[derive(Args, Clone, Debug)]
@@ -13,9 +14,12 @@ pub struct ProjectsArgs {
 
 #[instrument(skip(session))]
 pub async fn projects(session: MoonSession, args: ProjectsArgs) -> SessionResult {
-    let mut projects = session.get_workspace_graph().await?.get_projects()?;
+    let mut projects = session
+        .get_aggregate_workspace_graph()
+        .await?
+        .get_projects()?;
 
-    projects.sort_by(|a, d| a.id.cmp(&d.id));
+    projects.sort_by_key(|project| project.key());
 
     if args.json {
         session
@@ -38,13 +42,34 @@ pub async fn projects(session: MoonSession, args: ProjectsArgs) -> SessionResult
         return Ok(None);
     }
 
+    let mut id_counts = BTreeMap::new();
+
+    for project in &projects {
+        *id_counts.entry(project.id.clone()).or_insert(0) += 1;
+    }
+
+    let projects = projects
+        .into_iter()
+        .map(|project| {
+            let display_id = if id_counts[&project.id] > 1 {
+                project.key().to_string()
+            } else {
+                project.id.to_string()
+            };
+
+            (display_id, project)
+        })
+        .collect::<Vec<_>>();
+
     let id_width = projects
         .iter()
-        .fold(0, |acc, project| acc.max(project.id.as_str().len()))
+        .fold(0, |acc, (id, _)| acc.max(id.len()))
         .max(3);
     let source_width = projects
         .iter()
-        .fold(0, |acc, project| acc.max(project.source.as_str().len()))
+        .fold(0, |acc, (_, project)| {
+            acc.max(project.source.as_str().len())
+        })
         .max(3);
 
     session.console.render(element! {
@@ -59,12 +84,12 @@ pub async fn projects(session: MoonSession, args: ProjectsArgs) -> SessionResult
                     TableHeader::new("Description", Size::Auto).hide_below(100),
                 ]
             ) {
-                #(projects.into_iter().enumerate().map(|(i, project)| {
+                #(projects.into_iter().enumerate().map(|(i, (id, project))| {
                     element! {
                         TableRow(row: i as i32) {
                             TableCol(col: 0) {
                                 StyledText(
-                                    content: project.id.to_string(),
+                                    content: id,
                                     style: Style::Id
                                 )
                             }

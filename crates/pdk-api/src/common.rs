@@ -1,9 +1,10 @@
 use crate::context::{MoonContext, Operation};
 use crate::is_false;
 use crate::prompts::SettingPrompt;
-use moon_common::Id;
+use moon_common::{Id, SourceRootId};
 use moon_config::{DependencyScope, PartialTaskConfig};
 use moon_project::ProjectFragment;
+use moon_target::ProjectKey;
 use moon_task::TaskFragment;
 use rustc_hash::FxHashMap;
 use schematic::Schema;
@@ -22,6 +23,29 @@ api_struct!(
         pub context: MoonContext,
     }
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serializes_qualified_project_graph_identity() {
+        let source_id = SourceRootId::new("acme/web").unwrap();
+        let key = ProjectKey::new(source_id.clone(), Id::raw("app")).unwrap();
+        let mut input = ExtendProjectGraphInput {
+            graph_schema_version: 2,
+            source_id,
+            ..Default::default()
+        };
+        input.project_keys.insert(key, "apps/app".into());
+
+        let value = serde_json::to_value(input).unwrap();
+
+        assert_eq!(value["graph_schema_version"], 2);
+        assert_eq!(value["source_id"], "acme/web");
+        assert_eq!(value["project_keys"]["acme/web::app"], "apps/app");
+    }
+}
 
 api_struct!(
     /// Output returned from the initialize functions.
@@ -59,9 +83,18 @@ api_struct!(
         /// Is null when within toolchains.
         pub extension_config: serde_json::Value,
 
+        /// Version of the project graph identity fields.
+        pub graph_schema_version: u8,
+
+        /// Map of canonical project keys to their source location.
+        pub project_keys: BTreeMap<ProjectKey, String>,
+
         /// Map of project IDs to their source location,
         /// relative from the workspace root.
         pub project_sources: BTreeMap<Id, String>,
+
+        /// Canonical ID of the source being extended.
+        pub source_id: SourceRootId,
 
         /// Workspace toolchain configuration.
         /// Is null when within extensions.

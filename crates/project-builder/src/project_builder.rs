@@ -1,4 +1,4 @@
-use moon_common::{Id, IdExt, color, path::WorkspaceRelativePath};
+use moon_common::{Id, IdExt, SourceRootId, color, path::WorkspaceRelativePath};
 use moon_config::{
     DependencySource, EnvMap, InheritFor, InheritedTasks, InheritedTasksManager, Input,
     LanguageType, MergeStrategy, ProjectConfig, ProjectDependencyConfig, ProjectDependsOn,
@@ -23,6 +23,7 @@ pub struct ProjectBuilderContext<'app> {
     pub enabled_toolchains: &'app [Id],
     pub monorepo: bool,
     pub root_project_id: Option<&'app Id>,
+    pub source_id: &'app SourceRootId,
     pub toolchains_config: &'app ToolchainsConfig,
     pub toolchain_registry: Arc<ToolchainRegistry>,
     pub workspace_root: &'app Path,
@@ -312,6 +313,7 @@ impl<'app> ProjectBuilder<'app> {
             language: self.language,
             root: self.root,
             source: self.source.to_owned(),
+            source_id: self.context.source_id.clone(),
             tasks,
             task_targets,
             toolchains: self.toolchains,

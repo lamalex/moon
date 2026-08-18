@@ -62,10 +62,7 @@ impl WorkspaceBuilderAsync {
 
         // Load the previous state, as input files discovered by plugins
         // during the last build must contribute to the hash
-        let mut state = context
-            .cache_engine
-            .state
-            .load_state::<WorkspaceGraphCacheState>(STATE_CACHE_FILE_NAME)?;
+        let mut state = load_workspace_graph_cache_state(&context.cache_engine);
         let cache_path = context
             .cache_engine
             .state
@@ -93,25 +90,32 @@ impl WorkspaceBuilderAsync {
         );
 
         if digest.hash == state.data.last_hash && cache_path.exists() {
-            let mut cache: WorkspaceBuilderAsync = json::read_file(&cache_path)?;
+            let cache_result = json::read_file::<WorkspaceBuilderAsync>(&cache_path);
 
-            // Verify that the cached projects match the current projects
-            // on disk. If a project has been added or removed since the
-            // cache was created, we need to rebuild the graph
-            let cached_ids: FxHashSet<&Id> = cache.projects.ids_to_indexes.keys().collect();
-            let current_ids: FxHashSet<&Id> = graph.projects.build_data.keys().collect();
+            match cache_result {
+                Ok(mut cache) => {
+                    // Verify that the cached projects match the current projects
+                    // on disk. If a project has been added or removed since the
+                    // cache was created, we need to rebuild the graph
+                    let cached_ids: FxHashSet<&Id> = cache.projects.ids_to_indexes.keys().collect();
+                    let current_ids: FxHashSet<&Id> = graph.projects.build_data.keys().collect();
 
-            if cached_ids == current_ids {
-                debug!(
-                    cache = ?cache_path,
-                    "Loading workspace graph with {} projects from cache",
-                    cache.projects.ids_to_indexes.len(),
-                );
+                    if cached_ids == current_ids {
+                        debug!(
+                            cache = ?cache_path,
+                            "Loading workspace graph with {} projects from cache",
+                            cache.projects.ids_to_indexes.len(),
+                        );
 
-                cache.projects.context = graph.projects.context.take();
-                cache.context = graph.context;
+                        cache.projects.context = graph.projects.context.take();
+                        cache.context = graph.context;
 
-                return Ok(cache);
+                        return Ok(cache);
+                    }
+                }
+                Err(error) => {
+                    debug!(cache = ?cache_path, error = ?error, "Ignoring invalid workspace graph cache");
+                }
             }
 
             debug!(

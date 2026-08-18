@@ -31,6 +31,17 @@ pub enum ProjectGraphError {
     #[error("No project has been configured with the identifier or alias {}.", .id.style(Style::Id))]
     UnconfiguredID { id: String },
 
+    #[diagnostic(code(project_graph::unsupported_cross_source_edge))]
+    #[error(
+        "Unable to compose project graph, relationships between projects in different sources are not supported: {} to {}.",
+        .source_key.style(Style::Id),
+        .target_key.style(Style::Id),
+    )]
+    UnsupportedCrossSourceEdge {
+        source_key: String,
+        target_key: String,
+    },
+
     #[diagnostic(code(project_graph::would_cycle))]
     #[error(
         "Unable to create project graph, adding a relationship from {} to {} would introduce a cycle.",

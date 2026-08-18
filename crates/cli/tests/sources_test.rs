@@ -11,7 +11,8 @@ mod sources {
             ".moon/workspace.yml",
             r"
 id: acme/platform
-projects: []
+projects:
+  - apps/*
 workspaces:
   frontend:
     path: web
@@ -25,7 +26,22 @@ projects:
   - apps/*
 ",
         );
-        sandbox.create_file("web/apps/app/moon.yml", "{}");
+        sandbox.create_file(
+            "apps/app/moon.yml",
+            r"
+tasks:
+  build:
+    command: echo primary
+",
+        );
+        sandbox.create_file(
+            "web/apps/app/moon.yml",
+            r"
+tasks:
+  build:
+    command: echo child
+",
+        );
         sandbox
     }
 
@@ -45,7 +61,7 @@ projects:
     }
 
     #[test]
-    fn existing_project_listing_remains_primary_scoped() {
+    fn aggregates_duplicate_projects_with_canonical_identities() {
         let sandbox = create_sources_sandbox();
 
         sandbox
@@ -53,7 +69,71 @@ projects:
                 cmd.arg("projects").arg("--json");
             })
             .success()
-            .stdout(predicate::eq("[]\n"));
+            .stdout(predicate::str::contains("\"sourceId\": \"acme/platform\""))
+            .stdout(predicate::str::contains("\"sourceId\": \"acme/web\""));
+    }
+
+    #[test]
+    fn aggregates_duplicate_tasks_without_changing_positional_resolution() {
+        let sandbox = create_sources_sandbox();
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("tasks").arg("--json");
+            })
+            .success()
+            .stdout(predicate::str::contains("acme/platform::app:build"))
+            .stdout(predicate::str::contains("acme/web::app:build"));
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("tasks").arg("app").arg("--json");
+            })
+            .success()
+            .stdout(predicate::str::contains("\"primary\""))
+            .stdout(predicate::str::contains("\"child\"").not());
+    }
+
+    #[test]
+    fn aggregate_queries_preserve_duplicate_project_and_task_keys() {
+        let sandbox = create_sources_sandbox();
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("query").arg("projects").arg("project=app");
+            })
+            .success()
+            .stdout(predicate::str::contains("acme/platform::app"))
+            .stdout(predicate::str::contains("acme/web::app"));
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("query").arg("tasks").arg("task=build");
+            })
+            .success()
+            .stdout(predicate::str::contains("acme/platform::app:build"))
+            .stdout(predicate::str::contains("acme/web::app:build"));
+    }
+
+    #[test]
+    fn project_graph_qualifies_ambiguous_ids() {
+        let sandbox = create_sources_sandbox();
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("project-graph").arg("--dot");
+            })
+            .success()
+            .stdout(predicate::str::contains("acme/platform::app"))
+            .stdout(predicate::str::contains("acme/web::app"));
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("project-graph").arg("--json");
+            })
+            .success()
+            .stdout(predicate::str::contains("\"sourceId\": \"acme/platform\""))
+            .stdout(predicate::str::contains("\"sourceId\": \"acme/web\""));
     }
 
     #[test]

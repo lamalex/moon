@@ -1,4 +1,4 @@
-use moon_common::{Id, SourceRootId};
+use moon_common::{Id, SourceRegistry, SourceRootId};
 use moon_target::{ProjectKey, TaskKey};
 
 #[test]
@@ -35,6 +35,17 @@ fn primary_keys_have_stable_qualified_values() {
             .to_string(),
         "workspace::app:build"
     );
+}
+
+#[test]
+fn project_keys_use_the_configured_primary_source() {
+    let sources = SourceRegistry::new(
+        SourceRootId::new("acme/platform").unwrap(),
+        "/workspace".into(),
+    );
+    let key = ProjectKey::for_primary(&sources, Id::raw("app")).unwrap();
+
+    assert_eq!(key.to_string(), "acme/platform::app");
 }
 
 #[test]

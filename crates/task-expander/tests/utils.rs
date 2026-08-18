@@ -79,8 +79,9 @@ pub fn create_project_graph(projects: impl IntoIterator<Item = Project>) -> Arc<
     let mut graph = ProjectGraph::default();
 
     for (i, project) in projects.into_iter().enumerate() {
+        let key = project.key();
         graph.nodes.insert(
-            project.id.clone(),
+            key,
             ProjectNode {
                 index: NodeIndex::new(i),
                 project,

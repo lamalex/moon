@@ -13,6 +13,7 @@ moon_common = { version = "2.0.8", path = "../common" }
 moon_config = { version = "2.1.2", path = "../config" }
 moon_file_group = { version = "2.0.5", path = "../file-group" }
 moon_task = { version = "2.1.2", path = "../task" }
+moon_target = { version = "3.0.1", path = "../target" }
 miette = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

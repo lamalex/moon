@@ -69,8 +69,6 @@ pub struct QueryTasksArgs {
 
 #[instrument(skip(session))]
 pub async fn tasks(session: MoonSession, args: QueryTasksArgs) -> SessionResult {
-    let workspace_graph = session.get_workspace_graph().await?;
-
     let mut options = QueryTasksOptions {
         affected: None,
         id: args.id,
@@ -85,6 +83,7 @@ pub async fn tasks(session: MoonSession, args: QueryTasksArgs) -> SessionResult 
 
     // Filter down to affected tasks only
     if let Some(by) = &args.affected {
+        let workspace_graph = session.get_workspace_graph().await?;
         let vcs = session.get_vcs_adapter().await?;
         let changed_files = query_changed_files_for_affected(&vcs, by.as_ref()).await?;
 
@@ -98,32 +97,65 @@ pub async fn tasks(session: MoonSession, args: QueryTasksArgs) -> SessionResult 
         }
 
         options.affected = Some(affected_tracker.build());
-    }
 
-    // Query for tasks that match the filters
-    let tasks = query_tasks(&workspace_graph, &options).await?;
-
-    let mut result = QueryTasksResult {
-        tasks: BTreeMap::default(),
-        options,
-    };
-
-    for task in tasks {
-        let Ok(project_id) = task.target.get_project_id() else {
-            continue;
+        let tasks = query_tasks(&workspace_graph, &options).await?;
+        let mut result = QueryTasksResult {
+            tasks: BTreeMap::default(),
+            options,
         };
 
-        result
-            .tasks
-            .entry(Id::raw(project_id))
-            .or_default()
-            .insert(task.id.clone(), task);
+        for task in tasks {
+            let Ok(project_id) = task.target.get_project_id() else {
+                continue;
+            };
+
+            result
+                .tasks
+                .entry(Id::raw(project_id))
+                .or_default()
+                .insert(task.id.clone(), task);
+        }
+
+        session
+            .console
+            .out
+            .write_line(json::format(&result, true)?)?;
+
+        return Ok(None);
     }
 
-    session
-        .console
-        .out
-        .write_line(json::format(&result, true)?)?;
+    let workspace_graph = session.get_aggregate_workspace_graph().await?;
+    let tasks = query_tasks_with_keys(&workspace_graph, &options).await?;
+
+    if workspace_graph.sources.len() > 1 {
+        let result = QueryTasksByKeyResult {
+            tasks: tasks.into_iter().collect(),
+            options,
+        };
+
+        session
+            .console
+            .out
+            .write_line(json::format(&result, true)?)?;
+    } else {
+        let mut result = QueryTasksResult {
+            tasks: BTreeMap::default(),
+            options,
+        };
+
+        for (key, task) in tasks {
+            result
+                .tasks
+                .entry(key.project_key().project_id().clone())
+                .or_default()
+                .insert(key.task_id().clone(), task);
+        }
+
+        session
+            .console
+            .out
+            .write_line(json::format(&result, true)?)?;
+    }
 
     Ok(None)
 }

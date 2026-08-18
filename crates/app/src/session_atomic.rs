@@ -58,6 +58,7 @@ impl MoonSession {
     pub fn reset_components(&mut self) {
         debug!("Resetting registries and graphs cache");
 
+        self.aggregate_workspace_graph.take();
         self.extension_registry.take();
         self.toolchain_registry.take();
         self.project_graph.take();

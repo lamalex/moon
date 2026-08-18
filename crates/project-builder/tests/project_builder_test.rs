@@ -1,5 +1,5 @@
-use moon_common::Id;
 use moon_common::path::WorkspaceRelativePathBuf;
+use moon_common::{Id, SourceRegistry, SourceRootId};
 use moon_config::{
     DependencyScope, DependencySource, EnvMap, LanguageType, ProjectDependencyConfig, TaskArgs,
     TaskConfig,
@@ -11,6 +11,7 @@ use moon_test_utils::WorkspaceMocker;
 use starbase_sandbox::create_sandbox;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 struct ProjectBuilderContainer {
     pub mocker: WorkspaceMocker,
@@ -67,8 +68,22 @@ mod project_builder {
         let project = build_project_without_inherited("baz", sandbox.path()).await;
 
         assert_eq!(project.id, Id::raw("baz"));
+        assert_eq!(project.key().to_string(), "workspace::baz");
         assert_eq!(project.source, WorkspaceRelativePathBuf::from("baz"));
         assert_eq!(project.root, sandbox.path().join("baz"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sets_the_canonical_source_identity() {
+        let sandbox = create_sandbox("builder");
+        let mut container = ProjectBuilderContainer::new(sandbox.path());
+        container.mocker.sources = Arc::new(SourceRegistry::new(
+            SourceRootId::new("acme/web").unwrap(),
+            sandbox.path().to_path_buf(),
+        ));
+        let project = container.build_project("baz").await;
+
+        assert_eq!(project.key().to_string(), "acme/web::baz");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1453,12 +1453,12 @@ impl<'query> ActionGraphBuilder<'query> {
 
         // We should also depend on other projects
         if self.options.sync_project_dependencies {
-            for dep_project_id in self.workspace_graph.projects.dependencies_of(project) {
-                if cycle.contains(&dep_project_id) {
+            for dependency_key in self.workspace_graph.projects.dependencies_of(project) {
+                if cycle.contains(dependency_key.project_id()) {
                     continue;
                 }
 
-                let dep_project = self.workspace_graph.get_project(&dep_project_id)?;
+                let dep_project = self.workspace_graph.projects.get_by_key(&dependency_key)?;
 
                 if let Some(dep_project_index) =
                     Box::pin(self.internal_sync_project(&dep_project, reqs, cycle.clone())).await?

@@ -8,6 +8,7 @@ use moon_config::{
     ProjectDependencyConfig, StackType,
 };
 use moon_file_group::FileGroup;
+use moon_target::ProjectKey;
 use moon_task::{Target, Task};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -65,6 +66,9 @@ cacheable!(
         /// Relative path from the workspace root to the project root.
         pub source: WorkspaceRelativePathBuf,
 
+        /// Canonical source root that owns this project.
+        pub source_id: moon_common::SourceRootId,
+
         /// The technology stack of the project.
         pub stack: StackType,
 
@@ -85,6 +89,12 @@ cacheable!(
 );
 
 impl Project {
+    /// Return the canonical identity for this project.
+    pub fn key(&self) -> ProjectKey {
+        ProjectKey::new(self.source_id.clone(), self.id.clone())
+            .expect("Project IDs must be valid canonical identities.")
+    }
+
     /// Return a list of project IDs this project depends on.
     pub fn get_dependency_ids(&self) -> Vec<&Id> {
         self.dependencies
@@ -173,6 +183,7 @@ impl PartialEq for Project {
             && self.layer == other.layer
             && self.root == other.root
             && self.source == other.source
+            && self.source_id == other.source_id
             && self.stack == other.stack
             && self.tasks == other.tasks
             && self.task_targets == other.task_targets

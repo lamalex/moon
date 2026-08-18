@@ -1,10 +1,14 @@
-use moon_common::Id;
+use moon_common::SourceRootId;
+use moon_target::ProjectKey;
 use rustc_hash::FxHashMap;
 use std::path::Path;
 
 pub struct ProjectExpanderContext<'graph> {
-    /// Mapping of aliases to their project IDs.
-    pub aliases: FxHashMap<&'graph str, &'graph Id>,
+    /// Source-local mapping of aliases to canonical project keys.
+    pub aliases: FxHashMap<&'graph str, &'graph ProjectKey>,
+
+    /// Source containing the project being expanded.
+    pub source_id: &'graph SourceRootId,
 
     /// Workspace root, of course.
     pub workspace_root: &'graph Path,

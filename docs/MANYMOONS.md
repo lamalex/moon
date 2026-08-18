@@ -5,8 +5,9 @@
 Manymoons is a design and implementation effort. The external configuration and command syntax
 described by this document are intentionally undecided unless explicitly marked otherwise.
 
-Milestone 1, internal source-root qualification, and Milestone 2, direct multi-workspace discovery,
-are complete. Milestone 3, aggregated querying, is next.
+Milestone 1, internal source-root qualification, Milestone 2, direct multi-workspace discovery, and
+Milestone 3, aggregated querying, are complete. Milestone 4, cross-source project dependencies, is
+next.
 
 ## End Goal
 

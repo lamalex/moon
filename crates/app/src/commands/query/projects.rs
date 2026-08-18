@@ -6,6 +6,7 @@ use crate::session::{MoonSession, SessionResult};
 use clap::Args;
 use moon_affected::{AffectedTracker, DownstreamScope, UpstreamScope};
 use starbase_utils::json;
+use std::collections::BTreeMap;
 use tracing::instrument;
 
 #[derive(Args, Clone, Debug)]
@@ -70,8 +71,6 @@ pub struct QueryProjectsArgs {
 
 #[instrument(skip(session))]
 pub async fn projects(session: MoonSession, args: QueryProjectsArgs) -> SessionResult {
-    let workspace_graph = session.get_workspace_graph().await?;
-
     let mut options = QueryProjectsOptions {
         alias: args.alias,
         affected: None,
@@ -87,6 +86,7 @@ pub async fn projects(session: MoonSession, args: QueryProjectsArgs) -> SessionR
 
     // Filter down to affected projects only
     if let Some(by) = &args.affected {
+        let workspace_graph = session.get_workspace_graph().await?;
         let vcs = session.get_vcs_adapter().await?;
         let changed_files = query_changed_files_for_affected(&vcs, by.as_ref()).await?;
 
@@ -100,15 +100,37 @@ pub async fn projects(session: MoonSession, args: QueryProjectsArgs) -> SessionR
         }
 
         options.affected = Some(affected_tracker.build());
+
+        let projects = query_projects(&workspace_graph, &options).await?;
+
+        session.console.out.write_line(json::format(
+            &QueryProjectsResult { projects, options },
+            true,
+        )?)?;
+
+        return Ok(None);
     }
 
-    // Query for projects that match the filters
-    let projects = query_projects(&workspace_graph, &options).await?;
+    let workspace_graph = session.get_aggregate_workspace_graph().await?;
+    let projects = query_projects_with_keys(&workspace_graph, &options).await?;
 
-    session.console.out.write_line(json::format(
-        &QueryProjectsResult { projects, options },
-        true,
-    )?)?;
+    if workspace_graph.sources.len() > 1 {
+        session.console.out.write_line(json::format(
+            &QueryProjectsByKeyResult {
+                projects: projects.into_iter().collect::<BTreeMap<_, _>>(),
+                options,
+            },
+            true,
+        )?)?;
+    } else {
+        session.console.out.write_line(json::format(
+            &QueryProjectsResult {
+                projects: projects.into_iter().map(|(_, project)| project).collect(),
+                options,
+            },
+            true,
+        )?)?;
+    }
 
     Ok(None)
 }

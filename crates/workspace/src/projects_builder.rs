@@ -18,6 +18,7 @@ use moon_project::{Project, ProjectAlias};
 use moon_project_builder::{ProjectBuilder, ProjectBuilderContext};
 use moon_project_constraints::{enforce_layer_relationships, enforce_tag_relationships};
 use moon_project_graph::{ProjectGraph, ProjectGraphError, ProjectNode, would_cycle_in_scope};
+use moon_target::ProjectKey;
 use moon_task::{Target, Task, TaskOptions};
 use moon_task_builder::TaskDepsBuilder;
 use petgraph::prelude::*;
@@ -111,6 +112,16 @@ pub async fn extend_project_build_data_with_plugins(
     sources: BTreeMap<Id, String>,
 ) -> miette::Result<Vec<(Id, ExtendProjectGraphOutput, bool)>> {
     let mut outputs = vec![];
+    let source_id = context.sources.primary_id().clone();
+    let project_keys = sources
+        .iter()
+        .map(|(id, source)| {
+            Ok((
+                ProjectKey::new(source_id.clone(), id.clone())?,
+                source.clone(),
+            ))
+        })
+        .collect::<miette::Result<BTreeMap<_, _>>>()?;
 
     // From toolchains
     let registry = &context.toolchain_registry;
@@ -118,7 +129,10 @@ pub async fn extend_project_build_data_with_plugins(
     for result in registry
         .extend_project_graph_all(|toolchain| ExtendProjectGraphInput {
             context: registry.create_context(),
+            graph_schema_version: 2,
+            project_keys: project_keys.clone(),
             project_sources: sources.clone(),
+            source_id: source_id.clone(),
             toolchain_config: registry.create_config(&toolchain.id),
             ..Default::default()
         })
@@ -133,7 +147,10 @@ pub async fn extend_project_build_data_with_plugins(
     for result in registry
         .extend_project_graph_all(|extension| ExtendProjectGraphInput {
             context: registry.create_context(),
+            graph_schema_version: 2,
+            project_keys: project_keys.clone(),
             project_sources: sources.clone(),
+            source_id: source_id.clone(),
             extension_config: registry.create_config(&extension.id),
             ..Default::default()
         })
@@ -166,6 +183,7 @@ pub async fn build_project(
             enabled_toolchains: &context.enabled_toolchains,
             monorepo,
             root_project_id: root_id.as_ref(),
+            source_id: context.sources.primary_id(),
             toolchains_config: &context.toolchains_config,
             toolchain_registry: context.toolchain_registry.clone(),
             workspace_root: &context.workspace_root,
@@ -388,9 +406,26 @@ impl WorkspaceProjectsBuilder {
     }
 
     pub fn finalize(self, context: GraphExpanderContext) -> miette::Result<ProjectGraph> {
+        let source_id = context.sources.primary_id().clone();
         let mut project_graph = ProjectGraph::new(context);
-        project_graph.default_id = self.context().workspace_config.default_project.clone();
-        project_graph.aliases.extend(self.aliases_to_ids);
+        project_graph.default_key = self
+            .context()
+            .workspace_config
+            .default_project
+            .clone()
+            .map(|id| ProjectKey::new(source_id.clone(), id))
+            .transpose()?;
+        project_graph.aliases.extend(
+            self.aliases_to_ids
+                .into_iter()
+                .map(|(alias, id)| {
+                    Ok((
+                        (source_id.clone(), alias),
+                        ProjectKey::new(source_id.clone(), id)?,
+                    ))
+                })
+                .collect::<miette::Result<FxHashMap<_, _>>>()?,
+        );
         let mut loaded_projects = FxHashMap::default();
 
         // TODO switch to filter_map_owned
@@ -409,12 +444,12 @@ impl WorkspaceProjectsBuilder {
         for index in graph.node_indices() {
             let old_index = *graph.node_weight(index).unwrap();
             let project = loaded_projects.remove(&old_index).unwrap();
-            let id = project.id.clone();
+            let key = project.key();
 
-            project_graph.indexes.insert(index, id.clone());
+            project_graph.indexes.insert(index, key.clone());
             project_graph
                 .nodes
-                .insert(id, ProjectNode { index, project });
+                .insert(key, ProjectNode { index, project });
         }
 
         project_graph.set_graph(graph)?;

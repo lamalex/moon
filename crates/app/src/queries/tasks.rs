@@ -1,6 +1,7 @@
 use super::convert_to_regex;
 use moon_affected::Affected;
 use moon_common::Id;
+use moon_target::TaskKey;
 use moon_task::Task;
 use moon_workspace_graph::WorkspaceGraph;
 use serde::{Deserialize, Serialize};
@@ -30,17 +31,17 @@ pub struct QueryTasksResult {
     pub options: QueryTasksOptions,
 }
 
-fn load_with_query(
-    workspace_graph: &WorkspaceGraph,
-    query: &str,
-) -> miette::Result<Vec<Arc<Task>>> {
-    workspace_graph.query_tasks(moon_query::build_query(query)?)
+#[derive(Deserialize, Serialize)]
+pub struct QueryTasksByKeyResult {
+    pub tasks: BTreeMap<TaskKey, Arc<Task>>,
+    pub options: QueryTasksOptions,
 }
 
-fn load_with_regex(
+fn load_with_regex_and_keys(
     workspace_graph: &WorkspaceGraph,
     options: &QueryTasksOptions,
-) -> miette::Result<Vec<Arc<Task>>> {
+    match_project_aliases: bool,
+) -> miette::Result<Vec<(TaskKey, Arc<Task>)>> {
     let id_regex = convert_to_regex("id", &options.id)?;
     let command_regex = convert_to_regex("command", &options.command)?;
     let project_regex = convert_to_regex("project", &options.project)?;
@@ -50,17 +51,25 @@ fn load_with_regex(
     let type_regex = convert_to_regex("type", &options.type_of)?;
     let mut filtered = vec![];
 
-    for task in workspace_graph.get_tasks()? {
+    for (key, task) in workspace_graph.get_all_tasks_with_keys()? {
         if let Some(regex) = &id_regex
             && !regex.is_match(&task.id)
         {
             continue;
         }
 
-        if let (Some(regex), Ok(project_id)) = (&project_regex, task.target.get_project_id())
-            && !regex.is_match(project_id)
-        {
-            continue;
+        if let Some(regex) = &project_regex {
+            let project = workspace_graph.get_project_by_key(key.project_key())?;
+            let matches_project = regex.is_match(&project.id)
+                || (match_project_aliases
+                    && project
+                        .aliases
+                        .iter()
+                        .any(|alias| regex.is_match(&alias.alias)));
+
+            if !matches_project {
+                continue;
+            }
         }
 
         if let Some(regex) = &command_regex
@@ -69,10 +78,14 @@ fn load_with_regex(
             continue;
         }
 
-        if let (Some(regex), Some(script)) = (&script_regex, &task.script)
-            && !regex.is_match(script)
-        {
-            continue;
+        if let Some(regex) = &script_regex {
+            let Some(script) = &task.script else {
+                continue;
+            };
+
+            if !regex.is_match(script) {
+                continue;
+            }
         }
 
         if let Some(regex) = &tags_regex {
@@ -95,7 +108,7 @@ fn load_with_regex(
             continue;
         }
 
-        filtered.push(task);
+        filtered.push((key, task));
     }
 
     Ok(filtered)
@@ -108,9 +121,12 @@ pub async fn query_tasks(
     debug!("Querying for tasks");
 
     let mut tasks = if let Some(query) = &options.query {
-        load_with_query(workspace_graph, query)?
+        workspace_graph.query_tasks(moon_query::build_query(query)?)?
     } else {
-        load_with_regex(workspace_graph, options)?
+        load_with_regex_and_keys(workspace_graph, options, false)?
+            .into_iter()
+            .map(|(_, task)| task)
+            .collect()
     };
 
     if let Some(affected) = &options.affected {
@@ -129,6 +145,23 @@ pub async fn query_tasks(
     }
 
     tasks.sort_by(|a, d| a.target.cmp(&d.target));
+
+    Ok(tasks)
+}
+
+pub async fn query_tasks_with_keys(
+    workspace_graph: &WorkspaceGraph,
+    options: &QueryTasksOptions,
+) -> miette::Result<Vec<(TaskKey, Arc<Task>)>> {
+    debug!("Querying aggregate tasks");
+
+    let mut tasks = if let Some(query) = &options.query {
+        workspace_graph.query_tasks_with_keys(moon_query::build_query(query)?)?
+    } else {
+        load_with_regex_and_keys(workspace_graph, options, true)?
+    };
+
+    tasks.sort_by(|a, b| a.0.cmp(&b.0));
 
     Ok(tasks)
 }

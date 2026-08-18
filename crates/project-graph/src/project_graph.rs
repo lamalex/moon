@@ -1,11 +1,13 @@
 use crate::project_graph_error::ProjectGraphError;
 use daggy::Dag;
-use moon_common::Id;
+use miette::IntoDiagnostic;
 use moon_common::path::{PathExt, WorkspaceRelativePathBuf};
+use moon_common::{Id, SourcePathBuf, SourceRootId};
 use moon_config::DependencyScope;
 use moon_graph_utils::*;
 use moon_project::Project;
 use moon_project_expander::{ProjectExpander, ProjectExpanderContext};
+use moon_target::ProjectKey;
 use petgraph::Direction;
 use petgraph::algo::{has_path_connecting, toposort};
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -70,11 +72,14 @@ pub struct ProjectNode {
 pub struct ProjectGraph {
     pub context: GraphExpanderContext,
 
-    /// Map of aliases to project IDs.
-    pub aliases: FxHashMap<String, Id>,
+    /// Expansion contexts indexed by the source that owns each project.
+    contexts: FxHashMap<SourceRootId, GraphExpanderContext>,
 
-    /// ID of the default project.
-    pub default_id: Option<Id>,
+    /// Map of source-qualified aliases to canonical project keys.
+    pub aliases: FxHashMap<(SourceRootId, String), ProjectKey>,
+
+    /// Canonical key of the default project.
+    pub default_key: Option<ProjectKey>,
 
     /// Union graph of projects (by index) and their dependencies across every
     /// scope. Powers all read APIs. May contain cycles that cross the
@@ -88,34 +93,136 @@ pub struct ProjectGraph {
     /// Directed-acyclic graph (DAG) of development, build, and root dependencies.
     development_graph: Dag<NodeIndex, DependencyScope>,
 
-    /// Map of node indexes to project IDs.
-    pub indexes: FxHashMap<NodeIndex, Id>,
+    /// Map of node indexes to canonical project keys.
+    pub indexes: FxHashMap<NodeIndex, ProjectKey>,
 
-    /// Map of project nodes by ID.
-    pub nodes: FxHashMap<Id, ProjectNode>,
+    /// Map of project nodes by canonical key.
+    pub nodes: FxHashMap<ProjectKey, ProjectNode>,
 
-    /// Cache of file path lookups, mapped by starting path to project ID (as a string).
-    fs_cache: Arc<scc::HashMap<PathBuf, Arc<String>>>,
+    /// Cache of file path lookups, mapped by starting path to canonical project key.
+    fs_cache: Arc<scc::HashMap<SourcePathBuf, Arc<ProjectKey>>>,
 
-    /// Map of expanded projects by ID.
-    projects: Arc<scc::HashMap<Id, Arc<Project>>>,
+    /// Map of expanded projects by canonical key.
+    projects: Arc<scc::HashMap<ProjectKey, Arc<Project>>>,
 }
 
 impl ProjectGraph {
     pub fn new(context: GraphExpanderContext) -> Self {
         debug!("Creating project graph");
 
+        let mut contexts = FxHashMap::default();
+        contexts.insert(context.sources.primary_id().clone(), context.clone());
+
         Self {
             context,
+            contexts,
             ..Default::default()
         }
     }
 
+    /// Compose finalized source-local project graphs into a read-only aggregate graph.
+    pub fn compose(
+        sources: Arc<moon_common::SourceRegistry>,
+        graphs: impl IntoIterator<Item = Arc<ProjectGraph>>,
+    ) -> miette::Result<Self> {
+        let mut graphs = graphs.into_iter().collect::<Vec<_>>();
+        graphs.sort_by(|a, b| {
+            a.context
+                .sources
+                .primary_id()
+                .cmp(b.context.sources.primary_id())
+        });
+
+        let primary_id = sources.primary_id().clone();
+        let primary = graphs
+            .iter()
+            .find(|graph| graph.context.sources.primary_id() == &primary_id)
+            .ok_or_else(|| ProjectGraphError::UnconfiguredID {
+                id: primary_id.to_string(),
+            })?;
+        let mut context = primary.context.clone();
+        context.sources = Arc::clone(&sources);
+        context.workspace_root = sources.get_primary().to_path_buf();
+
+        let mut aggregate = Self::new(context);
+        aggregate.contexts.clear();
+        aggregate.default_key = primary.default_key.clone();
+
+        let mut graph = DiGraph::new();
+        let mut indexes_by_key = FxHashMap::default();
+
+        for local in graphs {
+            let source_id = local.context.sources.primary_id().clone();
+            aggregate
+                .contexts
+                .insert(source_id.clone(), local.context.clone());
+
+            let mut keys = local.nodes.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+
+            for key in keys {
+                let project = local.nodes[&key].project.clone();
+                let index = graph.add_node(NodeIndex::new(graph.node_count()));
+
+                aggregate.indexes.insert(index, key.clone());
+                aggregate
+                    .nodes
+                    .insert(key.clone(), ProjectNode { index, project });
+                indexes_by_key.insert(key, index);
+            }
+
+            aggregate.aliases.extend(
+                local
+                    .aliases
+                    .iter()
+                    .filter(|((alias_source, _), key)| {
+                        alias_source == &source_id && key.source_id() == &source_id
+                    })
+                    .map(|(alias, key)| (alias.clone(), key.clone())),
+            );
+
+            for edge in local.graph.edge_references() {
+                let source_key = &local.indexes[&edge.source()];
+                let target_key = &local.indexes[&edge.target()];
+
+                if source_key.source_id() != target_key.source_id() {
+                    return Err(ProjectGraphError::UnsupportedCrossSourceEdge {
+                        source_key: source_key.to_string(),
+                        target_key: target_key.to_string(),
+                    }
+                    .into());
+                }
+
+                graph.add_edge(
+                    indexes_by_key[source_key],
+                    indexes_by_key[target_key],
+                    *edge.weight(),
+                );
+            }
+        }
+
+        aggregate.set_graph(graph)?;
+
+        Ok(aggregate)
+    }
+
     /// Return a map of aliases to their project IDs. Projects without aliases are omitted.
     pub fn aliases(&self) -> FxHashMap<&str, &Id> {
+        self.aliases_for_source(self.context.sources.primary_id())
+            .into_iter()
+            .map(|(alias, key)| (alias, key.project_id()))
+            .collect()
+    }
+
+    /// Return source-local aliases mapped to canonical project keys.
+    pub fn aliases_for_source(&self, source_id: &SourceRootId) -> FxHashMap<&str, &ProjectKey> {
+        let source_id = self.canonical_source_id(source_id);
+
         self.aliases
             .iter()
-            .map(|(alias, id)| (alias.as_str(), id))
+            .filter_map(|((alias_source, alias), key)| {
+                (alias_source == source_id).then_some((alias.as_str(), key))
+            })
             .collect()
     }
 
@@ -123,17 +230,46 @@ impl ProjectGraph {
     /// If the project does not exist or has been misconfigured, return an error.
     #[instrument(name = "get_project", skip(self))]
     pub fn get(&self, id_or_alias: &str) -> miette::Result<Arc<Project>> {
-        self.internal_get(id_or_alias)
+        let key = self.resolve_key(self.context.sources.primary_id(), id_or_alias)?;
+
+        if !self.nodes.contains_key(&key) {
+            return Err(ProjectGraphError::UnconfiguredID {
+                id: key.project_id().to_string(),
+            }
+            .into());
+        }
+
+        self.internal_get(&key)
+    }
+
+    /// Return a project by its canonical source-qualified identity.
+    pub fn get_by_key(&self, key: &ProjectKey) -> miette::Result<Arc<Project>> {
+        let key = self.normalize_key(key)?;
+        self.internal_get(&key)
     }
 
     /// Return an unexpanded project with the provided ID or alias from the graph.
     pub fn get_unexpanded(&self, id_or_alias: &str) -> miette::Result<&Project> {
-        let id = self.resolve_id(id_or_alias);
-
+        let key = self.resolve_key(self.context.sources.primary_id(), id_or_alias)?;
         let node = self
             .nodes
-            .get(&id)
-            .ok_or_else(|| ProjectGraphError::UnconfiguredID { id: id.to_string() })?;
+            .get(&key)
+            .ok_or_else(|| ProjectGraphError::UnconfiguredID {
+                id: key.project_id().to_string(),
+            })?;
+
+        Ok(&node.project)
+    }
+
+    /// Return an unexpanded project by its canonical source-qualified identity.
+    pub fn get_unexpanded_by_key(&self, key: &ProjectKey) -> miette::Result<&Project> {
+        let key = self.normalize_key(key)?;
+        let node = self
+            .nodes
+            .get(&key)
+            .ok_or_else(|| ProjectGraphError::UnconfiguredID {
+                id: key.to_string(),
+            })?;
 
         Ok(&node.project)
     }
@@ -143,8 +279,8 @@ impl ProjectGraph {
     pub fn get_all(&self) -> miette::Result<Vec<Arc<Project>>> {
         let mut all = vec![];
 
-        for id in self.nodes.keys() {
-            all.push(self.internal_get(id)?);
+        for key in self.nodes.keys() {
+            all.push(self.internal_get(key)?);
         }
 
         Ok(all)
@@ -157,8 +293,17 @@ impl ProjectGraph {
 
     /// Return the default project if it has been configured and exists.
     pub fn get_default(&self) -> miette::Result<Arc<Project>> {
-        if let Some(id) = &self.default_id {
-            return self.get(id);
+        if let Some(key) = &self.default_key {
+            return self.get(key.project_id());
+        }
+
+        Err(ProjectGraphError::NoDefaultProject.into())
+    }
+
+    /// Return the canonical default project if it has been configured and exists.
+    pub fn get_default_by_key(&self) -> miette::Result<Arc<Project>> {
+        if let Some(key) = &self.default_key {
+            return self.get_by_key(key);
         }
 
         Err(ProjectGraphError::NoDefaultProject.into())
@@ -170,24 +315,45 @@ impl ProjectGraph {
     pub fn get_from_path(&self, starting_file: Option<&Path>) -> miette::Result<Arc<Project>> {
         let current_file = starting_file.unwrap_or(&self.context.working_dir);
 
-        let file = if current_file == self.context.workspace_root {
-            Path::new(".")
-        } else if let Ok(rel_file) = current_file.strip_prefix(&self.context.workspace_root) {
-            rel_file
+        let source_path = if current_file.is_absolute() {
+            self.context.sources.qualify(current_file)?
         } else {
-            current_file
+            SourcePathBuf::new(
+                self.context.sources.primary_id().clone(),
+                WorkspaceRelativePathBuf::from_path(current_file).into_diagnostic()?,
+            )
         };
 
-        let id = self.internal_search(file)?;
+        self.get_from_source_path(&source_path)
+    }
 
-        self.get(&id)
+    /// Find a project from a canonical source-qualified path.
+    pub fn get_from_source_path(
+        &self,
+        source_path: &SourcePathBuf,
+    ) -> miette::Result<Arc<Project>> {
+        let key = self.internal_search(source_path)?;
+
+        self.get_by_key(&key)
     }
 
     /// Return a map of project IDs to their file source paths.
     pub fn sources(&self) -> FxHashMap<&Id, &WorkspaceRelativePathBuf> {
+        let primary = self.context.sources.primary_id();
+
         self.nodes
             .iter()
-            .map(|(id, node)| (id, &node.project.source))
+            .filter_map(|(key, node)| {
+                (key.source_id() == primary).then_some((key.project_id(), &node.project.source))
+            })
+            .collect()
+    }
+
+    /// Return a map of canonical project keys to their file source paths.
+    pub fn sources_by_key(&self) -> FxHashMap<&ProjectKey, &WorkspaceRelativePathBuf> {
+        self.nodes
+            .iter()
+            .map(|(key, node)| (key, &node.project.source))
             .collect()
     }
 
@@ -220,6 +386,18 @@ impl ProjectGraph {
         project: &Project,
         partition: ScopePartition,
     ) -> Vec<Id> {
+        self.partitioned_dependency_keys_of(project, partition)
+            .into_iter()
+            .map(|key| key.project_id().clone())
+            .collect()
+    }
+
+    /// Return canonical keys for direct dependencies in the provided partition.
+    pub fn partitioned_dependency_keys_of(
+        &self,
+        project: &Project,
+        partition: ScopePartition,
+    ) -> Vec<ProjectKey> {
         self.partitioned_neighbors_of(project, partition, Direction::Outgoing)
     }
 
@@ -230,6 +408,18 @@ impl ProjectGraph {
         project: &Project,
         partition: ScopePartition,
     ) -> Vec<Id> {
+        self.partitioned_dependent_keys_of(project, partition)
+            .into_iter()
+            .map(|key| key.project_id().clone())
+            .collect()
+    }
+
+    /// Return canonical keys for direct dependents in the provided partition.
+    pub fn partitioned_dependent_keys_of(
+        &self,
+        project: &Project,
+        partition: ScopePartition,
+    ) -> Vec<ProjectKey> {
         self.partitioned_neighbors_of(project, partition, Direction::Incoming)
     }
 
@@ -240,6 +430,18 @@ impl ProjectGraph {
         project: &Project,
         partition: ScopePartition,
     ) -> Vec<Id> {
+        self.partitioned_deep_dependency_keys_of(project, partition)
+            .into_iter()
+            .map(|key| key.project_id().clone())
+            .collect()
+    }
+
+    /// Return canonical keys for all dependencies in the provided partition.
+    pub fn partitioned_deep_dependency_keys_of(
+        &self,
+        project: &Project,
+        partition: ScopePartition,
+    ) -> Vec<ProjectKey> {
         self.partitioned_traverse(project, partition, Direction::Outgoing)
     }
 
@@ -250,6 +452,18 @@ impl ProjectGraph {
         project: &Project,
         partition: ScopePartition,
     ) -> Vec<Id> {
+        self.partitioned_deep_dependent_keys_of(project, partition)
+            .into_iter()
+            .map(|key| key.project_id().clone())
+            .collect()
+    }
+
+    /// Return canonical keys for all dependents in the provided partition.
+    pub fn partitioned_deep_dependent_keys_of(
+        &self,
+        project: &Project,
+        partition: ScopePartition,
+    ) -> Vec<ProjectKey> {
         self.partitioned_traverse(project, partition, Direction::Incoming)
     }
 
@@ -259,6 +473,14 @@ impl ProjectGraph {
     /// partition are included. Sorting is only possible for partitioned
     /// graphs, as the unioned graph may contain cycles across partitions.
     pub fn partitioned_toposort(&self, partition: ScopePartition) -> Vec<Id> {
+        self.partitioned_toposort_keys(partition)
+            .into_iter()
+            .map(|key| key.project_id().clone())
+            .collect()
+    }
+
+    /// Return all canonical project keys in dependency-first topological order.
+    pub fn partitioned_toposort_keys(&self, partition: ScopePartition) -> Vec<ProjectKey> {
         let mut indices = toposort(self.partitioned_graph(partition), None)
             .expect("Partitioned graphs are always acyclic!");
 
@@ -277,9 +499,9 @@ impl ProjectGraph {
         project: &Project,
         partition: ScopePartition,
         direction: Direction,
-    ) -> Vec<Id> {
+    ) -> Vec<ProjectKey> {
         self.partitioned_graph(partition)
-            .neighbors_directed(self.nodes[&project.id].index, direction)
+            .neighbors_directed(self.nodes[&project.key()].index, direction)
             .map(|index| self.indexes[&index].clone())
             .collect()
     }
@@ -289,9 +511,9 @@ impl ProjectGraph {
         project: &Project,
         partition: ScopePartition,
         direction: Direction,
-    ) -> Vec<Id> {
+    ) -> Vec<ProjectKey> {
         let graph = self.partitioned_graph(partition);
-        let start = self.nodes[&project.id].index;
+        let start = self.nodes[&project.key()].index;
         let mut visited = FxHashSet::from_iter([start]);
         let mut queue = VecDeque::from([start]);
         let mut results = vec![];
@@ -362,9 +584,15 @@ impl ProjectGraph {
         Ok(())
     }
 
-    /// Focus the graph for a specific project by ID.
+    /// Focus the graph for a specific primary-source project by ID.
     pub fn focus_for(&self, id_or_alias: &Id, with_dependents: bool) -> miette::Result<Self> {
         let project = self.get(id_or_alias)?;
+        self.focus_for_key(&project.key(), with_dependents)
+    }
+
+    /// Focus the graph for a project by its canonical key.
+    pub fn focus_for_key(&self, key: &ProjectKey, with_dependents: bool) -> miette::Result<Self> {
+        let project = self.get_by_key(key)?;
         let focused_graph = self.to_focused_graph(&project, with_dependents);
         let (nodes, edges) = focused_graph.into_nodes_edges();
 
@@ -377,12 +605,12 @@ impl ProjectGraph {
         for (i, node) in nodes.into_iter().enumerate() {
             let new_index = NodeIndex::from(i as u32);
             let old_index = node.weight;
-            let id = &self.indexes[&old_index];
+            let key = &self.indexes[&old_index];
 
-            indexes.insert(new_index, id.to_owned());
+            indexes.insert(new_index, key.to_owned());
 
             projects.insert(
-                id.to_owned(),
+                key.to_owned(),
                 ProjectNode {
                     index: new_index,
                     project: self.get_node_by_index(&old_index).to_owned(),
@@ -399,9 +627,9 @@ impl ProjectGraph {
         let aliases = self
             .aliases
             .iter()
-            .filter_map(|(alias, id)| {
-                if projects.contains_key(id) {
-                    Some((alias.to_owned(), id.to_owned()))
+            .filter_map(|(alias, key)| {
+                if projects.contains_key(key) {
+                    Some((alias.to_owned(), key.to_owned()))
                 } else {
                     None
                 }
@@ -411,8 +639,9 @@ impl ProjectGraph {
         let mut focused = Self {
             aliases,
             context: self.context.clone(),
+            contexts: self.contexts.clone(),
             indexes,
-            default_id: self.default_id.clone(),
+            default_key: self.default_key.clone(),
             fs_cache: Arc::clone(&self.fs_cache),
             nodes: projects,
             projects: Arc::clone(&self.projects),
@@ -433,18 +662,21 @@ impl ProjectGraph {
             .unwrap_or_else(|| index.index().to_string())
     }
 
-    fn internal_get(&self, id_or_alias: &str) -> miette::Result<Arc<Project>> {
-        let id = self.resolve_id(id_or_alias);
-
-        let project = match self.projects.entry_sync(id) {
+    fn internal_get(&self, key: &ProjectKey) -> miette::Result<Arc<Project>> {
+        let project = match self.projects.entry_sync(key.clone()) {
             Entry::Occupied(entry) => Arc::clone(entry.get()),
             Entry::Vacant(entry) => {
+                let context = self
+                    .contexts
+                    .get(entry.key().source_id())
+                    .unwrap_or(&self.context);
                 let expander = ProjectExpander::new(ProjectExpanderContext {
-                    aliases: self.aliases(),
-                    workspace_root: &self.context.workspace_root,
+                    aliases: self.aliases_for_source(entry.key().source_id()),
+                    source_id: entry.key().source_id(),
+                    workspace_root: &context.workspace_root,
                 });
 
-                let project = Arc::new(expander.expand(self.get_unexpanded(entry.key())?)?);
+                let project = Arc::new(expander.expand(self.get_unexpanded_by_key(entry.key())?)?);
 
                 entry.insert_entry(Arc::clone(&project));
 
@@ -455,49 +687,61 @@ impl ProjectGraph {
         Ok(project)
     }
 
-    fn internal_search(&self, search: &Path) -> miette::Result<Arc<String>> {
-        let cache_key = search.to_path_buf();
+    fn internal_search(&self, search: &SourcePathBuf) -> miette::Result<Arc<ProjectKey>> {
+        let source_id = self.canonical_source_id(&search.source);
+        let search_path = if search.path.as_str().is_empty() {
+            "."
+        } else {
+            search.path.as_str()
+        };
 
-        let cache = match self.fs_cache.entry_sync(cache_key) {
+        let cache = match self
+            .fs_cache
+            .entry_sync(SourcePathBuf::new(source_id.clone(), search.path.clone()))
+        {
             Entry::Occupied(entry) => Arc::clone(entry.get()),
             Entry::Vacant(entry) => {
                 // Find the deepest matching path in case sub-projects are being used
                 let mut remaining_length = 1000; // Start with a really fake number
-                let mut possible_id = String::new();
+                let mut possible_key = None;
 
-                for (id, node) in &self.nodes {
-                    if !search.starts_with(node.project.source.as_str()) {
+                for (key, node) in &self.nodes {
+                    if key.source_id() != source_id
+                        || !Path::new(search_path).starts_with(node.project.source.as_str())
+                    {
                         continue;
                     }
 
-                    if let Ok(diff) = search.relative_to(node.project.source.as_str()) {
+                    if let Ok(diff) =
+                        Path::new(search_path).relative_to(node.project.source.as_str())
+                    {
                         let diff_comps = diff.components().count();
 
                         // Exact match, abort
                         if diff_comps == 0 {
-                            possible_id = id.as_str().to_owned();
+                            possible_key = Some(key.clone());
                             break;
                         }
 
                         if diff_comps < remaining_length {
                             remaining_length = diff_comps;
-                            possible_id = id.as_str().to_owned();
+                            possible_key = Some(key.clone());
                         }
                     }
                 }
 
-                if possible_id.is_empty() {
+                let Some(possible_key) = possible_key else {
                     return Err(ProjectGraphError::MissingFromPath {
-                        dir: search.to_path_buf(),
+                        dir: PathBuf::from(search_path),
                     }
                     .into());
-                }
+                };
 
-                let id = Arc::new(possible_id);
+                let key = Arc::new(possible_key);
 
-                entry.insert_entry(Arc::clone(&id));
+                entry.insert_entry(Arc::clone(&key));
 
-                id
+                key
             }
         };
 
@@ -505,17 +749,49 @@ impl ProjectGraph {
     }
 
     pub fn resolve_id(&self, id_or_alias: &str) -> Id {
-        Id::raw(if self.nodes.contains_key(id_or_alias) {
-            id_or_alias
-        } else if let Some(id) = self.aliases.get(id_or_alias) {
-            id.as_str()
+        self.resolve_key(self.context.sources.primary_id(), id_or_alias)
+            .map(|key| key.project_id().clone())
+            .unwrap_or_else(|_| Id::raw(id_or_alias))
+    }
+
+    /// Resolve an ID or alias within a source to its canonical key.
+    pub fn resolve_key(
+        &self,
+        source_id: &SourceRootId,
+        id_or_alias: &str,
+    ) -> miette::Result<ProjectKey> {
+        let source_id = self.canonical_source_id(source_id);
+        let candidate = ProjectKey::new(source_id.clone(), Id::raw(id_or_alias))?;
+
+        if self.nodes.contains_key(&candidate) {
+            Ok(candidate)
+        } else if let Some(key) = self
+            .aliases
+            .get(&(source_id.clone(), id_or_alias.to_owned()))
+        {
+            Ok(key.clone())
         } else {
-            id_or_alias
-        })
+            Ok(candidate)
+        }
+    }
+
+    fn canonical_source_id<'a>(&'a self, source_id: &'a SourceRootId) -> &'a SourceRootId {
+        if source_id == &SourceRootId::primary() {
+            self.context.sources.primary_id()
+        } else {
+            source_id
+        }
+    }
+
+    fn normalize_key(&self, key: &ProjectKey) -> miette::Result<ProjectKey> {
+        ProjectKey::new(
+            self.canonical_source_id(key.source_id()).clone(),
+            key.project_id().clone(),
+        )
     }
 }
 
-impl GraphData<Project, DependencyScope, Id> for ProjectGraph {
+impl GraphData<Project, DependencyScope, ProjectKey> for ProjectGraph {
     fn get_graph(&self) -> &DiGraph<NodeIndex, DependencyScope> {
         &self.graph
     }
@@ -531,26 +807,94 @@ impl GraphData<Project, DependencyScope, Id> for ProjectGraph {
         &self.nodes[&self.indexes[index]].project
     }
 
-    fn get_node_key(&self, node: &Project) -> Id {
-        node.id.clone()
+    fn get_node_key(&self, node: &Project) -> ProjectKey {
+        node.key()
     }
 }
 
-impl GraphConnections<Project, DependencyScope, Id> for ProjectGraph {
+impl GraphConnections<Project, DependencyScope, ProjectKey> for ProjectGraph {
     fn get_node_index(&self, node: &Project) -> NodeIndex {
-        self.nodes[&node.id].index
+        self.nodes[&node.key()].index
     }
 }
 
-impl GraphConversions<Project, DependencyScope, Id> for ProjectGraph {}
+impl GraphConversions<Project, DependencyScope, ProjectKey> for ProjectGraph {
+    fn to_labeled_graph(&self) -> DiGraph<String, String> {
+        let mut id_counts = FxHashMap::default();
 
-impl GraphToDot<Project, DependencyScope, Id> for ProjectGraph {}
+        for node in self.nodes.values() {
+            *id_counts.entry(&node.project.id).or_insert(0) += 1;
+        }
 
-impl GraphToJson<Project, DependencyScope, Id> for ProjectGraph {}
+        self.graph.map(
+            |_, index| {
+                let project = self.get_node_by_index(index);
+
+                if id_counts[&project.id] > 1 {
+                    project.key().to_string()
+                } else {
+                    project.id.to_string()
+                }
+            },
+            |_, edge| edge.to_string(),
+        )
+    }
+}
+
+impl GraphToDot<Project, DependencyScope, ProjectKey> for ProjectGraph {}
+
+impl GraphToJson<Project, DependencyScope, ProjectKey> for ProjectGraph {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moon_common::SourceRegistry;
+    use moon_config::ProjectDependencyConfig;
+    use moon_graph_utils::GraphConnections;
+
+    fn project(source_id: SourceRootId, id: &str) -> Project {
+        Project {
+            id: Id::raw(id),
+            source_id,
+            ..Project::default()
+        }
+    }
+
+    fn local_graph(
+        source_id: SourceRootId,
+        root: &str,
+        projects: Vec<Project>,
+        edges: &[(usize, usize)],
+    ) -> ProjectGraph {
+        let context = GraphExpanderContext {
+            sources: Arc::new(SourceRegistry::new(source_id, PathBuf::from(root))),
+            working_dir: PathBuf::from(root),
+            workspace_root: PathBuf::from(root),
+            ..Default::default()
+        };
+        let mut project_graph = ProjectGraph::new(context);
+        let mut graph = DiGraph::new();
+
+        for project in projects {
+            let index = graph.add_node(NodeIndex::new(graph.node_count()));
+            let key = project.key();
+            project_graph.indexes.insert(index, key.clone());
+            project_graph
+                .nodes
+                .insert(key, ProjectNode { index, project });
+        }
+
+        for (source, target) in edges {
+            graph.add_edge(
+                NodeIndex::new(*source),
+                NodeIndex::new(*target),
+                DependencyScope::Production,
+            );
+        }
+
+        project_graph.set_graph(graph).unwrap();
+        project_graph
+    }
 
     fn loop_graph(
         scope_ab: DependencyScope,
@@ -590,6 +934,159 @@ mod tests {
     }
 
     #[test]
+    fn stores_duplicate_local_ids_without_key_collisions() {
+        let primary = SourceRootId::primary();
+        let secondary = SourceRootId::new("secondary").unwrap();
+        let mut graph = ProjectGraph::default();
+
+        for (index, project) in [
+            project(primary.clone(), "app"),
+            project(secondary.clone(), "app"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let index = NodeIndex::new(index);
+            graph
+                .nodes
+                .insert(project.key(), ProjectNode { index, project });
+        }
+
+        assert_eq!(graph.nodes.len(), 2);
+        assert_eq!(graph.get_unexpanded("app").unwrap().source_id, primary);
+        assert_eq!(
+            graph
+                .get_unexpanded_by_key(&ProjectKey::new(secondary.clone(), Id::raw("app")).unwrap())
+                .unwrap()
+                .source_id,
+            secondary
+        );
+    }
+
+    #[test]
+    fn composes_source_local_graphs_deterministically() {
+        let primary_id = SourceRootId::new("primary").unwrap();
+        let child_id = SourceRootId::new("child").unwrap();
+        let primary_root = "/workspace/primary";
+        let child_root = "/workspace/child";
+        let mut sources = SourceRegistry::new(primary_id.clone(), primary_root.into());
+        sources
+            .register(child_id.clone(), child_root.into())
+            .unwrap();
+
+        let mut primary_app = project(primary_id.clone(), "app");
+        primary_app.source = "packages/app".into();
+        primary_app.dependencies.push(ProjectDependencyConfig {
+            id: Id::raw("shared"),
+            ..Default::default()
+        });
+        let mut primary_dep = project(primary_id.clone(), "primary-dep");
+        primary_dep.source = "packages/dep".into();
+        let mut primary = local_graph(
+            primary_id.clone(),
+            primary_root,
+            vec![primary_app, primary_dep],
+            &[(0, 1)],
+        );
+        primary.aliases.insert(
+            (primary_id.clone(), "shared".into()),
+            ProjectKey::new(primary_id.clone(), Id::raw("primary-dep")).unwrap(),
+        );
+        primary.default_key = Some(ProjectKey::new(primary_id.clone(), Id::raw("app")).unwrap());
+
+        let mut child_app = project(child_id.clone(), "app");
+        child_app.source = "packages/app".into();
+        child_app.dependencies.push(ProjectDependencyConfig {
+            id: Id::raw("shared"),
+            ..Default::default()
+        });
+        let mut child_dep = project(child_id.clone(), "child-dep");
+        child_dep.source = "packages/dep".into();
+        let mut child = local_graph(
+            child_id.clone(),
+            child_root,
+            vec![child_app, child_dep],
+            &[(0, 1)],
+        );
+        child.aliases.insert(
+            (child_id.clone(), "shared".into()),
+            ProjectKey::new(child_id.clone(), Id::raw("child-dep")).unwrap(),
+        );
+        child.default_key = Some(ProjectKey::new(child_id.clone(), Id::raw("app")).unwrap());
+
+        // Reverse input order to verify source-ID ordering is internal to composition.
+        let aggregate = ProjectGraph::compose(
+            Arc::new(sources),
+            [Arc::new(primary), Arc::new(child)].into_iter().rev(),
+        )
+        .unwrap();
+        let child_app_key = ProjectKey::new(child_id.clone(), Id::raw("app")).unwrap();
+        let primary_app = aggregate.get("app").unwrap();
+        let child_app = aggregate.get_by_key(&child_app_key).unwrap();
+
+        assert_eq!(aggregate.nodes.len(), 4);
+        assert_eq!(primary_app.source_id, primary_id);
+        assert_eq!(child_app.source_id, child_id);
+        assert_eq!(
+            aggregate.dependencies_of(&child_app),
+            [ProjectKey::new(child_id.clone(), Id::raw("child-dep")).unwrap()]
+        );
+        assert_eq!(child_app.dependencies[0].id, Id::raw("child-dep"));
+        assert_eq!(aggregate.get_default().unwrap().id, Id::raw("app"));
+        assert_eq!(
+            aggregate.contexts[&child_id].workspace_root,
+            Path::new(child_root)
+        );
+        assert_eq!(
+            aggregate
+                .get_from_path(Some(Path::new("/workspace/primary/packages/app")))
+                .unwrap()
+                .source_id,
+            primary_id
+        );
+        assert_eq!(
+            aggregate
+                .get_from_path(Some(Path::new("/workspace/child/packages/app")))
+                .unwrap()
+                .source_id,
+            child_id
+        );
+
+        let dot = aggregate.to_dot();
+        assert!(dot.contains("child::app"));
+        assert!(dot.contains("primary::app"));
+        assert!(dot.contains("child-dep"));
+        assert!(!dot.contains("child::child-dep"));
+    }
+
+    #[test]
+    fn rejects_cross_source_edges_during_composition() {
+        let primary_id = SourceRootId::new("primary").unwrap();
+        let child_id = SourceRootId::new("child").unwrap();
+        let mut sources = SourceRegistry::new(primary_id.clone(), "/workspace/primary".into());
+        sources
+            .register(child_id.clone(), "/workspace/child".into())
+            .unwrap();
+        let malformed = local_graph(
+            primary_id.clone(),
+            "/workspace/primary",
+            vec![project(primary_id, "app"), project(child_id, "app")],
+            &[(0, 1)],
+        );
+
+        let error = ProjectGraph::compose(Arc::new(sources), [Arc::new(malformed)]).unwrap_err();
+
+        assert!(
+            error
+                .downcast_ref::<ProjectGraphError>()
+                .is_some_and(|error| matches!(
+                    error,
+                    ProjectGraphError::UnsupportedCrossSourceEdge { .. }
+                ))
+        );
+    }
+
+    #[test]
     fn toposorts_partitions_in_dependency_first_order() {
         let mut project_graph = ProjectGraph::default();
 
@@ -600,12 +1097,14 @@ mod tests {
                 DependencyScope::Development,
             ))
             .unwrap();
-        project_graph
-            .indexes
-            .insert(NodeIndex::new(0), Id::raw("a"));
-        project_graph
-            .indexes
-            .insert(NodeIndex::new(1), Id::raw("b"));
+        project_graph.indexes.insert(
+            NodeIndex::new(0),
+            ProjectKey::primary(Id::raw("a")).unwrap(),
+        );
+        project_graph.indexes.insert(
+            NodeIndex::new(1),
+            ProjectKey::primary(Id::raw("b")).unwrap(),
+        );
 
         // The union cycles, but each partition can still be sorted
         assert_eq!(

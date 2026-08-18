@@ -242,6 +242,7 @@ impl WorkspaceMocker {
                 enabled_toolchains: &enabled_toolchains,
                 monorepo: self.monorepo,
                 root_project_id: None,
+                source_id: self.sources.primary_id(),
                 toolchains_config: &self.toolchains_config,
                 toolchain_registry: Arc::new(self.mock_toolchain_registry()),
                 workspace_root: &self.workspace_root,

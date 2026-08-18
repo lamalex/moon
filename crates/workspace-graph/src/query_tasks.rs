@@ -1,8 +1,9 @@
-use crate::WorkspaceGraph;
-use moon_common::color;
+use crate::{QueryScope, WorkspaceGraph};
+use moon_common::{Id, SourceRootId, color};
 use moon_project_graph::Project;
 use moon_query::*;
-use moon_task_graph::{Target, Task};
+use moon_target::{ProjectKey, TaskKey};
+use moon_task_graph::Task;
 use std::{fmt::Debug, sync::Arc};
 use tracing::{debug, instrument};
 
@@ -15,8 +16,26 @@ impl WorkspaceGraph {
     ) -> miette::Result<Vec<Arc<Task>>> {
         let mut tasks = vec![];
 
-        for target in self.internal_query_tasks(query)?.iter() {
-            tasks.push(self.get_task(target)?);
+        for key in self
+            .internal_query_tasks(query, QueryScope::Primary)?
+            .iter()
+        {
+            tasks.push(self.get_task_by_key(key)?);
+        }
+
+        Ok(tasks)
+    }
+
+    /// Return expanded tasks matching the query with canonical identities.
+    #[instrument(skip(self))]
+    pub fn query_tasks_with_keys<'input, Q: AsRef<Criteria<'input>> + Debug>(
+        &self,
+        query: Q,
+    ) -> miette::Result<Vec<(TaskKey, Arc<Task>)>> {
+        let mut tasks = vec![];
+
+        for key in self.internal_query_tasks(query, QueryScope::All)?.iter() {
+            tasks.push((key.clone(), self.get_task_by_key(key)?));
         }
 
         Ok(tasks)
@@ -25,63 +44,74 @@ impl WorkspaceGraph {
     fn internal_query_tasks<'input, Q: AsRef<Criteria<'input>>>(
         &self,
         query: Q,
-    ) -> miette::Result<Arc<Vec<Target>>> {
+        scope: QueryScope,
+    ) -> miette::Result<Arc<Vec<TaskKey>>> {
         let query = query.as_ref();
         let query_input = query
             .input
             .as_ref()
             .expect("Querying the task graph requires a query input string.");
-        let cache_key = query_input.to_string();
+        let cache_key = scope.cache_key(query_input);
 
         if let Some(cache) = self
             .task_query_cache
-            .read_sync(&cache_key, |_, v| v.clone())
+            .read_sync(&cache_key, |_, value| value.clone())
         {
             return Ok(cache);
         }
 
-        debug!("Querying tasks with {}", color::shell(query_input));
+        debug!(?scope, "Querying tasks with {}", color::shell(query_input));
 
-        let mut targets = vec![];
+        let mut keys = vec![];
 
         // Don't use `get_all` as it recursively calls `query`,
         // which runs into a deadlock! This should be faster also...
-        for task in self.tasks.get_all_unexpanded()? {
-            if self.does_task_match_criteria(task, query)? {
-                targets.push(task.target.clone());
+        for (source_id, graph) in &self.task_graphs {
+            if matches!(scope, QueryScope::Primary) && source_id != self.sources.primary_id() {
+                continue;
+            }
+
+            for task in graph.get_all_unexpanded()? {
+                if (matches!(scope, QueryScope::Primary) || !task.is_internal())
+                    && self.does_task_match_criteria(task, source_id, query)?
+                {
+                    keys.push(Self::task_key(source_id, task)?);
+                }
             }
         }
 
-        // Sort so that the order is deterministic
-        targets.sort();
+        keys.sort();
 
-        debug!(
-            task_targets = ?targets
-                .iter()
-                .map(|target| target.as_str())
-                .collect::<Vec<_>>(),
-            "Found {} matches",
-            targets.len(),
-        );
-
-        let targets = Arc::new(targets);
+        let keys = Arc::new(keys);
         let _ = self
             .task_query_cache
-            .insert_sync(cache_key, Arc::clone(&targets));
+            .insert_sync(cache_key, Arc::clone(&keys));
 
-        Ok(targets)
+        Ok(keys)
     }
 
     // Use the unexpanded project, as expanding may recursively call
     // `query`, which runs into a deadlock!
-    fn get_task_parent_project(&self, task: &Task) -> miette::Result<Option<&Project>> {
+    fn get_task_parent_project(
+        &self,
+        task: &Task,
+        source_id: &SourceRootId,
+    ) -> miette::Result<Option<&Project>> {
         Ok(match task.target.get_project_id() {
-            Ok(project_id) => Some(self.projects.get_unexpanded(project_id)?),
+            Ok(project_id) => Some(self.projects.get_unexpanded_by_key(&ProjectKey::new(
+                source_id.clone(),
+                Id::raw(project_id),
+            )?)?),
             Err(_) => None,
         })
     }
 
-    fn does_task_match_criteria(&self, task: &Task, query: &Criteria) -> miette::Result<bool> {
+    fn does_task_match_criteria(
+        &self,
+        task: &Task,
+        source_id: &SourceRootId,
+        query: &Criteria,
+    ) -> miette::Result<bool> {
         let match_all = matches!(query.op, LogicalOperator::And);
         let mut matched_any = false;
 
@@ -93,7 +123,8 @@ impl WorkspaceGraph {
                             if let Ok(project_id) = task.target.get_project_id() {
                                 if condition.matches(ids, project_id)? {
                                     Ok(true)
-                                } else if let Some(project) = self.get_task_parent_project(task)?
+                                } else if let Some(project) =
+                                    self.get_task_parent_project(task, source_id)?
                                     && !project.aliases.is_empty()
                                 {
                                     condition.matches_list(ids, &project.aliases)
@@ -115,7 +146,7 @@ impl WorkspaceGraph {
                     result?
                 }
                 Condition::Criteria { criteria } => {
-                    self.does_task_match_criteria(task, criteria)?
+                    self.does_task_match_criteria(task, source_id, criteria)?
                 }
             };
 

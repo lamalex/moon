@@ -6,6 +6,7 @@ use moon_config::{
 use moon_project::{FileGroup, Project, ProjectAlias};
 use moon_project_graph::*;
 use moon_query::build_query;
+use moon_target::ProjectKey;
 use moon_task::{Target, TaskFileInput, TaskFileOutput, TaskGlobInput};
 use moon_test_utils::{
     MoonSandbox, WorkspaceGraph, WorkspaceMockOptions, WorkspaceMocker, create_moon_sandbox,
@@ -25,8 +26,26 @@ pub fn append_file<P: AsRef<Path>>(path: P, data: &str) {
     writeln!(file, "\n\n{data}").unwrap();
 }
 
-fn map_ids(ids: Vec<Id>) -> Vec<String> {
-    ids.into_iter().map(|id| id.to_string()).collect()
+trait LocalProjectId {
+    fn local_id(&self) -> &Id;
+}
+
+impl LocalProjectId for Id {
+    fn local_id(&self) -> &Id {
+        self
+    }
+}
+
+impl LocalProjectId for ProjectKey {
+    fn local_id(&self) -> &Id {
+        self.project_id()
+    }
+}
+
+fn map_ids<T: LocalProjectId>(ids: Vec<T>) -> Vec<String> {
+    ids.into_iter()
+        .map(|id| id.local_id().to_string())
+        .collect()
 }
 
 fn map_ids_from_target(targets: Vec<Target>) -> Vec<String> {
@@ -119,6 +138,33 @@ mod project_graph {
                     .unwrap(),
                 sandbox.path().join("secondary")
             );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolves_bare_and_primary_keys_in_the_configured_primary_source() {
+        for async_graph in [false, true] {
+            let sandbox = create_moon_sandbox("dependencies");
+            let mut mocker = create_workspace_mocker(sandbox.path());
+            let primary = SourceRootId::new("acme/platform").unwrap();
+
+            mocker.sources = Arc::new(SourceRegistry::new(
+                primary.clone(),
+                sandbox.path().to_path_buf(),
+            ));
+            mocker.workspace_config.experiments.async_graph_building = async_graph;
+
+            let graph = mocker.mock_workspace_graph().await;
+            let project = graph.get_projects().unwrap().into_iter().next().unwrap();
+            let bare = graph.get_project(&project.id).unwrap();
+            let compatibility_key = ProjectKey::primary(project.id.clone()).unwrap();
+
+            assert_eq!(bare.source_id, primary);
+            assert_eq!(
+                graph.projects.get_by_key(&compatibility_key).unwrap().key(),
+                project.key()
+            );
+            assert_eq!(graph.projects.resolve_id(&project.id), project.id);
         }
     }
 
@@ -395,8 +441,8 @@ mod project_graph {
     mod cache {
         use super::*;
 
-        const CACHE_PATH: &str = ".moon/cache/states/workspaceGraph.json";
-        const STATE_PATH: &str = ".moon/cache/states/workspaceGraphStateV1.json";
+        const CACHE_PATH: &str = ".moon/cache/states/workspaceGraphV2.json";
+        const STATE_PATH: &str = ".moon/cache/states/workspaceGraphStateV2.json";
 
         // Written by the `tc-tier1` test plugin when `extend_project_graph`
         // is called, allowing us to detect if/when it was invoked
@@ -538,6 +584,21 @@ mod project_graph {
                         &cached_graph.sources,
                         &cached_graph.tasks.context.sources,
                     ));
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn rebuilds_an_invalid_cache() {
+                    let (sandbox, graph) = build_cached_graph($async_graph, |sandbox| {
+                        sandbox.enable_git();
+                    })
+                    .await;
+                    sandbox.create_file(CACHE_PATH, "{invalid");
+                    let rebuilt_graph = do_generate(sandbox.path(), $async_graph).await;
+
+                    assert_eq!(
+                        graph.projects.get_node_keys(),
+                        rebuilt_graph.projects.get_node_keys()
+                    );
                 }
 
                 #[tokio::test(flavor = "multi_thread")]

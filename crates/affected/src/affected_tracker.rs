@@ -343,9 +343,11 @@ impl AffectedTracker {
             }
         }
 
-        for dep_id in self.workspace_graph.projects.dependents_of(project) {
+        for dependent_key in self.workspace_graph.projects.dependents_of(project) {
+            // Affected state remains primary/execution scoped until task identity migrates.
+            let dependent_id = dependent_key.project_id().clone();
             self.projects
-                .entry(dep_id.clone())
+                .entry(dependent_id)
                 .or_default()
                 .insert(AffectedBy::UpstreamProject(project.id.clone()));
 
@@ -353,7 +355,7 @@ impl AffectedTracker {
                 continue;
             }
 
-            let dep_project = self.workspace_graph.get_project(&dep_id)?;
+            let dep_project = self.workspace_graph.projects.get_by_key(&dependent_key)?;
 
             self.track_project_dependents(&dep_project, depth + 1, cycle)?;
         }

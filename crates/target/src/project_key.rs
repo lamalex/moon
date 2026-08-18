@@ -1,4 +1,4 @@
-use moon_common::{Id, SourceRootId};
+use moon_common::{Id, SourceRegistry, SourceRootId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::{fmt, str::FromStr};
 
@@ -17,6 +17,10 @@ impl ProjectKey {
 
     pub fn primary(project: Id) -> miette::Result<Self> {
         Self::new(SourceRootId::primary(), project)
+    }
+
+    pub fn for_primary(sources: &SourceRegistry, project: Id) -> miette::Result<Self> {
+        Self::new(sources.primary_id().clone(), project)
     }
 
     pub fn project_id(&self) -> &Id {

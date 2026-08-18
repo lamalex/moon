@@ -1,7 +1,9 @@
-use crate::WorkspaceGraph;
+use crate::{QueryScope, WorkspaceGraph};
 use moon_common::{Id, IdExt, color};
-use moon_project_graph::Project;
+use moon_project_graph::{GraphConnections, Project};
 use moon_query::*;
+use moon_target::ProjectKey;
+use moon_task_graph::TaskGraph;
 use std::{fmt::Debug, sync::Arc};
 use tracing::{debug, instrument};
 
@@ -14,8 +16,26 @@ impl WorkspaceGraph {
     ) -> miette::Result<Vec<Arc<Project>>> {
         let mut projects = vec![];
 
-        for id in self.internal_query_projects(query)?.iter() {
-            projects.push(self.get_project(id)?);
+        for key in self
+            .internal_query_projects(query, QueryScope::Primary)?
+            .iter()
+        {
+            projects.push(self.get_project_by_key(key)?);
+        }
+
+        Ok(projects)
+    }
+
+    /// Return expanded projects matching the query with canonical identities.
+    #[instrument(skip(self))]
+    pub fn query_projects_with_keys<'input, Q: AsRef<Criteria<'input>> + Debug>(
+        &self,
+        query: Q,
+    ) -> miette::Result<Vec<(ProjectKey, Arc<Project>)>> {
+        let mut projects = vec![];
+
+        for key in self.internal_query_projects(query, QueryScope::All)?.iter() {
+            projects.push((key.clone(), self.get_project_by_key(key)?));
         }
 
         Ok(projects)
@@ -24,56 +44,73 @@ impl WorkspaceGraph {
     fn internal_query_projects<'input, Q: AsRef<Criteria<'input>>>(
         &self,
         query: Q,
-    ) -> miette::Result<Arc<Vec<Id>>> {
+        scope: QueryScope,
+    ) -> miette::Result<Arc<Vec<ProjectKey>>> {
         let query = query.as_ref();
         let query_input = query
             .input
             .as_ref()
             .expect("Querying the project graph requires a query input string.");
-        let cache_key = query_input.to_string();
+        let cache_key = scope.cache_key(query_input);
 
         if let Some(cache) = self
             .project_query_cache
-            .read_sync(&cache_key, |_, v| v.clone())
+            .read_sync(&cache_key, |_, value| value.clone())
         {
             return Ok(cache);
         }
 
-        debug!("Querying projects with {}", color::shell(query_input));
+        debug!(
+            ?scope,
+            "Querying projects with {}",
+            color::shell(query_input)
+        );
 
-        let mut project_ids = vec![];
+        let mut project_keys = self.projects.get_node_keys();
+        project_keys.sort();
+        let mut keys = vec![];
 
-        // Don't use `get_all` as it recursively calls `query`,
-        // which runs into a deadlock! This should be faster also...
-        for project in self.projects.get_all_unexpanded() {
-            if self.does_project_match_criteria(project, query)? {
-                project_ids.push(project.id.clone());
+        for key in project_keys {
+            if matches!(scope, QueryScope::Primary) && key.source_id() != self.sources.primary_id()
+            {
+                continue;
+            }
+
+            let project = self.projects.get_unexpanded_by_key(&key)?;
+
+            if self.does_project_match_criteria(
+                project,
+                self.task_graph_for_source(key.source_id())?,
+                query,
+            )? {
+                keys.push(key);
             }
         }
 
-        // Sort so that the order is deterministic
-        project_ids.sort();
-
-        debug!(
-            project_ids = ?project_ids
-                .iter()
-                .map(|id| id.as_str())
-                .collect::<Vec<_>>(),
-            "Found {} matches",
-            project_ids.len(),
-        );
-
-        let ids = Arc::new(project_ids);
+        let keys = Arc::new(keys);
         let _ = self
             .project_query_cache
-            .insert_sync(cache_key, Arc::clone(&ids));
+            .insert_sync(cache_key, Arc::clone(&keys));
 
-        Ok(ids)
+        Ok(keys)
+    }
+
+    fn task_graph_for_source(
+        &self,
+        source_id: &moon_common::SourceRootId,
+    ) -> miette::Result<&TaskGraph> {
+        let source_id = self.canonical_source_id(source_id);
+
+        self.task_graphs
+            .get(&source_id)
+            .map(Arc::as_ref)
+            .ok_or_else(|| miette::miette!("No task graph has been loaded for source {source_id}."))
     }
 
     fn does_project_match_criteria(
         &self,
         project: &Project,
+        task_graph: &TaskGraph,
         query: &Criteria,
     ) -> miette::Result<bool> {
         let match_all = matches!(query.op, LogicalOperator::And);
@@ -115,15 +152,13 @@ impl WorkspaceGraph {
                                 .and_then(|task_id| condition.matches(ids, task_id))
                                 .unwrap_or_default()
                         })),
-                        Field::TaskTag(tags) => Ok(self
-                            .tasks
+                        Field::TaskTag(tags) => Ok(task_graph
                             .get_many(&project.task_targets)?
                             .iter()
                             .any(|task| {
                                 condition.matches_list(tags, &task.tags).unwrap_or_default()
                             })),
-                        Field::TaskToolchain(ids) => Ok(self
-                            .tasks
+                        Field::TaskToolchain(ids) => Ok(task_graph
                             .get_many(&project.task_targets)?
                             .iter()
                             .any(|task| {
@@ -138,8 +173,7 @@ impl WorkspaceGraph {
 
                                 condition.matches_list(ids, &toolchains).unwrap_or_default()
                             })),
-                        Field::TaskType(types) => Ok(self
-                            .tasks
+                        Field::TaskType(types) => Ok(task_graph
                             .get_many(&project.task_targets)?
                             .iter()
                             .any(|task| {
@@ -152,7 +186,7 @@ impl WorkspaceGraph {
                     result?
                 }
                 Condition::Criteria { criteria } => {
-                    self.does_project_match_criteria(project, criteria)?
+                    self.does_project_match_criteria(project, task_graph, criteria)?
                 }
             };
 

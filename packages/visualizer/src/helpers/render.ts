@@ -3,7 +3,7 @@ import cytoscape from 'cytoscape';
 import dagre from 'cytoscape-dagre';
 import klay from 'cytoscape-klay';
 
-import type { GraphInfo } from './types';
+import type { GraphInfo, GraphNodeV2 } from './types';
 
 cytoscape.use(dagre);
 cytoscape.use(klay);
@@ -82,12 +82,23 @@ function getShortDepLabel(label: string) {
 function extractNodes(data: GraphInfo) {
 	// v2
 	if ('graph' in data) {
-		return data.graph.nodes.map((nodeOrIndex, arrayIndex) => {
-			let [node, index] =
+		const nodes = data.graph.nodes.map((nodeOrIndex, arrayIndex) => {
+			const [node, index]: [GraphNodeV2, number] =
 				typeof nodeOrIndex === 'number'
 					? [data.data[nodeOrIndex], nodeOrIndex]
 					: [nodeOrIndex, arrayIndex];
 
+			return { index, node };
+		});
+		const projectIdCounts = new Map<string, number>();
+
+		for (const { node } of nodes) {
+			if ('id' in node && !('action' in node) && !('target' in node)) {
+				projectIdCounts.set(node.id, (projectIdCounts.get(node.id) ?? 0) + 1);
+			}
+		}
+
+		return nodes.map(({ index, node }) => {
 			let row = { id: String(index), label: '', type: 'unknown' };
 
 			if ('action' in node) {
@@ -96,7 +107,10 @@ function extractNodes(data: GraphInfo) {
 			} else if ('target' in node) {
 				row.label = node.target;
 			} else if ('id' in node) {
-				row.label = node.id;
+				row.label =
+					(projectIdCounts.get(node.id) ?? 0) > 1 && node.sourceId
+						? `${node.sourceId}::${node.id}`
+						: node.id;
 			}
 
 			return { data: row };

@@ -15,6 +15,7 @@ moon_common = { version = "2.0.8", path = "../common" }
 moon_config = { version = "2.1.2", path = "../config" }
 moon_project = { version = "2.0.8", path = "../project" }
 moon_task = { version = "2.1.2", path = "../task" }
+moon_target = { version = "3.0.1", path = "../target" }
 derive_setters = "0.1.9"
 proto_pdk_api = { workspace = true }
 rustc-hash = { workspace = true }

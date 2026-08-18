@@ -39,7 +39,11 @@ pub struct ProjectGraphArgs {
 
 #[instrument(skip(session))]
 pub async fn project_graph(session: MoonSession, args: ProjectGraphArgs) -> SessionResult {
-    let mut project_graph = session.get_project_graph().await?;
+    let mut project_graph = session
+        .get_aggregate_workspace_graph()
+        .await?
+        .projects
+        .clone();
 
     if let Some(id) = &args.id {
         project_graph = Arc::new(project_graph.focus_for(id, args.dependents)?);
