@@ -4,6 +4,7 @@ use crate::{
 };
 use miette::{Diagnostic, IntoDiagnostic};
 use rustc_hash::FxHashMap;
+use schematic::{Schema, SchemaBuilder, Schematic};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::{fmt, path::Path, path::PathBuf, str::FromStr};
 use thiserror::Error;
@@ -83,6 +84,12 @@ impl FromStr for SourceRootId {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::new(value)
+    }
+}
+
+impl Schematic for SourceRootId {
+    fn build_schema(mut schema: SchemaBuilder) -> Schema {
+        schema.string_default()
     }
 }
 

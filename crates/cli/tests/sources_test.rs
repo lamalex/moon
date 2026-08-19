@@ -29,6 +29,10 @@ projects:
         sandbox.create_file(
             "apps/app/moon.yml",
             r"
+dependsOn:
+  - id: lib
+    sourceRoot: frontend
+
 tasks:
   build:
     command: echo primary
@@ -42,6 +46,7 @@ tasks:
     command: echo child
 ",
         );
+        sandbox.create_file("web/apps/lib/moon.yml", "{}");
         sandbox
     }
 
@@ -113,6 +118,45 @@ tasks:
             .success()
             .stdout(predicate::str::contains("acme/platform::app:build"))
             .stdout(predicate::str::contains("acme/web::app:build"));
+    }
+
+    #[test]
+    fn resolves_cross_source_dependencies_without_enabling_cross_source_execution() {
+        let sandbox = create_sources_sandbox();
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("query").arg("projects").arg("project=app");
+            })
+            .success()
+            .stdout(predicate::str::contains("\"id\": \"lib\""))
+            .stdout(predicate::str::contains("\"sourceRoot\": \"acme/web\""));
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("project-graph").arg("acme/web::lib").arg("--dot");
+            })
+            .success()
+            .stdout(predicate::str::contains("lib"))
+            .stdout(predicate::str::contains("acme/platform::app").not());
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("project-graph")
+                    .arg("acme/platform::app")
+                    .arg("--dot");
+            })
+            .success()
+            .stdout(predicate::str::contains("label=\"app\""))
+            .stdout(predicate::str::contains("lib"))
+            .stdout(predicate::str::contains("->"));
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("run").arg("app:build");
+            })
+            .success()
+            .stdout(predicate::str::contains("primary"));
     }
 
     #[test]

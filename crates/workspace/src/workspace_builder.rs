@@ -45,8 +45,8 @@ use std::sync::Arc;
 use tracing::{debug, instrument};
 
 pub const LOCK_FILE_NAME: &str = "workspaceGraph.lock";
-pub const STATE_GRAPH_FILE_NAME: &str = "workspaceGraphV2.json";
-pub const STATE_CACHE_FILE_NAME: &str = "workspaceGraphStateV2.json";
+pub const STATE_GRAPH_FILE_NAME: &str = "workspaceGraphV3.json";
+pub const STATE_CACHE_FILE_NAME: &str = "workspaceGraphStateV3.json";
 
 pub struct WorkspaceBuilderContext {
     pub cache_engine: Arc<CacheEngine>,

@@ -83,6 +83,7 @@ impl ActionPipeline {
         action_graph: ActionGraph,
         action_context: ActionContext,
     ) -> miette::Result<Vec<Action>> {
+        self.workspace_graph.ensure_execution_local()?;
         self.action_context = Arc::new(action_context);
         self.setup_subscribers().await;
 

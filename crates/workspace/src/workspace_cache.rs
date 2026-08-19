@@ -88,7 +88,7 @@ impl Default for WorkspaceGraphFingerprint<'_> {
     fn default() -> Self {
         WorkspaceGraphFingerprint {
             projects: BTreeMap::default(),
-            schema_version: 2,
+            schema_version: 3,
             async_graph_building: false,
             inputs: BTreeMap::default(),
             env: BTreeMap::default(),
@@ -274,10 +274,25 @@ mod tests {
     fn treats_invalid_cache_state_as_a_miss() {
         let sandbox = create_empty_sandbox();
         let cache_engine = CacheEngine::new(CacheContext::new(sandbox.path())).unwrap();
-        sandbox.create_file(".moon/cache/states/workspaceGraphStateV2.json", "not json");
+        sandbox.create_file(".moon/cache/states/workspaceGraphStateV3.json", "not json");
 
         let state = load_workspace_graph_cache_state(&cache_engine);
 
         assert_eq!(state.data, WorkspaceGraphCacheState::default());
+    }
+
+    #[test]
+    fn ignores_previous_cache_state_versions() {
+        let sandbox = create_empty_sandbox();
+        let cache_engine = CacheEngine::new(CacheContext::new(sandbox.path())).unwrap();
+        sandbox.create_file(
+            ".moon/cache/states/workspaceGraphStateV2.json",
+            r#"{"lastHash":"old"}"#,
+        );
+
+        let state = load_workspace_graph_cache_state(&cache_engine);
+
+        assert_eq!(state.data, WorkspaceGraphCacheState::default());
+        assert!(state.path.ends_with("workspaceGraphStateV3.json"));
     }
 }

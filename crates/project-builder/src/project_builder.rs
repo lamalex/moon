@@ -295,7 +295,10 @@ impl<'app> ProjectBuilder<'app> {
     #[instrument(name = "build_project", skip_all)]
     pub async fn build(mut self) -> miette::Result<Project> {
         // Build dependencies first since they're required for tasks
-        let dependencies = self.build_dependencies()?;
+        let (cross_source_dependencies, dependencies): (Vec<_>, Vec<_>) = self
+            .build_dependencies()?
+            .into_iter()
+            .partition(ProjectDependencyConfig::is_cross_source);
 
         // Then build the tasks
         let tasks = self.build_tasks(&dependencies).await?;
@@ -306,6 +309,7 @@ impl<'app> ProjectBuilder<'app> {
 
         // And finally build the project
         let mut project = Project {
+            cross_source_dependencies,
             dependencies,
             file_groups: self.build_file_groups()?,
             aliases: self.aliases,
@@ -336,7 +340,8 @@ impl<'app> ProjectBuilder<'app> {
 
     #[instrument(skip_all)]
     fn build_dependencies(&self) -> miette::Result<Vec<ProjectDependencyConfig>> {
-        let mut deps = FxHashMap::default();
+        let mut local_deps = FxHashMap::default();
+        let mut cross_source_deps = vec![];
 
         trace!(
             project_id = self.id.as_str(),
@@ -353,20 +358,29 @@ impl<'app> ProjectBuilder<'app> {
                     ProjectDependsOn::Object(config) => config.to_owned(),
                 };
 
-                deps.insert(dep_config.id.clone(), dep_config);
+                if dep_config.is_cross_source() {
+                    // Canonical deduplication happens after source and project aliases resolve.
+                    cross_source_deps.push(dep_config);
+                } else {
+                    // Preserve existing source-local ordering and last-wins behavior.
+                    local_deps.insert(dep_config.id.clone(), dep_config);
+                }
             }
         }
+
+        let mut deps = local_deps.into_values().collect::<Vec<_>>();
+        deps.extend(cross_source_deps);
 
         if !deps.is_empty() {
             trace!(
                 project_id = self.id.as_str(),
-                dep_ids = ?deps.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+                dep_ids = ?deps.iter().map(|dep| dep.id.as_str()).collect::<Vec<_>>(),
                 "Depends on {} projects",
                 deps.len(),
             );
         }
 
-        Ok(deps.into_values().collect::<Vec<_>>())
+        Ok(deps)
     }
 
     #[instrument(skip_all)]

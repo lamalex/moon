@@ -263,6 +263,7 @@ pub fn create_project_dep_from_task_dep(
             DependencyScope::Build
         },
         id: dep_project_id,
+        source_root: None,
         source: DependencySource::Implicit,
         via: Some(format!("task {}", task_dep.target)),
     })

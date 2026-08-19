@@ -2,11 +2,12 @@ use moon_common::path::WorkspaceRelativePathBuf;
 use moon_common::{Id, SourceRegistry, SourceRootId};
 use moon_config::{
     DependencyScope, DependencySource, EnvMap, LanguageType, ProjectDependencyConfig, TaskArgs,
-    TaskConfig,
+    TaskConfig, TaskDependency,
 };
 use moon_file_group::FileGroup;
 use moon_project::Project;
 use moon_project_builder::ProjectBuilder;
+use moon_task::Target;
 use moon_test_utils::WorkspaceMocker;
 use starbase_sandbox::create_sandbox;
 use std::collections::BTreeMap;
@@ -107,6 +108,66 @@ mod project_builder {
                 },
             ]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quarantines_cross_source_dependencies_from_tasks() {
+        let sandbox = create_sandbox("builder");
+        let container = ProjectBuilderContainer::new(sandbox.path());
+
+        let project = container
+            .build_project_with("bar", |builder| {
+                for source_root in ["acme/web", "frontend"] {
+                    builder.extend_with_dependency(ProjectDependencyConfig {
+                        id: Id::raw("foo"),
+                        source_root: Some(SourceRootId::new(source_root).unwrap()),
+                        ..ProjectDependencyConfig::default()
+                    });
+                }
+
+                builder.extend_with_task(
+                    Id::raw("qualified-deps"),
+                    TaskConfig {
+                        deps: Some(vec![TaskDependency::Target(
+                            Target::parse("foo:build").unwrap(),
+                        )]),
+                        ..TaskConfig::default()
+                    },
+                );
+            })
+            .await;
+
+        assert_eq!(project.dependencies.len(), 1);
+        assert_eq!(project.dependencies[0].id, "foo");
+        assert!(!project.dependencies[0].is_cross_source());
+        assert_eq!(project.dependencies[0].source, DependencySource::Implicit);
+        assert_eq!(project.cross_source_dependencies.len(), 2);
+        assert_eq!(
+            project.cross_source_dependencies[0]
+                .source_root
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "acme/web"
+        );
+        assert_eq!(
+            project.cross_source_dependencies[1]
+                .source_root
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "frontend"
+        );
+        assert!(
+            project
+                .cross_source_dependencies
+                .iter()
+                .all(ProjectDependencyConfig::is_cross_source)
+        );
+
+        let task = &project.tasks["qualified-deps"];
+        assert_eq!(task.deps.len(), 1);
+        assert_eq!(task.deps[0].target.to_string(), "foo:build");
     }
 
     // Tasks are tested heavily in the tasks-builder crate

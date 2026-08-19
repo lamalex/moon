@@ -7,6 +7,7 @@ use clap::Args;
 use moon_affected::{AffectedTracker, DownstreamScope, UpstreamScope};
 use starbase_utils::json;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use tracing::instrument;
 
 #[derive(Args, Clone, Debug)]
@@ -101,7 +102,16 @@ pub async fn projects(session: MoonSession, args: QueryProjectsArgs) -> SessionR
 
         options.affected = Some(affected_tracker.build());
 
-        let projects = query_projects(&workspace_graph, &options).await?;
+        let local_projects = query_projects(&workspace_graph, &options).await?;
+        let aggregate_graph = session.get_aggregate_workspace_graph().await?;
+        let projects = local_projects
+            .into_iter()
+            .map(|project| {
+                aggregate_graph
+                    .get_project_with_tasks_by_key(&project.key())
+                    .map(Arc::new)
+            })
+            .collect::<miette::Result<Vec<_>>>()?;
 
         session.console.out.write_line(json::format(
             &QueryProjectsResult { projects, options },

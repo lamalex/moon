@@ -491,10 +491,11 @@ impl MoonSession {
 
         let projects = Arc::new(ProjectGraph::compose(
             Arc::clone(&self.sources),
+            &self.source_aliases,
             project_graphs,
         )?);
 
-        Ok(Arc::new(WorkspaceGraph::new_with_source_task_graphs(
+        Ok(Arc::new(WorkspaceGraph::new_aggregate(
             projects,
             Arc::clone(&primary.tasks),
             Arc::clone(&self.sources),

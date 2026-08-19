@@ -5,9 +5,9 @@
 Manymoons is a design and implementation effort. The external configuration and command syntax
 described by this document are intentionally undecided unless explicitly marked otherwise.
 
-Milestone 1, internal source-root qualification, Milestone 2, direct multi-workspace discovery, and
-Milestone 3, aggregated querying, are complete. Milestone 4, cross-source project dependencies, is
-next.
+Milestone 1, internal source-root qualification, Milestone 2, direct multi-workspace discovery,
+Milestone 3, aggregated querying, and Milestone 4, cross-source project dependencies, are complete.
+Milestone 5, the unified task graph, is next.
 
 ## End Goal
 
@@ -311,8 +311,9 @@ no cross-source dependency or execution edge exists.
 - Make root-project semantics source-relative.
 - Expose the dependencies through graph and query commands before enabling execution.
 
-The external dependency syntax is deliberately deferred until discovery and identity behavior are
-proven.
+Cross-source dependencies use the existing dependency object with `sourceRoot`, which accepts a
+direct workspace alias or canonical source-root ID. Source-local dependencies continue to omit this
+field.
 
 Exit criteria: graph and query commands expose validated cross-source project edges, while run
 commands reject or ignore those edges behind the feature gate.

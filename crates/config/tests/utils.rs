@@ -71,6 +71,7 @@ pub fn load_project_config_in_format(format: &str) {
                 ProjectDependsOn::Object(ProjectDependencyConfig {
                     id: Id::raw("b"),
                     scope: DependencyScope::Build,
+                    source_root: None,
                     source: DependencySource::Implicit,
                     via: None
                 })

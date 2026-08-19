@@ -42,6 +42,41 @@ pub enum ProjectGraphError {
         target_key: String,
     },
 
+    #[diagnostic(code(project_graph::unknown_dependency_source))]
+    #[error(
+        "Project {} declares a dependency on unknown source root {}.",
+        .project_key.style(Style::Id),
+        .source_id.style(Style::Id),
+    )]
+    UnknownDependencySource {
+        project_key: String,
+        source_id: String,
+    },
+
+    #[diagnostic(code(project_graph::redundant_dependency_source))]
+    #[error(
+        "Project {} declares source root {} for a source-local dependency; omit sourceRoot instead.",
+        .project_key.style(Style::Id),
+        .source_id.style(Style::Id),
+    )]
+    RedundantDependencySource {
+        project_key: String,
+        source_id: String,
+    },
+
+    #[diagnostic(code(project_graph::unknown_cross_source_target))]
+    #[error(
+        "Project {} declares a dependency on unknown project or alias {} in source {}.",
+        .project_key.style(Style::Id),
+        .target_id.style(Style::Id),
+        .source_id.style(Style::Id),
+    )]
+    UnknownCrossSourceTarget {
+        project_key: String,
+        source_id: String,
+        target_id: String,
+    },
+
     #[diagnostic(code(project_graph::would_cycle))]
     #[error(
         "Unable to create project graph, adding a relationship from {} to {} would introduce a cycle.",

@@ -2,10 +2,11 @@ use crate::project_graph_error::ProjectGraphError;
 use daggy::Dag;
 use miette::IntoDiagnostic;
 use moon_common::path::{PathExt, WorkspaceRelativePathBuf};
-use moon_common::{Id, SourcePathBuf, SourceRootId};
-use moon_config::DependencyScope;
+use moon_common::{Id, SourceAlias, SourcePathBuf, SourceRootId};
+use moon_config::{DependencyScope, ProjectDependencyConfig};
 use moon_graph_utils::*;
 use moon_project::Project;
+use moon_project_constraints::{enforce_layer_relationships, enforce_tag_relationships};
 use moon_project_expander::{ProjectExpander, ProjectExpanderContext};
 use moon_target::ProjectKey;
 use petgraph::Direction;
@@ -123,6 +124,7 @@ impl ProjectGraph {
     /// Compose finalized source-local project graphs into a read-only aggregate graph.
     pub fn compose(
         sources: Arc<moon_common::SourceRegistry>,
+        source_aliases: &FxHashMap<SourceAlias, SourceRootId>,
         graphs: impl IntoIterator<Item = Arc<ProjectGraph>>,
     ) -> miette::Result<Self> {
         let mut graphs = graphs.into_iter().collect::<Vec<_>>();
@@ -150,6 +152,8 @@ impl ProjectGraph {
 
         let mut graph = DiGraph::new();
         let mut indexes_by_key = FxHashMap::default();
+        let mut local_edges = vec![];
+        let mut cross_dependencies = vec![];
 
         for local in graphs {
             let source_id = local.context.sources.primary_id().clone();
@@ -161,7 +165,12 @@ impl ProjectGraph {
             keys.sort();
 
             for key in keys {
-                let project = local.nodes[&key].project.clone();
+                let mut project = local.nodes[&key].project.clone();
+                cross_dependencies.extend(
+                    std::mem::take(&mut project.cross_source_dependencies)
+                        .into_iter()
+                        .map(|dependency| (key.clone(), dependency)),
+                );
                 let index = graph.add_node(NodeIndex::new(graph.node_count()));
 
                 aggregate.indexes.insert(index, key.clone());
@@ -193,10 +202,134 @@ impl ProjectGraph {
                     .into());
                 }
 
+                local_edges.push((source_key.clone(), target_key.clone(), *edge.weight()));
+            }
+        }
+
+        local_edges.sort();
+
+        for (source_key, target_key, scope) in local_edges {
+            graph.add_edge(
+                indexes_by_key[&source_key],
+                indexes_by_key[&target_key],
+                scope,
+            );
+        }
+
+        let mut resolved_dependencies = vec![];
+
+        for (order, (owner_key, mut dependency)) in cross_dependencies.into_iter().enumerate() {
+            let requested_source = dependency
+                .source_root
+                .clone()
+                .expect("Cross-source dependencies must declare a source root.");
+            let selected_source = if owner_key.source_id() == sources.primary_id() {
+                source_aliases
+                    .iter()
+                    .find_map(|(alias, source_id)| {
+                        (alias.as_str() == requested_source.as_str()).then(|| source_id.clone())
+                    })
+                    .unwrap_or_else(|| requested_source.clone())
+            } else {
+                requested_source.clone()
+            };
+            let selected_source = if selected_source == SourceRootId::primary() {
+                sources.primary_id().clone()
+            } else {
+                selected_source
+            };
+
+            if sources.get(&selected_source).is_err() {
+                return Err(ProjectGraphError::UnknownDependencySource {
+                    project_key: owner_key.to_string(),
+                    source_id: requested_source.to_string(),
+                }
+                .into());
+            }
+
+            if &selected_source == owner_key.source_id() {
+                return Err(ProjectGraphError::RedundantDependencySource {
+                    project_key: owner_key.to_string(),
+                    source_id: selected_source.to_string(),
+                }
+                .into());
+            }
+
+            let target_key = ProjectKey::new(selected_source.clone(), dependency.id.clone())?;
+            let target_key = if aggregate.nodes.contains_key(&target_key) {
+                target_key
+            } else if let Some(alias_key) = aggregate
+                .aliases
+                .get(&(selected_source.clone(), dependency.id.to_string()))
+            {
+                alias_key.clone()
+            } else {
+                return Err(ProjectGraphError::UnknownCrossSourceTarget {
+                    project_key: owner_key.to_string(),
+                    source_id: selected_source.to_string(),
+                    target_id: dependency.id.to_string(),
+                }
+                .into());
+            };
+
+            dependency.source_root = Some(selected_source);
+            dependency.id = target_key.project_id().clone();
+            resolved_dependencies.push((owner_key, target_key, dependency, order));
+        }
+
+        // Source-local dependency construction is last-wins. Apply the same rule
+        // after canonical resolution, then sort so graph output is input-order independent.
+        resolved_dependencies.sort_by(|a, b| (&a.0, &a.1, a.3).cmp(&(&b.0, &b.1, b.3)));
+        let mut deduplicated_dependencies: Vec<(
+            ProjectKey,
+            ProjectKey,
+            ProjectDependencyConfig,
+            usize,
+        )> = vec![];
+
+        for dependency in resolved_dependencies {
+            if let Some(previous) = deduplicated_dependencies.last_mut()
+                && previous.0 == dependency.0
+                && previous.1 == dependency.1
+            {
+                *previous = dependency;
+            } else {
+                deduplicated_dependencies.push(dependency);
+            }
+        }
+
+        deduplicated_dependencies.sort_by(|a, b| (&a.0, a.3).cmp(&(&b.0, b.3)));
+
+        for (owner_key, target_key, dependency, _) in deduplicated_dependencies {
+            if !dependency.is_root_scope() {
+                let owner = &aggregate.nodes[&owner_key].project;
+                let target = &aggregate.nodes[&target_key].project;
+                let constraints = &aggregate.contexts[owner_key.source_id()]
+                    .workspace_config
+                    .constraints;
+
+                if constraints.enforce_layer_relationships {
+                    enforce_layer_relationships(owner, target, &dependency.scope)?;
+                }
+
+                for (source_tag, required_tags) in &constraints.tag_relationships {
+                    enforce_tag_relationships(owner, source_tag, target, required_tags)?;
+                }
+            }
+
+            aggregate
+                .nodes
+                .get_mut(&owner_key)
+                .unwrap()
+                .project
+                .dependencies
+                .push(dependency.clone());
+
+            if !dependency.is_root_scope() {
                 graph.add_edge(
-                    indexes_by_key[source_key],
-                    indexes_by_key[target_key],
-                    *edge.weight(),
+                    indexes_by_key[&owner_key],
+                    indexes_by_key[&target_key],
+                    dependency.scope,
                 );
             }
         }
@@ -849,7 +982,7 @@ impl GraphToJson<Project, DependencyScope, ProjectKey> for ProjectGraph {}
 mod tests {
     use super::*;
     use moon_common::SourceRegistry;
-    use moon_config::ProjectDependencyConfig;
+    use moon_config::{LayerType, ProjectDependencyConfig, StackType};
     use moon_graph_utils::GraphConnections;
 
     fn project(source_id: SourceRootId, id: &str) -> Project {
@@ -857,6 +990,19 @@ mod tests {
             id: Id::raw(id),
             source_id,
             ..Project::default()
+        }
+    }
+
+    fn cross_dependency(
+        source_root: SourceRootId,
+        id: &str,
+        scope: DependencyScope,
+    ) -> ProjectDependencyConfig {
+        ProjectDependencyConfig {
+            id: Id::raw(id),
+            scope,
+            source_root: Some(source_root),
+            ..Default::default()
         }
     }
 
@@ -1017,6 +1163,7 @@ mod tests {
         // Reverse input order to verify source-ID ordering is internal to composition.
         let aggregate = ProjectGraph::compose(
             Arc::new(sources),
+            &FxHashMap::default(),
             [Arc::new(primary), Arc::new(child)].into_iter().rev(),
         )
         .unwrap();
@@ -1074,7 +1221,12 @@ mod tests {
             &[(0, 1)],
         );
 
-        let error = ProjectGraph::compose(Arc::new(sources), [Arc::new(malformed)]).unwrap_err();
+        let error = ProjectGraph::compose(
+            Arc::new(sources),
+            &FxHashMap::default(),
+            [Arc::new(malformed)],
+        )
+        .unwrap_err();
 
         assert!(
             error
@@ -1084,6 +1236,303 @@ mod tests {
                     ProjectGraphError::UnsupportedCrossSourceEdge { .. }
                 ))
         );
+    }
+
+    #[test]
+    fn resolves_cross_source_ids_and_aliases_after_composition() {
+        let primary_id = SourceRootId::new("acme/platform").unwrap();
+        let child_id = SourceRootId::new("acme/web").unwrap();
+        let mut sources = SourceRegistry::new(primary_id.clone(), "/workspace/primary".into());
+        sources
+            .register(child_id.clone(), "/workspace/child".into())
+            .unwrap();
+
+        let mut primary_app = project(primary_id.clone(), "app");
+        primary_app.cross_source_dependencies.push(cross_dependency(
+            SourceRootId::new("frontend").unwrap(),
+            "app",
+            DependencyScope::Production,
+        ));
+        let mut canonical_duplicate =
+            cross_dependency(child_id.clone(), "app", DependencyScope::Production);
+        canonical_duplicate.via = Some("canonical".into());
+        primary_app
+            .cross_source_dependencies
+            .push(canonical_duplicate);
+        primary_app.cross_source_dependencies.push(cross_dependency(
+            child_id.clone(),
+            "shared",
+            DependencyScope::Build,
+        ));
+        let primary = Arc::new(local_graph(
+            primary_id.clone(),
+            "/workspace/primary",
+            vec![primary_app],
+            &[],
+        ));
+
+        let mut child = local_graph(
+            child_id.clone(),
+            "/workspace/child",
+            vec![
+                project(child_id.clone(), "app"),
+                project(child_id.clone(), "lib"),
+            ],
+            &[],
+        );
+        child.aliases.insert(
+            (child_id.clone(), "shared".into()),
+            ProjectKey::new(child_id.clone(), Id::raw("lib")).unwrap(),
+        );
+        let child = Arc::new(child);
+        let aliases =
+            FxHashMap::from_iter([(SourceAlias::new("frontend").unwrap(), child_id.clone())]);
+
+        let aggregate = ProjectGraph::compose(
+            Arc::new(sources),
+            &aliases,
+            [Arc::clone(&child), Arc::clone(&primary)],
+        )
+        .unwrap();
+        let app = aggregate.get("app").unwrap();
+        let dependencies = aggregate.dependencies_of(&app);
+
+        assert_eq!(
+            dependencies,
+            [
+                ProjectKey::new(child_id.clone(), Id::raw("lib")).unwrap(),
+                ProjectKey::new(child_id.clone(), Id::raw("app")).unwrap(),
+            ]
+        );
+        assert!(app.cross_source_dependencies.is_empty());
+        assert_eq!(app.dependencies.len(), 2);
+        assert_eq!(
+            app.dependencies
+                .iter()
+                .map(|dependency| dependency.id.as_str())
+                .collect::<Vec<_>>(),
+            ["app", "lib"]
+        );
+        assert!(app.dependencies.iter().all(|dep| {
+            dep.source_root.as_ref() == Some(&child_id) && matches!(dep.id.as_str(), "app" | "lib")
+        }));
+        assert_eq!(
+            app.dependencies
+                .iter()
+                .find(|dep| dep.id == Id::raw("app"))
+                .unwrap()
+                .via
+                .as_deref(),
+            Some("canonical")
+        );
+
+        let reversed = ProjectGraph::compose(
+            Arc::clone(&aggregate.context.sources),
+            &aliases,
+            [primary, child],
+        )
+        .unwrap();
+        assert_eq!(aggregate.to_dot(), reversed.to_dot());
+    }
+
+    #[test]
+    fn resolves_workspace_compatibility_id_to_the_primary_source() {
+        let primary_id = SourceRootId::new("acme/platform").unwrap();
+        let child_id = SourceRootId::new("acme/web").unwrap();
+        let mut sources = SourceRegistry::new(primary_id.clone(), "/workspace/primary".into());
+        sources
+            .register(child_id.clone(), "/workspace/child".into())
+            .unwrap();
+        let primary = local_graph(
+            primary_id.clone(),
+            "/workspace/primary",
+            vec![project(primary_id.clone(), "lib")],
+            &[],
+        );
+        let mut child_app = project(child_id.clone(), "app");
+        child_app.cross_source_dependencies.push(cross_dependency(
+            SourceRootId::primary(),
+            "lib",
+            DependencyScope::Production,
+        ));
+        let child = local_graph(child_id.clone(), "/workspace/child", vec![child_app], &[]);
+
+        let aggregate = ProjectGraph::compose(
+            Arc::new(sources),
+            &FxHashMap::default(),
+            [Arc::new(primary), Arc::new(child)],
+        )
+        .unwrap();
+        let child_app = aggregate
+            .get_by_key(&ProjectKey::new(child_id, Id::raw("app")).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            aggregate.dependencies_of(&child_app),
+            [ProjectKey::new(primary_id.clone(), Id::raw("lib")).unwrap()]
+        );
+        assert_eq!(
+            child_app.dependencies[0].source_root.as_ref(),
+            Some(&primary_id)
+        );
+    }
+
+    #[test]
+    fn rejects_redundant_same_source_qualified_dependencies() {
+        let source_id = SourceRootId::new("acme/platform").unwrap();
+        let sources = Arc::new(SourceRegistry::new(
+            source_id.clone(),
+            "/workspace/primary".into(),
+        ));
+        let mut app = project(source_id.clone(), "app");
+        app.dependencies
+            .push(ProjectDependencyConfig::new(Id::raw("lib")));
+        app.cross_source_dependencies.push(cross_dependency(
+            source_id.clone(),
+            "lib",
+            DependencyScope::Development,
+        ));
+        let local = local_graph(
+            source_id.clone(),
+            "/workspace/primary",
+            vec![app, project(source_id.clone(), "lib")],
+            &[(0, 1)],
+        );
+
+        let error =
+            ProjectGraph::compose(sources, &FxHashMap::default(), [Arc::new(local)]).unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<ProjectGraphError>(),
+            Some(ProjectGraphError::RedundantDependencySource { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_same_partition_cross_source_cycles() {
+        let primary_id = SourceRootId::new("primary").unwrap();
+        let child_id = SourceRootId::new("child").unwrap();
+        let mut sources = SourceRegistry::new(primary_id.clone(), "/workspace/primary".into());
+        sources
+            .register(child_id.clone(), "/workspace/child".into())
+            .unwrap();
+        let mut primary_app = project(primary_id.clone(), "app");
+        primary_app.cross_source_dependencies.push(cross_dependency(
+            child_id.clone(),
+            "app",
+            DependencyScope::Production,
+        ));
+        let mut child_app = project(child_id.clone(), "app");
+        child_app.cross_source_dependencies.push(cross_dependency(
+            primary_id.clone(),
+            "app",
+            DependencyScope::Peer,
+        ));
+
+        let error = ProjectGraph::compose(
+            Arc::new(sources),
+            &FxHashMap::default(),
+            [
+                Arc::new(local_graph(
+                    primary_id,
+                    "/workspace/primary",
+                    vec![primary_app],
+                    &[],
+                )),
+                Arc::new(local_graph(
+                    child_id,
+                    "/workspace/child",
+                    vec![child_app],
+                    &[],
+                )),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("would introduce a cycle"));
+    }
+
+    #[test]
+    fn allows_cross_partition_cross_source_cycles() {
+        let primary_id = SourceRootId::new("primary").unwrap();
+        let child_id = SourceRootId::new("child").unwrap();
+        let mut sources = SourceRegistry::new(primary_id.clone(), "/workspace/primary".into());
+        sources
+            .register(child_id.clone(), "/workspace/child".into())
+            .unwrap();
+        let mut primary_app = project(primary_id.clone(), "app");
+        primary_app.cross_source_dependencies.push(cross_dependency(
+            child_id.clone(),
+            "app",
+            DependencyScope::Production,
+        ));
+        let mut child_app = project(child_id.clone(), "app");
+        child_app.cross_source_dependencies.push(cross_dependency(
+            primary_id.clone(),
+            "app",
+            DependencyScope::Development,
+        ));
+
+        let aggregate = ProjectGraph::compose(
+            Arc::new(sources),
+            &FxHashMap::default(),
+            [
+                Arc::new(local_graph(
+                    primary_id,
+                    "/workspace/primary",
+                    vec![primary_app],
+                    &[],
+                )),
+                Arc::new(local_graph(
+                    child_id,
+                    "/workspace/child",
+                    vec![child_app],
+                    &[],
+                )),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(aggregate.production_graph().edge_count(), 1);
+        assert_eq!(aggregate.development_graph().edge_count(), 1);
+    }
+
+    #[test]
+    fn enforces_constraints_from_the_declaring_source() {
+        let primary_id = SourceRootId::new("primary").unwrap();
+        let child_id = SourceRootId::new("child").unwrap();
+        let mut sources = SourceRegistry::new(primary_id.clone(), "/workspace/primary".into());
+        sources
+            .register(child_id.clone(), "/workspace/child".into())
+            .unwrap();
+        let mut primary_app = project(primary_id.clone(), "app");
+        primary_app.layer = LayerType::Application;
+        primary_app.config.stack = StackType::Frontend;
+        primary_app.cross_source_dependencies.push(cross_dependency(
+            child_id.clone(),
+            "app",
+            DependencyScope::Production,
+        ));
+        let mut child_app = project(child_id.clone(), "app");
+        child_app.layer = LayerType::Application;
+        child_app.config.stack = StackType::Frontend;
+        let mut primary = local_graph(primary_id, "/workspace/primary", vec![primary_app], &[]);
+        Arc::make_mut(&mut primary.context.workspace_config)
+            .constraints
+            .enforce_layer_relationships = true;
+        let mut child = local_graph(child_id, "/workspace/child", vec![child_app], &[]);
+        Arc::make_mut(&mut child.context.workspace_config)
+            .constraints
+            .enforce_layer_relationships = false;
+
+        let error = ProjectGraph::compose(
+            Arc::new(sources),
+            &FxHashMap::default(),
+            [Arc::new(primary), Arc::new(child)],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Layering violation"));
     }
 
     #[test]

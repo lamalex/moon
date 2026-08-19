@@ -1,10 +1,10 @@
 mod utils;
 
-use moon_common::Id;
+use moon_common::{Id, SourceRootId};
 use moon_config::{
-    DependencyScope, GlobPath, Input, LanguageType, LayerType, MergeStrategy, OwnersPaths,
-    PortablePath, ProjectConfig, ProjectDependencyConfig, ProjectDependsOn, ProjectToolchainEntry,
-    TaskArgs, ToolchainPluginConfig,
+    DependencyScope, DependencySource, GlobPath, Input, LanguageType, LayerType, MergeStrategy,
+    OwnersPaths, PortablePath, ProjectConfig, ProjectDependencyConfig, ProjectDependsOn,
+    ProjectToolchainEntry, TaskArgs, ToolchainPluginConfig,
 };
 use moon_config_loader::ConfigLoader;
 use proto_core::UnresolvedVersionSpec;
@@ -121,6 +121,38 @@ dependsOn:
                         scope: DependencyScope::Production,
                         ..ProjectDependencyConfig::default()
                     })
+                ]
+            );
+        }
+
+        #[test]
+        fn supports_canonical_and_alias_source_roots() {
+            let config = test_load_config(
+                "moon.yml",
+                r"
+dependsOn:
+  - id: 'app'
+    sourceRoot: 'acme/web'
+  - id: 'app'
+    sourceRoot: 'frontend'",
+                |path| load_config_from_root(path, "."),
+            );
+
+            assert_eq!(
+                config.depends_on,
+                vec![
+                    ProjectDependsOn::Object(ProjectDependencyConfig {
+                        id: Id::raw("app"),
+                        source_root: Some(SourceRootId::new("acme/web").unwrap()),
+                        source: DependencySource::Explicit,
+                        ..ProjectDependencyConfig::default()
+                    }),
+                    ProjectDependsOn::Object(ProjectDependencyConfig {
+                        id: Id::raw("app"),
+                        source_root: Some(SourceRootId::new("frontend").unwrap()),
+                        source: DependencySource::Explicit,
+                        ..ProjectDependencyConfig::default()
+                    }),
                 ]
             );
         }

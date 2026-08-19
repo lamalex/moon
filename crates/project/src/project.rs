@@ -43,6 +43,10 @@ cacheable!(
         #[serde(skip_serializing_if = "Vec::is_empty")]
         pub dependencies: Vec<ProjectDependencyConfig>,
 
+        /// Qualified dependencies quarantined from source-local execution graphs.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        pub cross_source_dependencies: Vec<ProjectDependencyConfig>,
+
         /// File groups specific to the project. Inherits all file groups from the global config.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         pub file_groups: BTreeMap<Id, FileGroup>,

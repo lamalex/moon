@@ -3,13 +3,33 @@ use crate::session::{MoonSession, SessionResult};
 use clap::Args;
 use moon_common::Id;
 use moon_project_graph::{GraphToDot, GraphToJson};
+use moon_target::ProjectKey;
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::instrument;
 
+#[derive(Clone, Debug)]
+enum ProjectGraphFocus {
+    Primary(Id),
+    Qualified(ProjectKey),
+}
+
+impl FromStr for ProjectGraphFocus {
+    type Err = miette::Report;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.contains("::") {
+            Ok(Self::Qualified(value.parse()?))
+        } else {
+            Ok(Self::Primary(Id::new(value)?))
+        }
+    }
+}
+
 #[derive(Args, Clone, Debug)]
 pub struct ProjectGraphArgs {
-    #[arg(help = "Project ID to *only* graph")]
-    id: Option<Id>,
+    #[arg(help = "Project ID or qualified source::project to *only* graph")]
+    id: Option<ProjectGraphFocus>,
 
     #[arg(long, help = "Include direct dependents of the focused project")]
     dependents: bool,
@@ -45,8 +65,13 @@ pub async fn project_graph(session: MoonSession, args: ProjectGraphArgs) -> Sess
         .projects
         .clone();
 
-    if let Some(id) = &args.id {
-        project_graph = Arc::new(project_graph.focus_for(id, args.dependents)?);
+    if let Some(focus) = &args.id {
+        project_graph = Arc::new(match focus {
+            ProjectGraphFocus::Primary(id) => project_graph.focus_for(id, args.dependents)?,
+            ProjectGraphFocus::Qualified(key) => {
+                project_graph.focus_for_key(key, args.dependents)?
+            }
+        });
     }
 
     // Force expand all projects
@@ -76,4 +101,21 @@ pub async fn project_graph(session: MoonSession, args: ProjectGraphArgs) -> Sess
     .await?;
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_primary_and_qualified_focus() {
+        assert!(matches!(
+            "app".parse::<ProjectGraphFocus>().unwrap(),
+            ProjectGraphFocus::Primary(id) if id.as_str() == "app"
+        ));
+        assert!(matches!(
+            "child::app".parse::<ProjectGraphFocus>().unwrap(),
+            ProjectGraphFocus::Qualified(key) if key.to_string() == "child::app"
+        ));
+    }
 }

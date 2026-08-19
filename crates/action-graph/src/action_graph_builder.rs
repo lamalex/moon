@@ -159,6 +159,7 @@ impl<'query> ActionGraphBuilder<'query> {
         options: ActionGraphBuilderOptions,
     ) -> miette::Result<Self> {
         debug!("Building action graph");
+        workspace_graph.ensure_execution_local()?;
 
         Ok(ActionGraphBuilder {
             affected: None,
@@ -1739,6 +1740,38 @@ mod tests {
             Default::default(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rejects_aggregate_workspace_graphs() {
+        let sandbox = create_sandbox("projects");
+        let mocker = WorkspaceMocker::new(sandbox.path()).with_default_projects();
+        let local = Arc::new(mocker.mock_workspace_graph().await);
+
+        assert!(
+            ActionGraphBuilder::new(
+                Arc::new(mocker.mock_app_context()),
+                Arc::clone(&local),
+                Default::default(),
+            )
+            .is_ok()
+        );
+
+        let aggregate = Arc::new(WorkspaceGraph::new_aggregate(
+            Arc::clone(&local.projects),
+            Arc::clone(&local.tasks),
+            Arc::clone(&local.sources),
+            local.task_graphs.clone(),
+        ));
+
+        assert!(
+            ActionGraphBuilder::new(
+                Arc::new(mocker.mock_app_context()),
+                aggregate,
+                Default::default(),
+            )
+            .is_err()
+        );
     }
 
     fn find_node_index(

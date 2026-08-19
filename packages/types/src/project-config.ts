@@ -34,6 +34,8 @@ export interface ProjectDependencyConfig {
 	 * @type {'explicit' | 'implicit'}
 	 */
 	source: DependencySource;
+	/** Source root containing the depended on project. */
+	sourceRoot?: string | null;
 	/** Metadata about the source. */
 	via?: string | null;
 }
@@ -294,6 +296,8 @@ export interface PartialProjectDependencyConfig {
 	 * @default 'explicit'
 	 */
 	source?: DependencySource | null;
+	/** Source root containing the depended on project. */
+	sourceRoot?: string | null;
 	/** Metadata about the source. */
 	via?: string | null;
 }

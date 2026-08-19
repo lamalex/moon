@@ -5,6 +5,7 @@ use moon_task::Target;
 use moon_test_utils::{WorkspaceGraph, WorkspaceMocker};
 use rustc_hash::{FxHashMap, FxHashSet};
 use starbase_sandbox::{Sandbox, create_sandbox};
+use std::sync::Arc;
 
 async fn build_graph_with_sandbox(fixture: &str) -> (WorkspaceGraph, Sandbox) {
     let sandbox = create_sandbox(fixture);
@@ -38,6 +39,28 @@ async fn build_graph_with_sync_builder(fixture: &str) -> WorkspaceGraph {
         })
         .mock_workspace_graph()
         .await
+}
+
+#[tokio::test]
+async fn tracking_rejects_aggregate_workspace_graphs() {
+    let local = Arc::new(build_graph("projects").await);
+    let aggregate = Arc::new(WorkspaceGraph::new_aggregate(
+        Arc::clone(&local.projects),
+        Arc::clone(&local.tasks),
+        Arc::clone(&local.sources),
+        local.task_graphs.clone(),
+    ));
+
+    assert!(
+        AffectedTracker::new(Arc::clone(&local), FxHashSet::default())
+            .track_projects()
+            .is_ok()
+    );
+    assert!(
+        AffectedTracker::new(aggregate, FxHashSet::default())
+            .track_projects()
+            .is_err()
+    );
 }
 
 mod affected_projects {

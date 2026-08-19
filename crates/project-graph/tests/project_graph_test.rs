@@ -441,8 +441,8 @@ mod project_graph {
     mod cache {
         use super::*;
 
-        const CACHE_PATH: &str = ".moon/cache/states/workspaceGraphV2.json";
-        const STATE_PATH: &str = ".moon/cache/states/workspaceGraphStateV2.json";
+        const CACHE_PATH: &str = ".moon/cache/states/workspaceGraphV3.json";
+        const STATE_PATH: &str = ".moon/cache/states/workspaceGraphStateV3.json";
 
         // Written by the `tc-tier1` test plugin when `extend_project_graph`
         // is called, allowing us to detect if/when it was invoked

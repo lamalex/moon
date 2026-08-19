@@ -31,6 +31,10 @@ pub struct AffectedTracker {
 }
 
 impl AffectedTracker {
+    fn ensure_execution_local(&self) -> miette::Result<()> {
+        self.workspace_graph.ensure_execution_local()
+    }
+
     pub fn new(
         workspace_graph: Arc<WorkspaceGraph>,
         changed_files: FxHashSet<WorkspaceRelativePathBuf>,
@@ -140,6 +144,7 @@ impl AffectedTracker {
     }
 
     pub fn track_projects(&mut self) -> miette::Result<&mut Self> {
+        self.ensure_execution_local()?;
         debug!("Tracking projects and marking any affected");
 
         for project in self.workspace_graph.get_projects()? {
@@ -152,6 +157,7 @@ impl AffectedTracker {
     }
 
     pub async fn track_projects_async(&mut self) -> miette::Result<&mut Self> {
+        self.ensure_execution_local()?;
         debug!("Tracking projects and marking any affected");
 
         let downstream = self.project_downstream;
@@ -230,6 +236,8 @@ impl AffectedTracker {
         project: &Project,
         affected: AffectedBy,
     ) -> miette::Result<()> {
+        self.ensure_execution_local()?;
+
         if affected == AffectedBy::AlreadyMarked {
             // May have been already marked through an indirect dep,
             // but that doesn't mean its own deps have been checked!
@@ -371,6 +379,7 @@ impl AffectedTracker {
     }
 
     pub fn track_tasks_by_instance(&mut self, tasks: &[Arc<Task>]) -> miette::Result<()> {
+        self.ensure_execution_local()?;
         debug!("Tracking tasks and marking any affected");
 
         for task in tasks {
@@ -393,6 +402,7 @@ impl AffectedTracker {
         &mut self,
         tasks: &[Arc<Task>],
     ) -> miette::Result<()> {
+        self.ensure_execution_local()?;
         debug!("Tracking tasks and marking any affected");
 
         let ci = self.ci;
@@ -440,6 +450,7 @@ impl AffectedTracker {
     }
 
     pub fn track_tasks_by_target(&mut self, targets: &[Target]) -> miette::Result<()> {
+        self.ensure_execution_local()?;
         debug!(
             task_targets = ?targets.iter().map(|target| target.as_str()).collect::<Vec<_>>(),
             "Tracking tasks by target and marking any affected",
@@ -549,6 +560,8 @@ impl AffectedTracker {
     }
 
     pub fn mark_task_affected(&mut self, task: &Task, affected: AffectedBy) -> miette::Result<()> {
+        self.ensure_execution_local()?;
+
         if affected == AffectedBy::AlreadyMarked {
             // May have been already marked through an indirect dep,
             // but that doesn't mean its own deps have been checked!

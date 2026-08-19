@@ -1,10 +1,12 @@
 use moon_action::Action;
-use moon_action_graph::RunRequirements;
+use moon_action_graph::{ActionGraph, RunRequirements};
 use moon_common::Id;
 use moon_task::Target;
 use moon_test_utils::WorkspaceMocker;
 use moon_toolchain::ToolchainSpec;
+use moon_workspace_graph::WorkspaceGraph;
 use starbase_sandbox::{Sandbox, create_sandbox};
+use std::sync::Arc;
 
 fn get_labels(actions: Vec<Action>) -> Vec<String> {
     actions.into_iter().map(|action| action.label).collect()
@@ -126,6 +128,31 @@ mod action_pipeline {
                 "InstallDependencies ran even though SetupEnvironment failed"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_aggregate_workspace_graphs_before_running() {
+        let sandbox = create_sandbox("pipeline");
+        let mocker = WorkspaceMocker::new(sandbox.path()).with_default_projects();
+        let local = Arc::new(mocker.mock_workspace_graph().await);
+        let aggregate = Arc::new(WorkspaceGraph::new_aggregate(
+            Arc::clone(&local.projects),
+            Arc::clone(&local.tasks),
+            Arc::clone(&local.sources),
+            local.task_graphs.clone(),
+        ));
+        let pipeline = moon_action_pipeline::ActionPipeline::new(
+            Arc::new(mocker.mock_app_context()),
+            aggregate,
+            None,
+        );
+
+        assert!(
+            pipeline
+                .run(ActionGraph::new(Default::default(), Default::default()))
+                .await
+                .is_err()
+        );
     }
 
     mod priority {

@@ -26,6 +26,13 @@ impl QueryScope {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WorkspaceGraphPurpose {
+    #[default]
+    ExecutionLocal,
+    AggregateReadOnly,
+}
+
 #[derive(Default)]
 pub struct WorkspaceGraph {
     pub projects: Arc<ProjectGraph>,
@@ -35,6 +42,8 @@ pub struct WorkspaceGraph {
     pub task_graphs: BTreeMap<SourceRootId, Arc<TaskGraph>>,
     /// Root of the primary source. Retained for single-source compatibility.
     pub root: PathBuf,
+
+    purpose: WorkspaceGraphPurpose,
 
     /// Canonical query caches. Scope is encoded into each cache key.
     project_query_cache: HashMap<String, Arc<Vec<ProjectKey>>>,
@@ -54,14 +63,36 @@ impl WorkspaceGraph {
         let mut task_graphs = BTreeMap::new();
         task_graphs.insert(sources.primary_id().clone(), Arc::clone(&tasks));
 
-        Self::new_with_source_task_graphs(projects, tasks, sources, task_graphs)
+        Self::create(
+            projects,
+            tasks,
+            sources,
+            task_graphs,
+            WorkspaceGraphPurpose::ExecutionLocal,
+        )
     }
 
-    pub fn new_with_source_task_graphs(
+    pub fn new_aggregate(
+        projects: Arc<ProjectGraph>,
+        tasks: Arc<TaskGraph>,
+        sources: Arc<SourceRegistry>,
+        task_graphs: BTreeMap<SourceRootId, Arc<TaskGraph>>,
+    ) -> Self {
+        Self::create(
+            projects,
+            tasks,
+            sources,
+            task_graphs,
+            WorkspaceGraphPurpose::AggregateReadOnly,
+        )
+    }
+
+    fn create(
         projects: Arc<ProjectGraph>,
         tasks: Arc<TaskGraph>,
         sources: Arc<SourceRegistry>,
         mut task_graphs: BTreeMap<SourceRootId, Arc<TaskGraph>>,
+        purpose: WorkspaceGraphPurpose,
     ) -> Self {
         let root = sources.get_primary().to_path_buf();
         task_graphs
@@ -74,9 +105,24 @@ impl WorkspaceGraph {
             tasks,
             task_graphs,
             root,
+            purpose,
             project_query_cache: HashMap::default(),
             task_query_cache: HashMap::default(),
         }
+    }
+
+    pub fn ensure_execution_local(&self) -> miette::Result<()> {
+        if self.purpose == WorkspaceGraphPurpose::AggregateReadOnly {
+            return Err(miette::miette!(
+                "Aggregate workspace graphs are read-only and cannot be used for execution."
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn is_aggregate(&self) -> bool {
+        self.purpose == WorkspaceGraphPurpose::AggregateReadOnly
     }
 
     pub fn get_primary_source_id(&self) -> &SourceRootId {
@@ -376,15 +422,35 @@ mod tests {
             TaskType::Run,
         );
         let projects = Arc::new(
-            ProjectGraph::compose(Arc::clone(&sources), [primary_projects, child_projects])
-                .unwrap(),
+            ProjectGraph::compose(
+                Arc::clone(&sources),
+                &Default::default(),
+                [primary_projects, child_projects],
+            )
+            .unwrap(),
         );
         let task_graphs = BTreeMap::from([
             (primary_id, Arc::clone(&primary_tasks)),
             (child_id, child_tasks),
         ]);
 
-        WorkspaceGraph::new_with_source_task_graphs(projects, primary_tasks, sources, task_graphs)
+        WorkspaceGraph::new_aggregate(projects, primary_tasks, sources, task_graphs)
+    }
+
+    #[test]
+    fn graph_purpose_distinguishes_execution_from_aggregate_queries() {
+        let aggregate = aggregate_graph();
+        let local = WorkspaceGraph::new(
+            Arc::clone(&aggregate.projects),
+            Arc::clone(&aggregate.tasks),
+            aggregate.root.clone(),
+        );
+
+        assert!(local.ensure_execution_local().is_ok());
+        assert!(!local.is_aggregate());
+        assert!(aggregate.ensure_execution_local().is_err());
+        assert!(aggregate.is_aggregate());
+        assert_eq!(aggregate.get_all_tasks_with_keys().unwrap().len(), 2);
     }
 
     #[test]

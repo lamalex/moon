@@ -18,7 +18,7 @@ in a project's root, as configured in [`projects`](./workspace#projects).
 Explicitly defines _other_ projects that _this_ project depends on, primarily when generating the
 project and task graphs. The most common use case for this is building those projects _before_
 building this one. When defined, this setting requires an array of project names, which are the keys
-found in the [`projects`](./workspace#projects) map.
+found in the selected workspace's [`projects`](./workspace#projects) map.
 
 ```yaml title="moon.yml"
 dependsOn:
@@ -36,6 +36,23 @@ dependsOn:
   - id: 'designSystem'
     scope: 'peer'
 ```
+
+Projects in a discovered workspace can be referenced with `sourceRoot`. The value accepts either
+the workspace alias configured in `workspaces` or its canonical workspace ID, which is shown by
+`moon sources`. The selected source root must differ from the declaring project's source; omit
+`sourceRoot` for source-local dependencies.
+
+```yaml title="moon.yml"
+dependsOn:
+  - id: 'designSystem'
+    sourceRoot: 'frontend'
+  - id: 'api'
+    sourceRoot: 'acme/services'
+```
+
+Cross-source project dependencies are exposed through project graph and query commands. Task
+dependencies and execution remain scoped to the current workspace, so run commands do not traverse
+these edges yet.
 
 > Learn more about [implicit and explicit dependencies](../concepts/project#dependencies).
 

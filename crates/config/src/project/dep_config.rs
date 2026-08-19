@@ -1,5 +1,5 @@
 use crate::{config_struct, config_unit_enum};
-use moon_common::Id;
+use moon_common::{Id, SourceRootId};
 use schematic::{Config, ConfigEnum};
 
 config_unit_enum!(
@@ -48,6 +48,10 @@ config_struct!(
         /// Scope of the dependency relationship.
         pub scope: DependencyScope,
 
+        /// Source root containing the depended on project.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub source_root: Option<SourceRootId>,
+
         /// Source of where the dependency came from.
         pub source: DependencySource,
 
@@ -67,6 +71,10 @@ impl ProjectDependencyConfig {
 
     pub fn is_build_scope(&self) -> bool {
         matches!(self.scope, DependencyScope::Build)
+    }
+
+    pub fn is_cross_source(&self) -> bool {
+        self.source_root.is_some()
     }
 
     pub fn is_root_scope(&self) -> bool {

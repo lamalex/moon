@@ -706,12 +706,14 @@ mod task_deps_builder {
                     ProjectDependencyConfig {
                         id: Id::raw("a"),
                         scope: DependencyScope::Build,
+                        source_root: None,
                         source: DependencySource::Implicit,
                         via: Some("task a:build".into())
                     },
                     ProjectDependencyConfig {
                         id: Id::raw("c"),
                         scope: DependencyScope::Build,
+                        source_root: None,
                         source: DependencySource::Implicit,
                         via: Some("task c:test".into())
                     }
@@ -873,12 +875,14 @@ mod task_deps_builder {
                     ProjectDependencyConfig {
                         id: Id::raw("baz"),
                         scope: DependencyScope::Build,
+                        source_root: None,
                         source: DependencySource::Implicit,
                         via: Some("task baz:build".into())
                     },
                     ProjectDependencyConfig {
                         id: Id::raw("foo"),
                         scope: DependencyScope::Build,
+                        source_root: None,
                         source: DependencySource::Implicit,
                         via: Some("task foo:build".into())
                     },
