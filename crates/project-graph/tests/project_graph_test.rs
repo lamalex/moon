@@ -6,7 +6,7 @@ use moon_config::{
 use moon_project::{FileGroup, Project, ProjectAlias};
 use moon_project_graph::*;
 use moon_query::build_query;
-use moon_target::ProjectKey;
+use moon_target::{ProjectKey, TaskKey};
 use moon_task::{Target, TaskFileInput, TaskFileOutput, TaskGlobInput};
 use moon_test_utils::{
     MoonSandbox, WorkspaceGraph, WorkspaceMockOptions, WorkspaceMocker, create_moon_sandbox,
@@ -441,8 +441,8 @@ mod project_graph {
     mod cache {
         use super::*;
 
-        const CACHE_PATH: &str = ".moon/cache/states/workspaceGraphV3.json";
-        const STATE_PATH: &str = ".moon/cache/states/workspaceGraphStateV3.json";
+        const CACHE_PATH: &str = ".moon/cache/states/workspaceGraphV4.json";
+        const STATE_PATH: &str = ".moon/cache/states/workspaceGraphStateV4.json";
 
         // Written by the `tc-tier1` test plugin when `extend_project_graph`
         // is called, allowing us to detect if/when it was invoked
@@ -1789,11 +1789,11 @@ mod project_graph {
                 assert_eq!(direct_deps, ["b", "c"]);
                 assert_eq!(
                     graph.tasks.dependencies_of(&build),
-                    vec![Target::parse("b:build").unwrap()]
+                    vec![TaskKey::primary(Id::raw("b"), Id::raw("build")).unwrap()]
                 );
                 assert_eq!(
                     graph.tasks.dependencies_of(&check),
-                    vec![Target::parse("c:check").unwrap()]
+                    vec![TaskKey::primary(Id::raw("c"), Id::raw("check")).unwrap()]
                 );
 
                 let deps = &graph.get_project("from-task-deps").unwrap().dependencies;
@@ -1815,7 +1815,7 @@ mod project_graph {
                 );
                 assert_eq!(
                     graph.tasks.dependencies_of(&build),
-                    vec![Target::parse("root:noop").unwrap()]
+                    vec![TaskKey::primary(Id::raw("root"), Id::raw("noop")).unwrap()]
                 );
 
                 let deps = &graph

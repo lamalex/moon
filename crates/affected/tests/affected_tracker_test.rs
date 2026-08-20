@@ -44,12 +44,14 @@ async fn build_graph_with_sync_builder(fixture: &str) -> WorkspaceGraph {
 #[tokio::test]
 async fn tracking_rejects_aggregate_workspace_graphs() {
     let local = Arc::new(build_graph("projects").await);
-    let aggregate = Arc::new(WorkspaceGraph::new_aggregate(
-        Arc::clone(&local.projects),
-        Arc::clone(&local.tasks),
-        Arc::clone(&local.sources),
-        local.task_graphs.clone(),
-    ));
+    let aggregate = Arc::new(
+        WorkspaceGraph::new_aggregate(
+            Arc::clone(&local.projects),
+            Arc::clone(&local.sources),
+            [Arc::clone(&local.tasks)],
+        )
+        .unwrap(),
+    );
 
     assert!(
         AffectedTracker::new(Arc::clone(&local), FxHashSet::default())

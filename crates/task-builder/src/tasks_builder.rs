@@ -3,7 +3,7 @@
 use crate::tasks_builder_error::TasksBuilderError;
 use indexmap::{IndexMap, IndexSet};
 use moon_common::{
-    Id, color,
+    Id, SourceRootId, color,
     path::{WorkspaceRelativePath, encode_component, is_root_level_source},
 };
 use moon_config::{
@@ -88,6 +88,7 @@ pub struct TasksBuilderContext<'proj> {
     pub config_loader: &'proj ConfigLoader,
     pub enabled_toolchains: &'proj [Id],
     pub monorepo: bool,
+    pub source_id: &'proj SourceRootId,
     pub toolchains_config: &'proj ToolchainsConfig,
     pub toolchain_registry: Arc<ToolchainRegistry>,
     pub workspace_root: &'proj Path,
@@ -292,6 +293,7 @@ impl<'proj> TasksBuilder<'proj> {
 
         let mut task = Task {
             // Reset toolchains so that we don't inherit system by default
+            source_id: self.context.source_id.clone(),
             toolchains: vec![],
             ..Default::default()
         };

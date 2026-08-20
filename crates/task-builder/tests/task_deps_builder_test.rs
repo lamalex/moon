@@ -629,6 +629,13 @@ mod task_deps_builder {
                 task.deps,
                 vec![dep_ignored("a:build"), dep_ignored("c:test")]
             );
+            assert_eq!(
+                task.configured_deps,
+                vec![
+                    TaskDependencyConfig::new(Target::parse("a:build").unwrap()),
+                    TaskDependencyConfig::new(Target::parse("c:test").unwrap()),
+                ]
+            );
         }
 
         #[test]

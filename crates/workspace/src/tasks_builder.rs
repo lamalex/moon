@@ -4,6 +4,7 @@ use moon_common::Id;
 use moon_config::TaskDependencyType;
 use moon_graph_utils::{GraphExpanderContext, NodeState};
 use moon_project_graph::ProjectGraph;
+use moon_target::TaskKey;
 use moon_task::{Target, Task, TaskOptions};
 use moon_task_graph::{TaskGraph, TaskGraphError, TaskNode};
 use petgraph::graph::NodeIndex;
@@ -28,6 +29,8 @@ pub struct TaskBuildData {
 
     #[serde(skip)]
     pub has_outputs: bool,
+
+    pub target: Target,
 }
 
 impl TaskBuildData {
@@ -49,36 +52,35 @@ pub struct WorkspaceTasksBuilder {
     /// The task DAG.
     pub graph: TaskDag,
 
-    /// Map of task targets to their graph index.
-    pub targets_to_indexes: FxHashMap<Target, NodeIndex>,
+    /// Map of canonical task keys to their graph index.
+    pub keys_to_indexes: FxHashMap<TaskKey, NodeIndex>,
 }
 
 impl WorkspaceTasksBuilder {
-    pub fn get_or_insert_node(&mut self, target: &Target) -> NodeIndex {
-        match self.targets_to_indexes.get(target) {
+    pub fn get_or_insert_node(&mut self, key: &TaskKey) -> NodeIndex {
+        match self.keys_to_indexes.get(key) {
             Some(index) => *index,
             None => {
                 let index = self.graph.add_node(NodeState::Loading);
-                self.targets_to_indexes.insert(target.to_owned(), index);
+                self.keys_to_indexes.insert(key.to_owned(), index);
                 index
             }
         }
     }
 
     pub fn insert_or_update_node(&mut self, task: Task) {
+        let key = task.key();
         // Project node may have been inserted through an edge first,
         // so we need to update the state from loading to loaded
-        if let Some(index) = self.targets_to_indexes.get(&task.target)
+        if let Some(index) = self.keys_to_indexes.get(&key)
             && let Some(node) = self.graph.node_weight_mut(*index)
         {
             *node = NodeState::Loaded(task);
         }
         // Otherwise the node was inserted first, so we can set as loaded
         else {
-            self.targets_to_indexes.insert(
-                task.target.clone(),
-                self.graph.add_node(NodeState::Loaded(task)),
-            );
+            self.keys_to_indexes
+                .insert(key, self.graph.add_node(NodeState::Loaded(task)));
         }
     }
 }
@@ -87,17 +89,18 @@ impl WorkspaceTasksBuilder {
     pub fn new() -> Self {
         Self {
             graph: TaskDag::default(),
-            targets_to_indexes: FxHashMap::default(),
+            keys_to_indexes: FxHashMap::default(),
         }
     }
 
     #[instrument(skip_all)]
     pub fn build(&mut self, tasks: Vec<Task>) -> miette::Result<()> {
         for task in tasks {
-            let from_index = self.get_or_insert_node(&task.target);
+            let from_index = self.get_or_insert_node(&task.key());
 
             for dep_config in &task.deps {
-                let to_index = self.get_or_insert_node(&dep_config.target);
+                let dep_key = TaskKey::from_target(task.source_id.clone(), &dep_config.target)?;
+                let to_index = self.get_or_insert_node(&dep_key);
                 let scope = if dep_config.optional.is_some_and(|v| v) {
                     TaskDependencyType::Optional
                 } else {
@@ -142,10 +145,10 @@ impl WorkspaceTasksBuilder {
         for index in task_graph.graph.graph().node_indices() {
             let old_index = *task_graph.graph.node_weight(index).unwrap();
             let task = loaded_tasks.remove(&old_index).unwrap();
-            let target = task.target.clone();
+            let key = task.key();
 
-            task_graph.indexes.insert(index, target.clone());
-            task_graph.nodes.insert(target, TaskNode { index, task });
+            task_graph.indexes.insert(index, key.clone());
+            task_graph.nodes.insert(key, TaskNode { index, task });
         }
 
         // Weight-based lookups require each node's weight to be its own

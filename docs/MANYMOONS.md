@@ -6,8 +6,8 @@ Manymoons is a design and implementation effort. The external configuration and 
 described by this document are intentionally undecided unless explicitly marked otherwise.
 
 Milestone 1, internal source-root qualification, Milestone 2, direct multi-workspace discovery,
-Milestone 3, aggregated querying, and Milestone 4, cross-source project dependencies, are complete.
-Milestone 5, the unified task graph, is next.
+Milestone 3, aggregated querying, Milestone 4, cross-source project dependencies, and Milestone 5,
+the unified task graph, are complete. Milestone 6, cross-source hashing and cache safety, is next.
 
 ## End Goal
 
@@ -328,6 +328,13 @@ commands reject or ignore those edges behind the feature gate.
 
 Action construction and execution for cross-source edges must remain disabled until Milestones 6
 and 7 are complete. Milestone 5 is a graph and query capability, not an uncached execution mode.
+
+The composed task graph is keyed by `TaskKey` and retains source-specific expansion contexts.
+Source-local `Target` selectors remain compatibility adapters at command and configuration
+boundaries. Configured dependency selectors are preserved before local expansion, then `^:task`
+and scoped variants are resolved again against canonical composed project edges. Aggregate graph
+and query commands use this single graph. Action construction consults it only to reject task
+closures containing cross-source edges with an explicit unsupported-feature error.
 
 Exit criteria: task graph output can represent cross-source edges, but attempting to execute one
 produces an explicit unsupported-feature error.

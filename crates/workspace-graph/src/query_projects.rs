@@ -3,7 +3,6 @@ use moon_common::{Id, IdExt, color};
 use moon_project_graph::{GraphConnections, Project};
 use moon_query::*;
 use moon_target::ProjectKey;
-use moon_task_graph::TaskGraph;
 use std::{fmt::Debug, sync::Arc};
 use tracing::{debug, instrument};
 
@@ -78,11 +77,7 @@ impl WorkspaceGraph {
 
             let project = self.projects.get_unexpanded_by_key(&key)?;
 
-            if self.does_project_match_criteria(
-                project,
-                self.task_graph_for_source(key.source_id())?,
-                query,
-            )? {
+            if self.does_project_match_criteria(project, query)? {
                 keys.push(key);
             }
         }
@@ -95,22 +90,9 @@ impl WorkspaceGraph {
         Ok(keys)
     }
 
-    fn task_graph_for_source(
-        &self,
-        source_id: &moon_common::SourceRootId,
-    ) -> miette::Result<&TaskGraph> {
-        let source_id = self.canonical_source_id(source_id);
-
-        self.task_graphs
-            .get(&source_id)
-            .map(Arc::as_ref)
-            .ok_or_else(|| miette::miette!("No task graph has been loaded for source {source_id}."))
-    }
-
     fn does_project_match_criteria(
         &self,
         project: &Project,
-        task_graph: &TaskGraph,
         query: &Criteria,
     ) -> miette::Result<bool> {
         let match_all = matches!(query.op, LogicalOperator::And);
@@ -152,14 +134,16 @@ impl WorkspaceGraph {
                                 .and_then(|task_id| condition.matches(ids, task_id))
                                 .unwrap_or_default()
                         })),
-                        Field::TaskTag(tags) => Ok(task_graph
-                            .get_many(&project.task_targets)?
+                        Field::TaskTag(tags) => Ok(self
+                            .tasks
+                            .get_many_by_key(&self.task_keys(project)?)?
                             .iter()
                             .any(|task| {
                                 condition.matches_list(tags, &task.tags).unwrap_or_default()
                             })),
-                        Field::TaskToolchain(ids) => Ok(task_graph
-                            .get_many(&project.task_targets)?
+                        Field::TaskToolchain(ids) => Ok(self
+                            .tasks
+                            .get_many_by_key(&self.task_keys(project)?)?
                             .iter()
                             .any(|task| {
                                 let mut toolchains = vec![];
@@ -173,8 +157,9 @@ impl WorkspaceGraph {
 
                                 condition.matches_list(ids, &toolchains).unwrap_or_default()
                             })),
-                        Field::TaskType(types) => Ok(task_graph
-                            .get_many(&project.task_targets)?
+                        Field::TaskType(types) => Ok(self
+                            .tasks
+                            .get_many_by_key(&self.task_keys(project)?)?
                             .iter()
                             .any(|task| {
                                 condition
@@ -186,7 +171,7 @@ impl WorkspaceGraph {
                     result?
                 }
                 Condition::Criteria { criteria } => {
-                    self.does_project_match_criteria(project, task_graph, criteria)?
+                    self.does_project_match_criteria(project, criteria)?
                 }
             };
 
@@ -209,5 +194,13 @@ impl WorkspaceGraph {
         }
 
         Ok(true)
+    }
+
+    fn task_keys(&self, project: &Project) -> miette::Result<Vec<moon_target::TaskKey>> {
+        project
+            .task_targets
+            .iter()
+            .map(|target| moon_target::TaskKey::from_target(project.source_id.clone(), target))
+            .collect()
     }
 }

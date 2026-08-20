@@ -1,5 +1,6 @@
 mod task;
 mod task_arg;
+mod task_dependency;
 mod task_options;
 
 pub use moon_config::{
@@ -12,4 +13,5 @@ pub use moon_config::{
 pub use moon_target::*;
 pub use task::*;
 pub use task_arg::*;
+pub use task_dependency::*;
 pub use task_options::*;

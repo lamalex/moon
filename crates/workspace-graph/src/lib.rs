@@ -1,12 +1,11 @@
 mod query_projects;
 mod query_tasks;
 
-use moon_common::{Id, SourceRegistry, SourceRootId};
+use moon_common::{SourceRegistry, SourceRootId};
 use moon_project_graph::{Project, ProjectGraph};
 use moon_target::{ProjectKey, TaskKey};
 use moon_task_graph::{Target, Task, TaskGraph};
 use scc::HashMap;
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::{path::Path, sync::Arc};
 
@@ -38,8 +37,6 @@ pub struct WorkspaceGraph {
     pub projects: Arc<ProjectGraph>,
     pub sources: Arc<SourceRegistry>,
     pub tasks: Arc<TaskGraph>,
-    /// Source-local task graphs used only by canonical aggregate read APIs.
-    pub task_graphs: BTreeMap<SourceRootId, Arc<TaskGraph>>,
     /// Root of the primary source. Retained for single-source compatibility.
     pub root: PathBuf,
 
@@ -60,50 +57,41 @@ impl WorkspaceGraph {
         tasks: Arc<TaskGraph>,
         sources: Arc<SourceRegistry>,
     ) -> Self {
-        let mut task_graphs = BTreeMap::new();
-        task_graphs.insert(sources.primary_id().clone(), Arc::clone(&tasks));
-
         Self::create(
             projects,
             tasks,
             sources,
-            task_graphs,
             WorkspaceGraphPurpose::ExecutionLocal,
         )
     }
 
     pub fn new_aggregate(
         projects: Arc<ProjectGraph>,
-        tasks: Arc<TaskGraph>,
         sources: Arc<SourceRegistry>,
-        task_graphs: BTreeMap<SourceRootId, Arc<TaskGraph>>,
-    ) -> Self {
-        Self::create(
+        task_graphs: impl IntoIterator<Item = Arc<TaskGraph>>,
+    ) -> miette::Result<Self> {
+        let tasks = Arc::new(TaskGraph::compose(Arc::clone(&projects), task_graphs)?);
+
+        Ok(Self::create(
             projects,
             tasks,
             sources,
-            task_graphs,
             WorkspaceGraphPurpose::AggregateReadOnly,
-        )
+        ))
     }
 
     fn create(
         projects: Arc<ProjectGraph>,
         tasks: Arc<TaskGraph>,
         sources: Arc<SourceRegistry>,
-        mut task_graphs: BTreeMap<SourceRootId, Arc<TaskGraph>>,
         purpose: WorkspaceGraphPurpose,
     ) -> Self {
         let root = sources.get_primary().to_path_buf();
-        task_graphs
-            .entry(sources.primary_id().clone())
-            .or_insert_with(|| Arc::clone(&tasks));
 
         Self {
             projects,
             sources,
             tasks,
-            task_graphs,
             root,
             purpose,
             project_query_cache: HashMap::default(),
@@ -207,30 +195,23 @@ impl WorkspaceGraph {
     /// Return a task by its canonical source-qualified identity.
     pub fn get_task_by_key(&self, key: &TaskKey) -> miette::Result<Arc<Task>> {
         let source_id = self.canonical_source_id(key.project_key().source_id());
-        let target = Target::new(
-            key.project_key().project_id().clone(),
+        let key = TaskKey::new(
+            ProjectKey::new(source_id.clone(), key.project_key().project_id().clone())?,
             key.task_id().clone(),
         )?;
 
-        self.task_graphs
-            .get(&source_id)
-            .ok_or_else(|| {
-                miette::miette!("No task graph has been loaded for source {source_id}.")
-            })?
-            .get(&target)
+        self.tasks.get_by_key(&key)
     }
 
     /// Return all non-internal tasks with canonical source-qualified identities.
     pub fn get_all_tasks_with_keys(&self) -> miette::Result<Vec<(TaskKey, Arc<Task>)>> {
-        let mut tasks = vec![];
-
-        for (source_id, graph) in &self.task_graphs {
-            for task in graph.get_all()? {
-                if !task.is_internal() {
-                    tasks.push((Self::task_key(source_id, &task)?, task));
-                }
-            }
-        }
+        let mut tasks = self
+            .tasks
+            .get_all()?
+            .into_iter()
+            .filter(|task| !task.is_internal())
+            .map(|task| (task.key(), task))
+            .collect::<Vec<_>>();
 
         tasks.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -244,16 +225,14 @@ impl WorkspaceGraph {
     ) -> miette::Result<Vec<(TaskKey, Arc<Task>)>> {
         let project = self.get_project_by_key(project_key)?;
         let source_id = self.canonical_source_id(project_key.source_id());
-        let graph = self.task_graphs.get(&source_id).ok_or_else(|| {
-            miette::miette!("No task graph has been loaded for source {source_id}.")
-        })?;
         let mut tasks = vec![];
 
         for target in &project.task_targets {
-            let task = graph.get(target)?;
+            let key = TaskKey::from_target(source_id.clone(), target)?;
+            let task = self.tasks.get_by_key(&key)?;
 
             if !task.is_internal() {
-                tasks.push((Self::task_key(&source_id, &task)?, task));
+                tasks.push((task.key(), task));
             }
         }
 
@@ -270,7 +249,7 @@ impl WorkspaceGraph {
         let project_id = self.projects.resolve_id(project_id_or_alias.as_ref());
         let target = Target::new(project_id, task_id)?;
 
-        self.tasks.get(&target)
+        self.get_task(&target)
     }
 
     pub fn get_tasks_from_project(
@@ -297,7 +276,7 @@ impl WorkspaceGraph {
             .tasks
             .get_all()?
             .into_iter()
-            .filter(|task| !task.is_internal())
+            .filter(|task| task.source_id == *self.sources.primary_id() && !task.is_internal())
             .collect())
     }
 
@@ -306,17 +285,27 @@ impl WorkspaceGraph {
             .tasks
             .get_all_unexpanded()?
             .into_iter()
-            .filter(|task| !task.is_internal())
+            .filter(|task| task.source_id == *self.sources.primary_id() && !task.is_internal())
             .collect())
     }
 
     /// Get all tasks, including internal.
     pub fn get_tasks_with_internal(&self) -> miette::Result<Vec<Arc<Task>>> {
-        self.tasks.get_all()
+        Ok(self
+            .tasks
+            .get_all()?
+            .into_iter()
+            .filter(|task| task.source_id == *self.sources.primary_id())
+            .collect())
     }
 
     pub fn get_tasks_unexpanded_with_internal(&self) -> miette::Result<Vec<&Task>> {
-        self.tasks.get_all_unexpanded()
+        Ok(self
+            .tasks
+            .get_all_unexpanded()?
+            .into_iter()
+            .filter(|task| task.source_id == *self.sources.primary_id())
+            .collect())
     }
 
     fn canonical_source_id(&self, source_id: &SourceRootId) -> SourceRootId {
@@ -326,18 +315,12 @@ impl WorkspaceGraph {
             source_id.clone()
         }
     }
-
-    fn task_key(source_id: &SourceRootId, task: &Task) -> miette::Result<TaskKey> {
-        TaskKey::new(
-            ProjectKey::new(source_id.clone(), Id::raw(task.target.get_project_id()?))?,
-            Id::raw(task.target.get_task_id()?),
-        )
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moon_common::Id;
     use moon_config::TaskType;
     use moon_project_graph::{ProjectAlias, ProjectNode};
     use moon_task_graph::TaskNode;
@@ -364,7 +347,7 @@ mod tests {
                 plugin: Id::raw("test"),
             }],
             id: Id::raw("app"),
-            source_id,
+            source_id: source_id.clone(),
             task_targets: vec![target.clone()],
             ..Project::default()
         };
@@ -379,6 +362,7 @@ mod tests {
         let projects = Arc::new(projects);
         let task = Task {
             id: Id::raw("build"),
+            source_id,
             tags: vec![Id::raw(task_tag)],
             target: target.clone(),
             toolchains: vec![Id::raw(task_toolchain)],
@@ -387,7 +371,7 @@ mod tests {
         };
         let mut tasks = TaskGraph::new(context, Arc::clone(&projects));
         tasks.nodes.insert(
-            target,
+            task.key(),
             TaskNode {
                 index: Default::default(),
                 task,
@@ -429,12 +413,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let task_graphs = BTreeMap::from([
-            (primary_id, Arc::clone(&primary_tasks)),
-            (child_id, child_tasks),
-        ]);
-
-        WorkspaceGraph::new_aggregate(projects, primary_tasks, sources, task_graphs)
+        WorkspaceGraph::new_aggregate(projects, sources, [primary_tasks, child_tasks]).unwrap()
     }
 
     #[test]

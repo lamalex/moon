@@ -213,9 +213,13 @@ impl TaskTracker {
             }
         }
 
-        for dep_target in self.workspace_graph.tasks.dependents_of(task) {
+        for dep_key in self.workspace_graph.tasks.dependents_of(task) {
+            let dep_target = Target::new(
+                dep_key.project_key().project_id().clone(),
+                dep_key.task_id().clone(),
+            )?;
             self.tracked
-                .entry(dep_target.clone())
+                .entry(dep_target)
                 .or_default()
                 .insert(AffectedBy::UpstreamTask(task.target.clone()));
 
@@ -223,7 +227,7 @@ impl TaskTracker {
                 continue;
             }
 
-            let dep_task = self.workspace_graph.get_task(&dep_target)?;
+            let dep_task = self.workspace_graph.get_task_by_key(&dep_key)?;
 
             self.track_task_dependents(&dep_task, depth + 1, cycle)?;
         }

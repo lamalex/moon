@@ -7,7 +7,7 @@ use moon_config::{
 use moon_project::Project;
 use moon_task::{
     Target, TargetDependencyScope as TargetDepScope, TargetProjectScope, TargetTaskScope, Task,
-    TaskOptionRunInCI, TaskOptions,
+    TaskDependencyValidationError, TaskOptions, validate_task_dependency,
 };
 use std::mem;
 use tracing::debug;
@@ -33,6 +33,10 @@ impl TaskDepsBuilder<'_> {
     pub fn build(mut self) -> miette::Result<()> {
         let mut deps = vec![];
         let project = self.project.take().unwrap();
+
+        if self.task.configured_deps.is_empty() {
+            self.task.configured_deps = self.task.deps.clone();
+        }
 
         for dep_config in mem::take(&mut self.task.deps) {
             let (project_ids, skip_if_missing, link_implicit_project_deps) = {
@@ -185,36 +189,22 @@ impl TaskDepsBuilder<'_> {
         dep_task_options: &TaskOptions,
         dep_config: &TaskDependencyConfig,
     ) -> miette::Result<TaskDependencyConfig> {
-        // Do not depend on tasks that can fail
-        if dep_task_options.allow_failure {
-            return Err(TasksBuilderError::AllowFailureDepRequirement {
-                dep: dep_task_target.to_owned(),
-                task: self.task.target.to_owned(),
-            }
-            .into());
-        }
+        validate_task_dependency(&self.task.options, dep_task_options).map_err(|error| {
+            let dep = dep_task_target.to_owned();
+            let task = self.task.target.to_owned();
 
-        // Do not depend on tasks that can't run in CI
-        if !dep_task_options.run_in_ci.is_enabled()
-            && self.task.options.run_in_ci.is_enabled()
-            && dep_task_options.run_in_ci != TaskOptionRunInCI::Skip
-            && self.task.options.run_in_ci != TaskOptionRunInCI::Skip
-        {
-            return Err(TasksBuilderError::RunInCiDepRequirement {
-                dep: dep_task_target.to_owned(),
-                task: self.task.target.to_owned(),
+            match error {
+                TaskDependencyValidationError::AllowFailure => {
+                    TasksBuilderError::AllowFailureDepRequirement { dep, task }
+                }
+                TaskDependencyValidationError::RunInCi => {
+                    TasksBuilderError::RunInCiDepRequirement { dep, task }
+                }
+                TaskDependencyValidationError::Persistent => {
+                    TasksBuilderError::PersistentDepRequirement { dep, task }
+                }
             }
-            .into());
-        }
-
-        // Enforce persistent constraints
-        if dep_task_options.persistent && !self.task.options.persistent {
-            return Err(TasksBuilderError::PersistentDepRequirement {
-                dep: dep_task_target.to_owned(),
-                task: self.task.target.to_owned(),
-            }
-            .into());
-        }
+        })?;
 
         let dep_has_outputs = self.querent.query_task_has_outputs(dep_task_target);
 

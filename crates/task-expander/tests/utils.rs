@@ -6,6 +6,7 @@ use moon_config::{Input, TaskOptionCache};
 use moon_graph_utils::GraphExpanderContext;
 use moon_project::{FileGroup, Project, ProjectError};
 use moon_project_graph::{ProjectGraph, ProjectNode};
+use moon_target::TaskKey;
 use moon_task::{Target, Task, TaskFileInput, TaskFileOutput, TaskGlobInput, TaskGlobOutput};
 use moon_task_expander::TaskLookup;
 use petgraph::graph::NodeIndex;
@@ -14,16 +15,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-fn unknown_task(target: &Target) -> miette::Report {
+fn unknown_task(key: &TaskKey) -> miette::Report {
     ProjectError::UnknownTask {
-        task_id: target
-            .get_task_id()
-            .map(|id| id.to_string())
-            .unwrap_or_default(),
-        project_id: target
-            .get_project_id()
-            .map(|id| id.to_string())
-            .unwrap_or_default(),
+        task_id: key.task_id().to_string(),
+        project_id: key.project_key().project_id().to_string(),
     }
     .into()
 }
@@ -31,8 +26,8 @@ fn unknown_task(target: &Target) -> miette::Report {
 pub struct EmptyTaskLookup;
 
 impl TaskLookup for EmptyTaskLookup {
-    fn get_task(&self, target: &Target) -> miette::Result<Arc<Task>> {
-        Err(unknown_task(target))
+    fn get_task(&self, key: &TaskKey) -> miette::Result<Arc<Task>> {
+        Err(unknown_task(key))
     }
 }
 
@@ -40,26 +35,26 @@ pub static EMPTY_TASK_LOOKUP: EmptyTaskLookup = EmptyTaskLookup;
 
 #[derive(Default)]
 pub struct MapTaskLookup {
-    pub tasks: FxHashMap<Target, Arc<Task>>,
+    pub tasks: FxHashMap<TaskKey, Arc<Task>>,
 }
 
 impl MapTaskLookup {
     pub fn with_task(mut self, task: Task) -> Self {
-        let target = task.target.clone();
+        let key = task.key();
         assert!(
-            self.tasks.insert(target.clone(), Arc::new(task)).is_none(),
-            "duplicate target in MapTaskLookup: {target}"
+            self.tasks.insert(key.clone(), Arc::new(task)).is_none(),
+            "duplicate task in MapTaskLookup: {key}"
         );
         self
     }
 }
 
 impl TaskLookup for MapTaskLookup {
-    fn get_task(&self, target: &Target) -> miette::Result<Arc<Task>> {
+    fn get_task(&self, key: &TaskKey) -> miette::Result<Arc<Task>> {
         self.tasks
-            .get(target)
+            .get(key)
             .map(Arc::clone)
-            .ok_or_else(|| unknown_task(target))
+            .ok_or_else(|| unknown_task(key))
     }
 }
 

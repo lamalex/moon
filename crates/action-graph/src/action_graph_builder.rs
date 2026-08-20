@@ -19,6 +19,7 @@ use moon_query::{Criteria, build_query};
 use moon_task::{Target, TargetError, TargetLocator, TargetProjectScope, TargetTaskScope, Task};
 use moon_toolchain::{DependenciesWorkspace, DependenciesWorkspaceRole, ToolchainSpec};
 use moon_workspace_graph::projects::ProjectGraphError;
+use moon_workspace_graph::tasks::TaskGraph;
 use moon_workspace_graph::{GraphConnections, WorkspaceGraph};
 use petgraph::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -125,6 +126,7 @@ impl ActionGraphBuilderOptions {
 }
 
 pub struct ActionGraphBuilder<'query> {
+    aggregate_task_graph: Option<Arc<TaskGraph>>,
     all_query: Option<Criteria<'query>>,
     app_context: Arc<AppContext>,
     graph: Dag<ActionNode, TaskDependencyType>,
@@ -162,6 +164,7 @@ impl<'query> ActionGraphBuilder<'query> {
         workspace_graph.ensure_execution_local()?;
 
         Ok(ActionGraphBuilder {
+            aggregate_task_graph: None,
             affected: None,
             all_query: None,
             app_context,
@@ -176,6 +179,12 @@ impl<'query> ActionGraphBuilder<'query> {
             changed_files: None,
             workspace_graph,
         })
+    }
+
+    /// Attach the read-only aggregate graph used to reject unsupported execution edges.
+    pub fn with_aggregate_task_graph(mut self, task_graph: Arc<TaskGraph>) -> Self {
+        self.aggregate_task_graph = Some(task_graph);
+        self
     }
 
     pub fn build(mut self) -> (ActionContext, ActionGraph) {
@@ -812,7 +821,11 @@ impl<'query> ActionGraphBuilder<'query> {
     ) -> miette::Result<Vec<Option<NodeIndex>>> {
         let mut indexes = vec![];
 
-        for dep_target in self.workspace_graph.tasks.dependents_of(task) {
+        for dep_key in self.workspace_graph.tasks.dependents_of(task) {
+            let dep_target = Target::new(
+                dep_key.project_key().project_id().clone(),
+                dep_key.task_id().clone(),
+            )?;
             for dep_task in self
                 .internal_resolve_tasks_from_target(&dep_target, true)
                 .await?
@@ -1068,6 +1081,16 @@ impl<'query> ActionGraphBuilder<'query> {
         let should_run_dependents =
             !state.via_dependency && reqs.dependents.is_in_scope(state.depth);
         state.depth += 1;
+
+        if let Some(task_graph) = &self.aggregate_task_graph
+            && let Some(dependency) = task_graph.cross_source_dependency_in_closure(&task.key())
+        {
+            return Err(ActionGraphError::UnsupportedCrossSourceTaskDependency {
+                task: task.key().to_string(),
+                dependency: dependency.to_string(),
+            }
+            .into());
+        }
 
         // Only apply CI checks when requested
         if reqs.ci_check && !task.should_run(reqs.ci) {
@@ -1757,12 +1780,14 @@ mod tests {
             .is_ok()
         );
 
-        let aggregate = Arc::new(WorkspaceGraph::new_aggregate(
-            Arc::clone(&local.projects),
-            Arc::clone(&local.tasks),
-            Arc::clone(&local.sources),
-            local.task_graphs.clone(),
-        ));
+        let aggregate = Arc::new(
+            WorkspaceGraph::new_aggregate(
+                Arc::clone(&local.projects),
+                Arc::clone(&local.sources),
+                [Arc::clone(&local.tasks)],
+            )
+            .unwrap(),
+        );
 
         assert!(
             ActionGraphBuilder::new(
@@ -1772,6 +1797,61 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_tasks_with_cross_source_dependencies() {
+        let sandbox = create_sandbox("projects");
+        let mut builder = create_builder(sandbox.path()).await;
+        let project = builder.workspace_graph.projects.get_all().unwrap()[0].clone();
+        let task = Task {
+            id: Id::raw("build"),
+            source_id: project.source_id.clone(),
+            target: Target::new(&project.id, "build").unwrap(),
+            ..Task::default()
+        };
+        let mut dependency = task.clone();
+        dependency.source_id = moon_common::SourceRootId::new("child").unwrap();
+
+        let mut aggregate_tasks = TaskGraph::new(
+            builder.workspace_graph.tasks.context.clone(),
+            Arc::clone(&builder.workspace_graph.projects),
+        );
+        let task_index = aggregate_tasks.graph.add_node(NodeIndex::new(0));
+        let dependency_index = aggregate_tasks.graph.add_node(NodeIndex::new(1));
+        aggregate_tasks.indexes.insert(task_index, task.key());
+        aggregate_tasks
+            .indexes
+            .insert(dependency_index, dependency.key());
+        aggregate_tasks.nodes.insert(
+            task.key(),
+            moon_workspace_graph::tasks::TaskNode {
+                index: task_index,
+                task: task.clone(),
+            },
+        );
+        aggregate_tasks.nodes.insert(
+            dependency.key(),
+            moon_workspace_graph::tasks::TaskNode {
+                index: dependency_index,
+                task: dependency.clone(),
+            },
+        );
+        aggregate_tasks
+            .graph
+            .add_edge(task_index, dependency_index, TaskDependencyType::Required)
+            .unwrap();
+
+        builder.aggregate_task_graph = Some(Arc::new(aggregate_tasks));
+        let error = builder
+            .run_task(&task, &RunRequirements::default())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains(&task.key().to_string()));
+        assert!(error.contains(&dependency.key().to_string()));
+        assert!(error.contains("another source root"));
     }
 
     fn find_node_index(

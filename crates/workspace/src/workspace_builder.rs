@@ -25,7 +25,7 @@ use moon_project::{Project, ProjectAlias, ProjectError};
 use moon_project_builder::{ProjectBuilder, ProjectBuilderContext};
 use moon_project_constraints::{enforce_layer_relationships, enforce_tag_relationships};
 use moon_project_graph::{ProjectGraph, ProjectGraphError, ProjectNode, would_cycle_in_scope};
-use moon_target::ProjectKey;
+use moon_target::{ProjectKey, TaskKey};
 use moon_task::{Target, Task};
 use moon_task_builder::TaskDepsBuilder;
 use moon_task_graph::{GraphExpanderContext, NodeState, TaskGraph, TaskGraphError, TaskNode};
@@ -45,8 +45,8 @@ use std::sync::Arc;
 use tracing::{debug, instrument};
 
 pub const LOCK_FILE_NAME: &str = "workspaceGraph.lock";
-pub const STATE_GRAPH_FILE_NAME: &str = "workspaceGraphV3.json";
-pub const STATE_CACHE_FILE_NAME: &str = "workspaceGraphStateV3.json";
+pub const STATE_GRAPH_FILE_NAME: &str = "workspaceGraphV4.json";
+pub const STATE_CACHE_FILE_NAME: &str = "workspaceGraphStateV4.json";
 
 pub struct WorkspaceBuilderContext {
     pub cache_engine: Arc<CacheEngine>,
@@ -141,7 +141,7 @@ pub struct WorkspaceBuilder {
     /// Mapping of task targets to associated data required for building
     /// the project itself. Currently we track the following:
     ///   - Their task options, for resolving deps.
-    task_data: FxHashMap<Target, TaskBuildData>,
+    task_data: FxHashMap<TaskKey, TaskBuildData>,
 
     /// The task DAG.
     task_graph: Dag<NodeState<Task>, TaskDependencyType>,
@@ -380,10 +380,10 @@ impl WorkspaceBuilder {
         for index in task_graph.graph.graph().node_indices() {
             let old_index = *task_graph.graph.node_weight(index).unwrap();
             let task = loaded_tasks.remove(&old_index).unwrap();
-            let target = task.target.clone();
+            let key = task.key();
 
-            task_graph.indexes.insert(index, target.clone());
-            task_graph.nodes.insert(target, TaskNode { index, task });
+            task_graph.indexes.insert(index, key.clone());
+            task_graph.nodes.insert(key, TaskNode { index, task });
         }
 
         // Weight-based lookups require each node's weight to be its own
@@ -491,11 +491,12 @@ impl WorkspaceBuilder {
         // Then persist task build data
         for task in project.tasks.values() {
             self.task_data.insert(
-                task.target.clone(),
+                task.key(),
                 TaskBuildData {
                     tags: task.tags.clone(),
                     options: task.options.clone(),
                     has_outputs: task.has_outputs(),
+                    target: task.target.clone(),
                     ..Default::default()
                 },
             );
@@ -638,7 +639,9 @@ impl WorkspaceBuilder {
 
     /// Load a single task by target into the graph.
     pub async fn load_task(&mut self, target: &Target) -> miette::Result<()> {
-        Box::pin(self.internal_load_task(target, &mut FxHashSet::default())).await?;
+        let target = TaskBuildData::resolve_target(target, &self.project_data)?;
+        let key = TaskKey::from_target(self.context().sources.primary_id().clone(), &target)?;
+        Box::pin(self.internal_load_task(&key, &mut FxHashSet::default())).await?;
 
         // Tasks may lazily load their owning project
         self.connect_deferred_project_edges();
@@ -653,13 +656,13 @@ impl WorkspaceBuilder {
         for node in self.project_graph.raw_nodes() {
             if let NodeState::Loaded(project) = &node.weight {
                 for task in project.tasks.values() {
-                    targets.push(task.target.clone());
+                    targets.push(task.key());
                 }
             }
         }
 
-        for target in targets {
-            self.load_task(&target).await?;
+        for key in targets {
+            Box::pin(self.internal_load_task(&key, &mut FxHashSet::default())).await?;
         }
 
         Ok(())
@@ -668,20 +671,20 @@ impl WorkspaceBuilder {
     #[instrument(name = "load_task", skip(self))]
     async fn internal_load_task(
         &mut self,
-        target: &Target,
-        cycle: &mut FxHashSet<Target>,
+        key: &TaskKey,
+        cycle: &mut FxHashSet<TaskKey>,
     ) -> miette::Result<Option<NodeIndex>> {
-        let target = TaskBuildData::resolve_target(target, &self.project_data)?;
+        let source_id = self.context().sources.primary_id().clone();
 
-        if cycle.contains(&target) {
+        if cycle.contains(key) {
             return Ok(None);
         }
 
         {
-            let Some(build_data) = self.task_data.get(&target) else {
+            let Some(build_data) = self.task_data.get(key) else {
                 return Err(ProjectError::UnknownTask {
-                    task_id: target.get_task_id().unwrap().to_string(),
-                    project_id: target.get_project_id().unwrap().to_string(),
+                    task_id: key.task_id().to_string(),
+                    project_id: key.project_key().project_id().to_string(),
                 }
                 .into());
             };
@@ -694,7 +697,7 @@ impl WorkspaceBuilder {
 
         // Not loaded, resolve the task
         let Some((_, project_index)) = Box::pin(
-            self.internal_load_project(target.get_project_id()?, &mut FxHashSet::default()),
+            self.internal_load_project(key.project_key().project_id(), &mut FxHashSet::default()),
         )
         .await?
         else {
@@ -709,18 +712,19 @@ impl WorkspaceBuilder {
         // Not loaded, insert a temporary node so that we have an index
         let index = self.task_graph.add_node(NodeState::Loading);
 
-        self.task_data.get_mut(&target).unwrap().node_index = Some(index);
+        self.task_data.get_mut(key).unwrap().node_index = Some(index);
 
         // Build the task (remove from project)
-        let mut task = project.tasks.remove(target.get_task_id()?).unwrap();
+        let mut task = project.tasks.remove(key.task_id()).unwrap();
 
-        cycle.insert(target.clone());
+        cycle.insert(key.clone());
 
         // Resolve the task dependencies so we can link edges correctly
         TaskDepsBuilder {
             querent: Box::new(WorkspaceBuilderTasksQuerent {
                 project_data: &self.project_data,
                 projects_by_tag: &self.projects_by_tag,
+                source_id: &source_id,
                 task_data: &self.task_data,
             }),
             project: Some(project),
@@ -731,9 +735,11 @@ impl WorkspaceBuilder {
 
         // Then resolve dependency tasks
         for dep_config in &task.deps {
-            if cycle.contains(&dep_config.target) {
+            let dep_key = TaskKey::from_target(task.source_id.clone(), &dep_config.target)?;
+
+            if cycle.contains(&dep_key) {
                 debug!(
-                    task_target = target.as_str(),
+                    task_target = task.target.as_str(),
                     dependency_target = dep_config.target.as_str(),
                     "Encountered a dependency cycle (from task); will disconnect nodes to avoid recursion",
                 );
@@ -741,9 +747,7 @@ impl WorkspaceBuilder {
                 continue;
             }
 
-            if let Some(dep_index) =
-                Box::pin(self.internal_load_task(&dep_config.target, cycle)).await?
-            {
+            if let Some(dep_index) = Box::pin(self.internal_load_task(&dep_key, cycle)).await? {
                 self.task_graph
                     .add_edge(
                         index,
@@ -1384,6 +1388,8 @@ mod tests {
         let _ghost = task_graph.add_node(NodeState::Loading);
         let build_target = Target::parse("app:build").unwrap();
         let lint_target = Target::parse("app:lint").unwrap();
+        let build_key = TaskKey::from_target(sources.primary_id().clone(), &build_target).unwrap();
+        let lint_key = TaskKey::from_target(sources.primary_id().clone(), &lint_target).unwrap();
         let build_index = task_graph.add_node(NodeState::Loaded(Task {
             id: Id::raw("build"),
             target: build_target.clone(),
@@ -1427,17 +1433,17 @@ mod tests {
 
         assert_eq!(
             graph.tasks.dependencies_of(build_task.as_ref()),
-            vec![lint_target.clone()]
+            vec![lint_key.clone()]
         );
 
         // Weight-based lookups must also resolve the reindexed nodes
         let mut keys = graph.tasks.get_node_keys();
         keys.sort_by_key(|target| target.to_string());
 
-        assert_eq!(keys, vec![build_target, lint_target.clone()]);
+        assert_eq!(keys, vec![build_key, lint_key.clone()]);
         assert_eq!(
             graph.tasks.deep_dependencies_of(build_task.as_ref()),
-            vec![lint_target]
+            vec![lint_key]
         );
     }
 }

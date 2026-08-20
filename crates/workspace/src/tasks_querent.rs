@@ -1,6 +1,7 @@
 use crate::projects_builder::ProjectBuildData;
 use crate::tasks_builder::TaskBuildData;
-use moon_common::Id;
+use moon_common::{Id, SourceRootId};
+use moon_target::TaskKey;
 use moon_task::{Target, TargetTaskScope, TaskOptions};
 use moon_task_builder::TasksQuerent;
 use rustc_hash::FxHashMap;
@@ -8,7 +9,8 @@ use rustc_hash::FxHashMap;
 pub struct WorkspaceBuilderTasksQuerent<'builder> {
     pub project_data: &'builder FxHashMap<Id, ProjectBuildData>,
     pub projects_by_tag: &'builder FxHashMap<Id, Vec<Id>>,
-    pub task_data: &'builder FxHashMap<Target, TaskBuildData>,
+    pub source_id: &'builder SourceRootId,
+    pub task_data: &'builder FxHashMap<TaskKey, TaskBuildData>,
 }
 
 impl TasksQuerent for WorkspaceBuilderTasksQuerent<'_> {
@@ -33,8 +35,9 @@ impl TasksQuerent for WorkspaceBuilderTasksQuerent<'_> {
 
         let results = self
             .task_data
-            .iter()
-            .filter_map(|(target, data)| {
+            .values()
+            .filter_map(|data| {
+                let target = &data.target;
                 let other_project_id = target.get_project_id().ok()?;
                 let other_task_id = target.get_task_id().ok()?;
 
@@ -65,7 +68,10 @@ impl TasksQuerent for WorkspaceBuilderTasksQuerent<'_> {
     }
 
     fn query_task_has_outputs(&self, target: &Target) -> bool {
-        self.task_data.get(target).is_some_and(|d| d.has_outputs)
+        TaskKey::from_target(self.source_id.clone(), target)
+            .ok()
+            .and_then(|key| self.task_data.get(&key))
+            .is_some_and(|data| data.has_outputs)
     }
 }
 

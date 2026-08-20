@@ -6,6 +6,7 @@ use moon_env_var::*;
 use moon_graph_utils::GraphExpanderContext;
 use moon_project::Project;
 use moon_project_graph::ProjectGraph;
+use moon_target::TaskKey;
 use moon_task::{Task, TaskArg, TaskFileInput, TaskFileOutput, TaskGlobInput, TaskGlobOutput};
 use std::mem;
 use std::sync::Arc;
@@ -80,7 +81,8 @@ impl<'graph> TaskExpander<'graph> {
                 continue;
             }
 
-            let dep_task = self.task_lookup.get_task(&dep.target)?;
+            let dep_key = TaskKey::from_target(task.source_id.clone(), &dep.target)?;
+            let dep_task = self.task_lookup.get_task(&dep_key)?;
             if dep_task.output_files.is_empty() && dep_task.output_globs.is_empty() {
                 continue;
             }

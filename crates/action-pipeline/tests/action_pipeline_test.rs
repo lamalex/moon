@@ -135,12 +135,14 @@ mod action_pipeline {
         let sandbox = create_sandbox("pipeline");
         let mocker = WorkspaceMocker::new(sandbox.path()).with_default_projects();
         let local = Arc::new(mocker.mock_workspace_graph().await);
-        let aggregate = Arc::new(WorkspaceGraph::new_aggregate(
-            Arc::clone(&local.projects),
-            Arc::clone(&local.tasks),
-            Arc::clone(&local.sources),
-            local.task_graphs.clone(),
-        ));
+        let aggregate = Arc::new(
+            WorkspaceGraph::new_aggregate(
+                Arc::clone(&local.projects),
+                Arc::clone(&local.sources),
+                [Arc::clone(&local.tasks)],
+            )
+            .unwrap(),
+        );
         let pipeline = moon_action_pipeline::ActionPipeline::new(
             Arc::new(mocker.mock_app_context()),
             aggregate,

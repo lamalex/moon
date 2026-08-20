@@ -1,6 +1,7 @@
 use crate::commands::graph::run_server;
 use crate::session::{MoonSession, SessionResult};
 use clap::Args;
+use moon_target::TaskKey;
 use moon_task::Target;
 use moon_task_graph::{GraphToDot, GraphToJson};
 use std::sync::Arc;
@@ -39,10 +40,12 @@ pub struct TaskGraphArgs {
 
 #[instrument(skip(session))]
 pub async fn task_graph(session: MoonSession, args: TaskGraphArgs) -> SessionResult {
-    let mut task_graph = session.get_task_graph().await?;
+    let workspace_graph = session.get_aggregate_workspace_graph().await?;
+    let mut task_graph = Arc::clone(&workspace_graph.tasks);
 
     if let Some(target) = &args.target {
-        task_graph = Arc::new(task_graph.focus_for(target, args.dependents)?);
+        let key = TaskKey::from_target(workspace_graph.sources.primary_id().clone(), target)?;
+        task_graph = Arc::new(task_graph.focus_for_key(&key, args.dependents)?);
     }
 
     // Force expand all tasks

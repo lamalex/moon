@@ -500,6 +500,25 @@ impl ProjectGraph {
         self.partitioned_graph(ScopePartition::Development)
     }
 
+    /// Return canonical direct outgoing dependencies and their exact scopes.
+    pub fn direct_dependencies_with_scopes(
+        &self,
+        key: &ProjectKey,
+    ) -> miette::Result<Vec<(ProjectKey, DependencyScope)>> {
+        let node = self
+            .nodes
+            .get(key)
+            .ok_or_else(|| miette::miette!("Unknown project {}.", key))?;
+        let mut dependencies = self
+            .graph
+            .edges_directed(node.index, Direction::Outgoing)
+            .map(|edge| (self.indexes[&edge.target()].clone(), *edge.weight()))
+            .collect::<Vec<_>>();
+        dependencies.sort();
+
+        Ok(dependencies)
+    }
+
     /// Return the graph of dependencies for the provided partition. Unlike
     /// the unioned graph, partitioned graphs are guaranteed to be acyclic.
     pub fn partitioned_graph(

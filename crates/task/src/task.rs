@@ -1,11 +1,11 @@
 use crate::task_arg::TaskArg;
 use crate::task_options::TaskOptions;
-use moon_common::{Id, cacheable, path::WorkspaceRelativePathBuf};
+use moon_common::{Id, SourceRootId, cacheable, path::WorkspaceRelativePathBuf};
 use moon_config::{
     EnvMap, Input, Output, TaskCheck, TaskDependencyConfig, TaskOptionRunInCI, TaskPreset,
     TaskType, is_false, schematic::RegexSetting,
 };
-use moon_target::Target;
+use moon_target::{Target, TaskKey};
 use rustc_hash::{FxHashMap, FxHashSet};
 use starbase_utils::glob::{self, GlobWalkOptions, split_patterns};
 use std::fmt;
@@ -97,6 +97,10 @@ cacheable!(
         #[serde(skip_serializing_if = "Vec::is_empty")]
         pub deps: Vec<TaskDependencyConfig>,
 
+        /// Dependency selectors as configured, before source-local expansion.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        pub configured_deps: Vec<TaskDependencyConfig>,
+
         #[serde(skip_serializing_if = "Option::is_none")]
         pub description: Option<String>,
 
@@ -134,6 +138,9 @@ cacheable!(
         #[serde(skip_serializing_if = "Option::is_none")]
         pub script: Option<String>,
 
+        /// Canonical source root that owns this task.
+        pub source_id: SourceRootId,
+
         pub state: TaskState,
 
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -150,6 +157,12 @@ cacheable!(
 );
 
 impl Task {
+    /// Return the canonical identity for this task.
+    pub fn key(&self) -> TaskKey {
+        TaskKey::from_target(self.source_id.clone(), &self.target)
+            .expect("Task targets must be valid canonical identities.")
+    }
+
     /// Create a globset of all input globs to match with.
     pub fn create_globset(&self) -> miette::Result<glob::GlobSet<'_>> {
         // Both inputs/outputs may have a mix of negated and
@@ -368,6 +381,7 @@ impl Default for Task {
             args: vec![],
             checks: vec![],
             deps: vec![],
+            configured_deps: vec![],
             description: None,
             env: EnvMap::default(),
             id: Id::default(),
@@ -381,6 +395,7 @@ impl Default for Task {
             output_globs: FxHashMap::default(),
             preset: None,
             script: None,
+            source_id: SourceRootId::primary(),
             state: TaskState::default(),
             tags: vec![],
             target: Target::default(),

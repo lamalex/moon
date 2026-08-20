@@ -35,7 +35,6 @@ use moon_workspace_graph::WorkspaceGraph;
 use proto_core::ProtoEnvironment;
 use rustc_hash::FxHashMap;
 use starbase::{AppExitCode, AppResult, AppSession};
-use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 use std::future::Future;
@@ -147,8 +146,12 @@ impl MoonSession {
     ) -> miette::Result<ActionGraphBuilder<'graph>> {
         let app_context = self.get_app_context().await?;
         let workspace_graph = self.get_workspace_graph().await?;
+        let aggregate_task_graph = Arc::clone(&self.get_aggregate_workspace_graph().await?.tasks);
 
-        ActionGraphBuilder::new(app_context, workspace_graph, options)
+        Ok(
+            ActionGraphBuilder::new(app_context, workspace_graph, options)?
+                .with_aggregate_task_graph(aggregate_task_graph),
+        )
     }
 
     pub fn build_code_generator(&self) -> CodeGenerator<'_> {
@@ -472,10 +475,7 @@ impl MoonSession {
         source_ids.sort();
 
         let mut project_graphs = vec![Arc::clone(&primary.projects)];
-        let mut task_graphs = BTreeMap::from([(
-            self.sources.primary_id().clone(),
-            Arc::clone(&primary.tasks),
-        )]);
+        let mut task_graphs = vec![Arc::clone(&primary.tasks)];
 
         for source_id in source_ids {
             if &source_id == self.sources.primary_id() {
@@ -486,7 +486,7 @@ impl MoonSession {
                 .get_workspace_graph()
                 .await?;
             project_graphs.push(Arc::clone(&source_graph.projects));
-            task_graphs.insert(source_id, Arc::clone(&source_graph.tasks));
+            task_graphs.push(Arc::clone(&source_graph.tasks));
         }
 
         let projects = Arc::new(ProjectGraph::compose(
@@ -497,10 +497,9 @@ impl MoonSession {
 
         Ok(Arc::new(WorkspaceGraph::new_aggregate(
             projects,
-            Arc::clone(&primary.tasks),
             Arc::clone(&self.sources),
             task_graphs,
-        )))
+        )?))
     }
 }
 

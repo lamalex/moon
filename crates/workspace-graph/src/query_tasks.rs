@@ -66,17 +66,17 @@ impl WorkspaceGraph {
 
         // Don't use `get_all` as it recursively calls `query`,
         // which runs into a deadlock! This should be faster also...
-        for (source_id, graph) in &self.task_graphs {
+        for task in self.tasks.get_all_unexpanded()? {
+            let source_id = &task.source_id;
+
             if matches!(scope, QueryScope::Primary) && source_id != self.sources.primary_id() {
                 continue;
             }
 
-            for task in graph.get_all_unexpanded()? {
-                if (matches!(scope, QueryScope::Primary) || !task.is_internal())
-                    && self.does_task_match_criteria(task, source_id, query)?
-                {
-                    keys.push(Self::task_key(source_id, task)?);
-                }
+            if (matches!(scope, QueryScope::Primary) || !task.is_internal())
+                && self.does_task_match_criteria(task, source_id, query)?
+            {
+                keys.push(task.key());
             }
         }
 

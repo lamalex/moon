@@ -284,6 +284,7 @@ impl WorkspaceMocker {
                 config_loader: &self.config_loader,
                 enabled_toolchains: &enabled_toolchains,
                 monorepo: self.monorepo,
+                source_id: &project.source_id,
                 toolchains_config: &self.toolchains_config,
                 toolchain_registry: toolchain_registry.into(),
                 workspace_root: &self.workspace_root,

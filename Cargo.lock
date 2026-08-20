@@ -5976,6 +5976,7 @@ dependencies = [
  "moon_graph_utils",
  "moon_project",
  "moon_project_graph",
+ "moon_target",
  "moon_task",
  "moon_time",
  "moon_token",

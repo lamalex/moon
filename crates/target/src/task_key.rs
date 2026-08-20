@@ -1,4 +1,4 @@
-use crate::ProjectKey;
+use crate::{ProjectKey, Target};
 use moon_common::{Id, SourceRootId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::{fmt, str::FromStr};
@@ -18,6 +18,14 @@ impl TaskKey {
 
     pub fn primary(project: Id, task: Id) -> miette::Result<Self> {
         Self::new(ProjectKey::new(SourceRootId::primary(), project)?, task)
+    }
+
+    /// Create a canonical task key from source-local target syntax.
+    pub fn from_target(source: SourceRootId, target: &Target) -> miette::Result<Self> {
+        Self::new(
+            ProjectKey::new(source, Id::raw(target.get_project_id()?))?,
+            Id::raw(target.get_task_id()?),
+        )
     }
 
     pub fn project_key(&self) -> &ProjectKey {
