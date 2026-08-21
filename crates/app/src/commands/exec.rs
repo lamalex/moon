@@ -533,11 +533,17 @@ impl ExecWorkflow {
             partition.targets.len()
         ))?;
 
-        for target in partition.targets.values() {
+        for key in partition.targets.values() {
+            let target = Target::new(key.project_key().project_id(), key.task_id())?;
             self.print(format!("\t<id>{}</id>", target.as_str()))?;
         }
 
-        self.targets.extend(partition.targets);
+        for (index, key) in partition.targets {
+            self.targets.insert(
+                index,
+                Target::new(key.project_key().project_id(), key.task_id())?,
+            );
+        }
 
         Ok((action_context, action_graph))
     }

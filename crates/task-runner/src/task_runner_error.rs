@@ -1,5 +1,5 @@
 use miette::Diagnostic;
-use moon_common::{Style, Stylize};
+use moon_common::{SourceRootId, Style, Stylize};
 use moon_process::ProcessError;
 use moon_task::Target;
 use std::path::PathBuf;
@@ -7,6 +7,13 @@ use thiserror::Error;
 
 #[derive(Error, Debug, Diagnostic)]
 pub enum TaskRunnerError {
+    #[diagnostic(code(task_runner::source_mismatch))]
+    #[error("Task source {task_source} does not match app context source {context_source}.")]
+    SourceMismatch {
+        task_source: SourceRootId,
+        context_source: SourceRootId,
+    },
+
     #[diagnostic(code(task_runner::run_failed))]
     #[error(
         "Task {} failed to run.",

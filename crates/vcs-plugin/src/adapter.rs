@@ -6,7 +6,10 @@ use moon_pdk_api::{
     GetVcsImpactsOutput, MoonContext, VcsChangeMask, VcsImpactCompleteness, VcsImpactIntent,
     VcsInitialization,
 };
-use moon_vcs::{ChangedFiles, ChangedStatus, Vcs, VcsHookEnvironment, WorkspaceFiles};
+use moon_vcs::{
+    ChangedFiles, ChangedFilesObservation, ChangedStatus, ImpactCompleteness, Vcs,
+    VcsHookEnvironment, WorkspaceFiles,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,6 +44,17 @@ impl VcsPluginAdapter {
     }
 
     async fn impacts(&self, intent: VcsImpactIntent) -> miette::Result<ChangedFiles> {
+        let observation = self.observe_impacts(intent).await?;
+
+        ensure_impacts_available(&observation)?;
+
+        Ok(observation.files)
+    }
+
+    async fn observe_impacts(
+        &self,
+        intent: VcsImpactIntent,
+    ) -> miette::Result<ChangedFilesObservation> {
         let intent = match intent {
             VcsImpactIntent::Submission {
                 base,
@@ -53,11 +67,7 @@ impl VcsPluginAdapter {
             },
             intent => intent,
         };
-        let output = self.plugin.get_impacts(intent).await?;
-
-        ensure_impacts_available(&output)?;
-
-        changed_files_from_impacts(output)
+        changed_files_from_impacts(self.plugin.get_impacts(intent).await?)
     }
 
     fn baseline(&self) -> Option<&moon_pdk_api::VcsState> {
@@ -92,10 +102,10 @@ impl VcsPluginAdapter {
     }
 }
 
-fn ensure_impacts_available(output: &GetVcsImpactsOutput) -> miette::Result<()> {
+fn ensure_impacts_available(output: &ChangedFilesObservation) -> miette::Result<()> {
     match output.completeness {
-        VcsImpactCompleteness::Exact => Ok(()),
-        VcsImpactCompleteness::Conservative => {
+        ImpactCompleteness::Exact => Ok(()),
+        ImpactCompleteness::Conservative => {
             warn!(
                 diagnostics = ?output.diagnostics,
                 "Source-control provider returned conservative impacts"
@@ -103,7 +113,7 @@ fn ensure_impacts_available(output: &GetVcsImpactsOutput) -> miette::Result<()> 
 
             Ok(())
         }
-        VcsImpactCompleteness::Unavailable => {
+        ImpactCompleteness::Unavailable => {
             let diagnostics = output.diagnostics.join("; ");
 
             Err(if diagnostics.is_empty() {
@@ -154,8 +164,15 @@ fn validate_hook_environment(
     })
 }
 
-fn changed_files_from_impacts(output: GetVcsImpactsOutput) -> miette::Result<ChangedFiles> {
+fn changed_files_from_impacts(
+    output: GetVcsImpactsOutput,
+) -> miette::Result<ChangedFilesObservation> {
     let mut changed = ChangedFiles::default();
+    let completeness = match output.completeness {
+        VcsImpactCompleteness::Exact => ImpactCompleteness::Exact,
+        VcsImpactCompleteness::Conservative => ImpactCompleteness::Conservative,
+        VcsImpactCompleteness::Unavailable => ImpactCompleteness::Unavailable,
+    };
 
     for (path, mask) in output.changes {
         if mask.bits() & !VcsChangeMask::KNOWN_BITS.bits() != 0
@@ -191,7 +208,11 @@ fn changed_files_from_impacts(output: GetVcsImpactsOutput) -> miette::Result<Cha
         );
     }
 
-    Ok(changed)
+    Ok(ChangedFilesObservation {
+        files: changed,
+        completeness,
+        diagnostics: output.diagnostics,
+    })
 }
 
 #[async_trait]
@@ -263,6 +284,10 @@ impl Vcs for VcsPluginAdapter {
         self.impacts(VcsImpactIntent::Working).await
     }
 
+    async fn observe_changed_files(&self) -> miette::Result<ChangedFilesObservation> {
+        self.observe_impacts(VcsImpactIntent::Working).await
+    }
+
     async fn get_changed_files_against_previous_revision(
         &self,
         revision: &str,
@@ -281,12 +306,43 @@ impl Vcs for VcsPluginAdapter {
         .await
     }
 
+    async fn observe_changed_files_against_previous_revision(
+        &self,
+        revision: &str,
+    ) -> miette::Result<ChangedFilesObservation> {
+        let head = if self.is_default_branch(revision) {
+            self.initialization.recorded.id.clone()
+        } else {
+            (!revision.is_empty()).then(|| revision.to_owned())
+        };
+
+        self.observe_impacts(VcsImpactIntent::Submission {
+            base: None,
+            head,
+            include_working: false,
+        })
+        .await
+    }
+
     async fn get_changed_files_between_revisions(
         &self,
         base_revision: &str,
         revision: &str,
     ) -> miette::Result<ChangedFiles> {
         self.impacts(VcsImpactIntent::Submission {
+            base: (!base_revision.is_empty()).then(|| base_revision.to_owned()),
+            head: (!revision.is_empty()).then(|| revision.to_owned()),
+            include_working: revision.is_empty(),
+        })
+        .await
+    }
+
+    async fn observe_changed_files_between_revisions(
+        &self,
+        base_revision: &str,
+        revision: &str,
+    ) -> miette::Result<ChangedFilesObservation> {
+        self.observe_impacts(VcsImpactIntent::Submission {
             base: (!base_revision.is_empty()).then(|| base_revision.to_owned()),
             head: (!revision.is_empty()).then(|| revision.to_owned()),
             include_working: revision.is_empty(),
@@ -423,11 +479,13 @@ mod tests {
         assert_eq!(
             changed
                 .files
+                .files
                 .get(&WorkspaceRelativePathBuf::from("old.txt")),
             Some(&vec![ChangedStatus::Deleted, ChangedStatus::Unstaged])
         );
         assert_eq!(
             changed
+                .files
                 .files
                 .get(&WorkspaceRelativePathBuf::from("new.txt")),
             Some(&vec![ChangedStatus::Added, ChangedStatus::Unstaged])
@@ -451,6 +509,7 @@ mod tests {
 
         assert_eq!(
             changed
+                .files
                 .files
                 .get(&WorkspaceRelativePathBuf::from("mixed.txt")),
             Some(&vec![
@@ -491,7 +550,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(ensure_impacts_available(&output).is_err());
+        assert!(ensure_impacts_available(&changed_files_from_impacts(output).unwrap()).is_err());
     }
 
     #[test]

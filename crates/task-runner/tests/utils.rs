@@ -203,15 +203,20 @@ impl TaskRunnerContainer {
     pub fn pack_archive(&self) -> PathBuf {
         let sandbox = &self.sandbox;
         let file = sandbox.path().join(".moon/cache/outputs/hash123.tar.gz");
+        let key = self.task.key();
 
         let out = format!(
-            ".moon/cache/states/{}/{}/stdout.log",
-            self.project_id, self.task_id,
+            ".moon/cache/states/tasks/{}/{}/{}/stdout.log",
+            key.project_key().source_id(),
+            key.project_key().project_id(),
+            key.task_id(),
         );
 
         let err = format!(
-            ".moon/cache/states/{}/{}/stderr.log",
-            self.project_id, self.task_id,
+            ".moon/cache/states/tasks/{}/{}/{}/stderr.log",
+            key.project_key().source_id(),
+            key.project_key().project_id(),
+            key.task_id(),
         );
 
         let txt = format!("{}/file.txt", self.project_id);

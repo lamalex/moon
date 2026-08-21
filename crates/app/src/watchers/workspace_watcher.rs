@@ -186,6 +186,7 @@ impl WorkspaceWatcher {
             .should_invalidate(&extensions_config);
 
         self.session.extensions_config = Arc::new(extensions_config);
+        self.session.reset_runtime_contexts();
 
         // Invalidate the extensions registry if the extensions config changed
         if invalidate {
@@ -242,6 +243,7 @@ impl WorkspaceWatcher {
             .should_invalidate(&toolchains_config);
 
         self.session.toolchains_config = Arc::new(toolchains_config);
+        self.session.reset_runtime_contexts();
         moon_env_var::GlobalEnvBag::instance().set(
             "PROTO_CLI_VERSION",
             self.session.toolchains_config.proto.version.to_string(),
@@ -316,6 +318,7 @@ impl WorkspaceWatcher {
         }
 
         self.session.workspace_config = workspace_config;
+        self.session.reset_runtime_contexts();
 
         if let Some(discovery) = discovery {
             for source in self.session.source_contexts.values() {

@@ -2,7 +2,7 @@ use crate::task_hasher::TaskHasher;
 use miette::IntoDiagnostic;
 use moon_action::ActionNode;
 use moon_action_context::{ActionContext, TargetState};
-use moon_app_context::AppContext;
+use moon_app_context::{AppContext, SourceRuntimeRegistry};
 use moon_config::{
     DependencyScope, HasherOptimization, ProjectConfig, TaskDependencyCacheStrategy,
     UnresolvedVersionSpec, VersionSpec,
@@ -13,7 +13,8 @@ use moon_pdk_api::{
     MatchesVersion, ParseLockInput, ParseLockOutput, ParseManifestInput, ParseManifestOutput,
 };
 use moon_project::{Project, ProjectFragment};
-use moon_task::{Task, TaskFragment};
+use moon_task::{Task, TaskFragment, TaskKey};
+use moon_task_graph::TaskGraph;
 use moon_toolchain_plugin::ToolchainPlugin;
 use starbase_utils::json::JsonValue;
 use std::collections::BTreeMap;
@@ -21,12 +22,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
+pub struct TaskHashContext<'context> {
+    pub source_runtime_registry: &'context SourceRuntimeRegistry,
+    pub task_graph: &'context TaskGraph,
+}
+
 pub async fn hash_common_task_contents(
     app_context: &AppContext,
     action_context: &ActionContext,
     project: &Project,
     task: &Task,
     node: &ActionNode,
+    hash_context: Option<TaskHashContext<'_>>,
     hasher: &mut ContentHasher,
 ) -> miette::Result<()> {
     let mut task_hasher = TaskHasher::new(
@@ -36,23 +43,47 @@ pub async fn hash_common_task_contents(
         &app_context.workspace_config.hasher,
     );
 
-    if task.script.is_none() && action_context.should_inherit_args(&task.target) {
+    let task_key = match node {
+        ActionNode::RunTask(inner) => inner.key.clone(),
+        _ => task.key(),
+    };
+
+    if task.script.is_none() && action_context.should_inherit_args(&task_key, &task.target) {
         task_hasher.hash_args(&action_context.passthrough_args);
     }
 
     task_hasher.hash_deps({
         let mut deps = BTreeMap::default();
 
-        for dep in &task.deps {
-            if action_context.is_dependency_ignored(&task.target, &dep.target) {
-                deps.insert(&dep.target, "passthrough".into());
-                continue;
-            }
+        if let Some(context) = &hash_context {
+            for dep in context.task_graph.resolved_dependencies_of(&task_key) {
+                let dep_key = &dep.task_key;
 
-            if let Some(entry) = action_context.target_states.get_sync(&dep.target)
-                && let Some(value) = dep_hash_input(dep.cache_strategy, entry.get())
-            {
-                deps.insert(&dep.target, value);
+                if action_context.is_dependency_ignored(&task_key, dep_key) {
+                    deps.insert(dep_key.clone(), "passthrough".into());
+                    continue;
+                }
+
+                if let Some(entry) = action_context.target_states.get_sync(dep_key)
+                    && let Some(value) = dep_hash_input(Some(dep.cache_strategy), entry.get())
+                {
+                    deps.insert(dep_key.clone(), value);
+                }
+            }
+        } else {
+            for dep in &task.deps {
+                let dep_key = TaskKey::from_target(task.source_id.clone(), &dep.target)?;
+
+                if action_context.is_dependency_ignored(&task_key, &dep_key) {
+                    deps.insert(dep_key, "passthrough".into());
+                    continue;
+                }
+
+                if let Some(entry) = action_context.target_states.get_sync(&dep_key)
+                    && let Some(value) = dep_hash_input(dep.cache_strategy, entry.get())
+                {
+                    deps.insert(dep_key, value);
+                }
             }
         }
 
@@ -60,6 +91,16 @@ pub async fn hash_common_task_contents(
     });
 
     task_hasher.hash_inputs().await?;
+
+    if let Some(context) = hash_context {
+        task_hasher
+            .hash_resolved_dependency_outputs(
+                context.source_runtime_registry,
+                context.task_graph,
+                &task_key,
+            )
+            .await?;
+    }
 
     if let ActionNode::RunTask(inner) = node {
         task_hasher.hash_args(&inner.args);

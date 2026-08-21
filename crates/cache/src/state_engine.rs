@@ -1,7 +1,7 @@
 use crate::resolve_path;
 use moon_cache_item::CacheItem;
 use moon_common::path::encode_component;
-use moon_target::{Target, TargetProjectScope, TargetTaskScope};
+use moon_target::TaskKey;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use starbase_utils::{fs, json};
@@ -43,28 +43,12 @@ impl StateEngine {
             .join(format!("tag-{}", encode_component(tag)))
     }
 
-    pub fn get_task_dir(&self, project_id: &str, task_id: &str) -> PathBuf {
-        self.get_project_dir(project_id)
-            .join(encode_component(task_id))
-    }
-
-    pub fn get_target_dir(&self, target: &Target) -> PathBuf {
-        let (scope, value) = target.get_task_scope();
-
-        let name = match scope {
-            TargetTaskScope::Id => value.to_string(),
-            TargetTaskScope::Tag => format!("tag-{value}"),
-        };
-
-        let (scope, value) = target.get_project_scope();
-
-        let dir = match scope {
-            TargetProjectScope::Id => self.get_project_dir(value),
-            TargetProjectScope::Tag => self.get_tag_dir(value),
-            _ => self.get_project_dir("_"),
-        };
-
-        dir.join(encode_component(name))
+    pub fn get_task_dir(&self, key: &TaskKey) -> PathBuf {
+        self.states_dir
+            .join("tasks")
+            .join(encode_component(key.project_key().source_id().as_str()))
+            .join(encode_component(key.project_key().project_id().as_str()))
+            .join(encode_component(key.task_id().as_str()))
     }
 
     pub fn load_state<T>(&self, path: impl AsRef<OsStr>) -> miette::Result<CacheItem<T>>
@@ -74,11 +58,11 @@ impl StateEngine {
         CacheItem::<T>::load(self.resolve_path(path))
     }
 
-    pub fn load_target_state<T>(&self, target: &Target) -> miette::Result<CacheItem<T>>
+    pub fn load_task_state<T>(&self, key: &TaskKey) -> miette::Result<CacheItem<T>>
     where
         T: Default + DeserializeOwned + Serialize,
     {
-        CacheItem::<T>::load(self.get_target_dir(target).join("lastRun.json"))
+        CacheItem::<T>::load(self.get_task_dir(key).join("lastRun.json"))
     }
 
     pub fn save_project_snapshot<T>(&self, project_id: &str, data: &T) -> miette::Result<()>

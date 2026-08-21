@@ -4,7 +4,7 @@ use crate::queries::changed_files::*;
 use crate::queries::tasks::*;
 use crate::session::{MoonSession, SessionResult};
 use clap::Args;
-use moon_affected::{AffectedTracker, DownstreamScope, UpstreamScope};
+use moon_affected::{AffectedTracker, AggregateAffectedTracker, DownstreamScope, UpstreamScope};
 use moon_common::Id;
 use starbase_utils::json;
 use std::collections::BTreeMap;
@@ -83,6 +83,38 @@ pub async fn tasks(session: MoonSession, args: QueryTasksArgs) -> SessionResult 
 
     // Filter down to affected tasks only
     if let Some(by) = &args.affected {
+        if session.sources.len() > 1 {
+            let workspace_graph = session.get_aggregate_workspace_graph().await?;
+            let observations = query_source_changed_files_for_affected(
+                session.get_source_runtime_registry().await?.as_ref(),
+                by.as_ref(),
+            )
+            .await?;
+            let mut tracker =
+                AggregateAffectedTracker::new(workspace_graph.clone(), observations.observations)?;
+            tracker.set_task_scopes(args.upstream, args.downstream);
+
+            if session.workspace_config.experiments.async_affected_tracking {
+                tracker.track_tasks_async().await?;
+            } else {
+                tracker.track_tasks()?;
+            }
+
+            let affected = tracker.build();
+            let tasks = query_tasks_with_keys(&workspace_graph, &options)
+                .await?
+                .into_iter()
+                .filter(|(key, _)| affected.is_task_affected(key))
+                .collect();
+
+            session.console.out.write_line(json::format(
+                &QueryTasksByKeyResult { tasks, options },
+                true,
+            )?)?;
+
+            return Ok(None);
+        }
+
         let workspace_graph = session.get_workspace_graph().await?;
         let vcs = session.get_vcs_adapter().await?;
         let changed_files = query_changed_files_for_affected(&vcs, by.as_ref()).await?;

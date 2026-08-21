@@ -22,10 +22,10 @@ pub fn build_daemon_service(
     let mocker = WorkspaceMocker::new(workspace_root);
 
     DaemonService::new(
-        Arc::new(RwLock::new(DaemonState {
-            app_context: Arc::new(mocker.mock_app_context()),
-            workspace_graph: Arc::new(WorkspaceGraph::default()),
-        })),
+        Arc::new(RwLock::new(DaemonState::new(
+            Arc::new(mocker.mock_app_context()),
+            Arc::new(WorkspaceGraph::default()),
+        ))),
         endpoint,
         pid,
         shutdown_tx,
@@ -53,10 +53,7 @@ async fn test_server_defers_when_ownership_lock_held() {
     app_context.daemon_dir = daemon_dir.clone();
 
     let result = start_daemon_server(
-        DaemonState {
-            app_context: Arc::new(app_context),
-            workspace_graph: Arc::new(WorkspaceGraph::default()),
-        },
+        DaemonState::new(Arc::new(app_context), Arc::new(WorkspaceGraph::default())),
         vec![],
     )
     .await;
@@ -233,10 +230,7 @@ mod unix_rpc {
         app_context.daemon_dir = daemon_dir;
 
         let result = start_daemon_server(
-            DaemonState {
-                app_context: Arc::new(app_context),
-                workspace_graph: Arc::new(WorkspaceGraph::default()),
-            },
+            DaemonState::new(Arc::new(app_context), Arc::new(WorkspaceGraph::default())),
             vec![],
         )
         .await;

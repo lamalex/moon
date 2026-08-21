@@ -1,6 +1,8 @@
 use moon_cache::*;
 use moon_common::path::WorkspaceRelativePathBuf;
+use moon_common::{Id, SourceRootId};
 use moon_env_var::GlobalEnvBag;
+use moon_target::{ProjectKey, TaskKey};
 use starbase_sandbox::{Sandbox, create_empty_sandbox};
 
 fn create_engine(sandbox: &Sandbox) -> CacheEngine {
@@ -231,4 +233,24 @@ mod cache_engine {
             }
         }
     }
+}
+
+#[test]
+fn task_state_directories_are_source_qualified() {
+    let sandbox = create_empty_sandbox();
+    let engine = create_engine(&sandbox);
+    let key = |source| {
+        TaskKey::new(
+            ProjectKey::new(SourceRootId::new(source).unwrap(), Id::raw("app")).unwrap(),
+            Id::raw("build"),
+        )
+        .unwrap()
+    };
+
+    let first = engine.state.get_task_dir(&key("first"));
+    let second = engine.state.get_task_dir(&key("second"));
+
+    assert_ne!(first, second);
+    assert!(first.ends_with("states/tasks/first/app/build"));
+    assert!(second.ends_with("states/tasks/second/app/build"));
 }

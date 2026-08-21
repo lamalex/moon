@@ -531,8 +531,11 @@ pub fn register_feature_flags(_config: &WorkspaceConfig) -> miette::Result<()> {
 mod tests {
     use super::*;
     use crate::SourceVcsState;
-    use moon_common::Id;
+    use moon_app_context::{SourceRuntime, SourceRuntimeRegistry};
+    use moon_common::{Id, path::WorkspaceRelativePathBuf};
+    use moon_console::Console;
     use starbase_sandbox::create_empty_sandbox;
+    use version_spec::Version;
 
     async fn discover(
         primary_config: &str,
@@ -738,6 +741,7 @@ workspaces:
 ",
         );
         sandbox.create_file("web/.moon/workspace.yml", "id: acme/web");
+        sandbox.create_file("web/source-only.txt", "from child");
         sandbox.create_file(
             "web/.moon/tasks/child.yml",
             r"
@@ -802,5 +806,66 @@ child-extension:
             }
             _ => panic!("Source VCS state must be cached."),
         }
+
+        let console = Arc::new(Console::new(true));
+        let first_app = web
+            .get_app_context(Version::parse("1.0.0").unwrap(), Arc::clone(&console))
+            .await
+            .unwrap();
+        let second_app = web
+            .get_app_context(Version::parse("1.0.0").unwrap(), console)
+            .await
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first_app, &second_app));
+        assert!(Arc::ptr_eq(&first_app.cache_engine, &first_cache));
+        assert!(Arc::ptr_eq(
+            &first_app.extension_registry,
+            &first_extensions
+        ));
+        assert!(Arc::ptr_eq(
+            &first_app.toolchain_registry,
+            &first_toolchains
+        ));
+        match web.vcs_state().unwrap() {
+            SourceVcsState::Ready(vcs) => assert!(Arc::ptr_eq(&first_app.vcs, &vcs)),
+            SourceVcsState::Failed(_) => panic!("Expected child VCS to be available."),
+        }
+
+        let mut primary = (*first_app).clone();
+        primary.source_id = discovery.sources.primary_id().clone();
+        primary.workspace_root = primary_root;
+        let registry = SourceRuntimeRegistry::new(
+            Arc::new(primary),
+            [(
+                first_app.source_id.clone(),
+                SourceRuntime::Available(Arc::clone(&first_app)),
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(registry.len(), 2);
+        assert_eq!(
+            registry.get_primary().source_id,
+            SourceRootId::new("acme/platform").unwrap()
+        );
+        assert!(Arc::ptr_eq(
+            registry
+                .get(&SourceRootId::new("acme/web").unwrap())
+                .unwrap(),
+            &first_app
+        ));
+
+        let file = WorkspaceRelativePathBuf::from("source-only.txt");
+        let hashes = registry
+            .hash_files_for_source(
+                &SourceRootId::new("acme/web").unwrap(),
+                std::slice::from_ref(&file),
+            )
+            .await
+            .unwrap();
+        let direct_hashes = first_cache.hash_files(&web.root, &[file]).await.unwrap();
+        assert_eq!(hashes, direct_hashes);
+        assert_eq!(hashes.len(), 1);
     }
 }

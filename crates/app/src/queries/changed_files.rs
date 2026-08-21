@@ -1,13 +1,17 @@
 use crate::app_options::AffectedOption;
 use miette::IntoDiagnostic;
-use moon_common::is_ci;
+use moon_app_context::{SourceRuntime, SourceRuntimeRegistry};
 use moon_common::path::{WorkspaceRelativePathBuf, standardize_separators};
+use moon_common::{SourcePathBuf, SourceRootId, is_ci};
 use moon_env_var::GlobalEnvBag;
-use moon_vcs::{BoxedVcs, ChangedFiles, ChangedStatus};
+use moon_vcs::{
+    BoxedVcs, ChangedFiles, ChangedFilesObservation, ChangedStatus, ImpactCompleteness, Vcs,
+};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use starbase_styles::color;
 use starbase_utils::json;
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read, stdin};
 use tracing::{debug, warn};
 
@@ -45,6 +49,13 @@ pub struct QueryChangedFilesResult {
     pub files: FxHashSet<WorkspaceRelativePathBuf>,
     pub options: QueryChangedFilesOptions,
     pub shallow: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct SourceChangedFilesQuery {
+    pub observations: BTreeMap<SourceRootId, ChangedFilesObservation<SourcePathBuf>>,
+    pub completeness: ImpactCompleteness,
+    pub diagnostics: Vec<String>,
 }
 
 // If we're in a shallow checkout, many diff commands will fail
@@ -202,15 +213,20 @@ async fn query_changed_files_with_stdin(
     vcs: &BoxedVcs,
     options: QueryChangedFilesOptions,
 ) -> miette::Result<QueryChangedFilesResult> {
+    if let Some(result) = read_changed_files_from_stdin()? {
+        return Ok(result);
+    }
+
+    query_changed_files_without_stdin(vcs, options).await
+}
+
+fn read_changed_files_from_stdin() -> miette::Result<Option<QueryChangedFilesResult>> {
     let mut buffer = String::new();
 
-    // Only read piped data when stdin is not a TTY,
-    // otherwise the process will hang indefinitely waiting for EOF.
     if !stdin().is_terminal() {
         stdin().read_to_string(&mut buffer).into_diagnostic()?;
     }
 
-    // If piped via stdin, parse and use it
     if !buffer.is_empty() {
         // As JSON
         if buffer.starts_with('{') {
@@ -218,7 +234,7 @@ async fn query_changed_files_with_stdin(
 
             let result: QueryChangedFilesResult = json::parse(&buffer)?;
 
-            return Ok(result);
+            return Ok(Some(result));
         }
         // As lines
         else {
@@ -227,14 +243,14 @@ async fn query_changed_files_with_stdin(
             let files =
                 FxHashSet::from_iter(buffer.split('\n').map(WorkspaceRelativePathBuf::from));
 
-            return Ok(QueryChangedFilesResult {
+            return Ok(Some(QueryChangedFilesResult {
                 files,
                 ..Default::default()
-            });
+            }));
         }
     }
 
-    query_changed_files_without_stdin(vcs, options).await
+    Ok(None)
 }
 
 pub async fn query_changed_files_for_affected(
@@ -256,4 +272,221 @@ pub async fn query_changed_files_for_affected(
     query_changed_files(vcs, options)
         .await
         .map(|result| result.files)
+}
+
+pub async fn query_source_changed_files_for_affected(
+    runtimes: &SourceRuntimeRegistry,
+    by: Option<&AffectedOption>,
+) -> miette::Result<SourceChangedFilesQuery> {
+    let ci = is_ci();
+    let mut options = QueryChangedFilesOptions {
+        default_branch: ci,
+        local: !ci,
+        stdin: true,
+        ..Default::default()
+    };
+
+    if let Some(by) = by {
+        options.apply_affected(by);
+    }
+
+    let stdin_result = read_changed_files_from_stdin()?;
+    let primary_id = runtimes.get_primary().source_id.clone();
+    let mut result = SourceChangedFilesQuery::default();
+
+    for (source_id, runtime) in runtimes.iter() {
+        let observation = if let Some(stdin_result) = &stdin_result {
+            changed_files_observation_from_stdin(source_id, &primary_id, stdin_result)
+        } else {
+            match runtime {
+                SourceRuntime::Available(context) => {
+                    match query_changed_files_observation(context.vcs.as_ref().as_ref(), &options)
+                        .await
+                    {
+                        Ok(observation) => observation,
+                        Err(error) => ChangedFilesObservation::unavailable(error.to_string()),
+                    }
+                }
+                SourceRuntime::Unavailable(reason) => {
+                    ChangedFilesObservation::unavailable(reason.to_string())
+                }
+            }
+        };
+
+        let qualified = qualify_changed_files_observation(source_id, observation);
+
+        result.completeness = result.completeness.max(qualified.completeness);
+        result.diagnostics.extend(
+            qualified
+                .diagnostics
+                .iter()
+                .map(|diagnostic| format!("{source_id}: {diagnostic}")),
+        );
+        result.observations.insert(source_id.clone(), qualified);
+    }
+
+    result.diagnostics.sort();
+    result.diagnostics.dedup();
+
+    Ok(result)
+}
+
+fn changed_files_observation_from_stdin(
+    source_id: &SourceRootId,
+    primary_id: &SourceRootId,
+    stdin_result: &QueryChangedFilesResult,
+) -> ChangedFilesObservation {
+    if source_id != primary_id {
+        return ChangedFilesObservation::unavailable(
+            "Changed files supplied through stdin are scoped to the primary source; changed files for this source are unavailable.",
+        );
+    }
+
+    let mut files = ChangedFiles::default();
+
+    for file in &stdin_result.files {
+        files.files.insert(file.clone(), vec![ChangedStatus::All]);
+    }
+
+    ChangedFilesObservation::exact(files)
+}
+
+fn qualify_changed_files_observation(
+    source_id: &SourceRootId,
+    observation: ChangedFilesObservation,
+) -> ChangedFilesObservation<SourcePathBuf> {
+    let mut qualified = ChangedFilesObservation {
+        files: ChangedFiles::default(),
+        completeness: observation.completeness,
+        diagnostics: observation.diagnostics,
+    };
+
+    for (path, statuses) in observation.files.files {
+        qualified
+            .files
+            .files
+            .insert(SourcePathBuf::new(source_id.clone(), path), statuses);
+    }
+
+    qualified
+}
+
+async fn query_changed_files_observation(
+    vcs: &(dyn Vcs + Send + Sync),
+    options: &QueryChangedFilesOptions,
+) -> miette::Result<ChangedFilesObservation> {
+    let bag = GlobalEnvBag::instance();
+    let default_branch = vcs.get_default_branch().await?;
+    let current_branch = vcs.get_local_branch().await?;
+    let base_value = bag
+        .get("MOON_BASE")
+        .filter(|value| !value.is_empty())
+        .or(options.base.clone())
+        .filter(|value| !value.is_empty());
+    let base = base_value.as_deref().unwrap_or(&default_branch);
+    let head_value = bag
+        .get("MOON_HEAD")
+        .filter(|value| !value.is_empty())
+        .or(options.head.clone())
+        .filter(|value| !value.is_empty());
+    let head = head_value.as_deref().unwrap_or("HEAD");
+    let previous = base_value.is_none()
+        && head_value.is_none()
+        && vcs.is_default_branch(&current_branch)
+        && options.default_branch;
+
+    if base_value.is_none() && vcs.is_shallow_checkout().await? {
+        return Ok(ChangedFilesObservation::unavailable(
+            "A full source-control history is required to determine affected files.",
+        ));
+    }
+
+    let only_local = options.local && base_value.is_none() && head_value.is_none();
+    let mut observation = ChangedFilesObservation::default();
+
+    if !only_local {
+        observation.merge(if previous {
+            vcs.observe_changed_files_against_previous_revision(&default_branch)
+                .await?
+        } else {
+            vcs.observe_changed_files_between_revisions(base, head)
+                .await?
+        });
+    }
+
+    if head_value.is_none() {
+        observation.merge(vcs.observe_changed_files().await?);
+    }
+
+    if !options.status.is_empty() {
+        observation.files.files.retain(|_, statuses| {
+            options
+                .status
+                .iter()
+                .any(|status| statuses.contains(status))
+        });
+    }
+
+    observation.files.files = observation
+        .files
+        .files
+        .into_iter()
+        .map(|(file, statuses)| {
+            (
+                WorkspaceRelativePathBuf::from(standardize_separators(&file)),
+                statuses,
+            )
+        })
+        .collect();
+
+    Ok(observation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdin_changed_files_remain_exact_and_primary_scoped() {
+        let primary_id = SourceRootId::primary();
+        let path = WorkspaceRelativePathBuf::from("packages/app/src/main.ts");
+        let stdin_result = QueryChangedFilesResult {
+            files: FxHashSet::from_iter([path.clone()]),
+            ..Default::default()
+        };
+
+        let observation = qualify_changed_files_observation(
+            &primary_id,
+            changed_files_observation_from_stdin(&primary_id, &primary_id, &stdin_result),
+        );
+
+        assert_eq!(observation.completeness, ImpactCompleteness::Exact);
+        assert_eq!(
+            observation
+                .files
+                .files
+                .get(&SourcePathBuf::new(primary_id, path)),
+            Some(&vec![ChangedStatus::All])
+        );
+        assert!(observation.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn stdin_marks_non_primary_sources_unavailable() {
+        let primary_id = SourceRootId::primary();
+        let child_id = SourceRootId::new("child").unwrap();
+        let stdin_result = QueryChangedFilesResult {
+            files: FxHashSet::from_iter([WorkspaceRelativePathBuf::from("primary.txt")]),
+            ..Default::default()
+        };
+        let observation = qualify_changed_files_observation(
+            &child_id,
+            changed_files_observation_from_stdin(&child_id, &primary_id, &stdin_result),
+        );
+
+        assert_eq!(observation.completeness, ImpactCompleteness::Unavailable);
+        assert!(observation.files.files.is_empty());
+        assert_eq!(observation.diagnostics.len(), 1);
+        assert!(observation.diagnostics[0].contains("scoped to the primary source"));
+    }
 }

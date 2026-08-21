@@ -1,11 +1,13 @@
+use moon_app_context::AppContext;
 use moon_cache::{CacheContext, CacheEngine};
 use moon_cache_local::LocalStorage;
 use moon_cache_remote::{GrpcRemoteStorage, HttpRemoteStorage};
 use moon_common::{SourceAlias, SourceRegistry, SourceRootId};
 use moon_config::{
-    ExtensionsConfig, InheritedTasksManager, RemoteApi, ToolchainsConfig, WorkspaceConfig,
+    ExtensionsConfig, InheritedTasksManager, RemoteApi, ToolchainsConfig, Version, WorkspaceConfig,
 };
 use moon_config_loader::ConfigLoader;
+use moon_console::Console;
 use moon_env::MoonEnvironment;
 use moon_env_var::GlobalEnvBag;
 use moon_extension_plugin::ExtensionRegistry;
@@ -78,6 +80,7 @@ pub struct SourceContext {
     pub working_dir: PathBuf,
     pub workspace_config: Arc<WorkspaceConfig>,
 
+    app_context: Arc<OnceCell<Arc<AppContext>>>,
     cache_engine: Arc<OnceCell<Arc<CacheEngine>>>,
     extension_registry: Arc<OnceCell<Arc<ExtensionRegistry>>>,
     toolchain_registry: Arc<OnceCell<Arc<ToolchainRegistry>>>,
@@ -101,6 +104,7 @@ impl SourceContext {
         failures: Vec<SourceLoadFailure>,
     ) -> Self {
         Self {
+            app_context: Arc::new(OnceCell::new()),
             cache_engine: Arc::new(OnceCell::new()),
             config_loader,
             extension_registry: Arc::new(OnceCell::new()),
@@ -119,6 +123,61 @@ impl SourceContext {
             workspace_config,
             workspace_graph: Arc::new(OnceCell::new()),
         }
+    }
+
+    pub async fn get_app_context(
+        &self,
+        cli_version: Version,
+        console: Arc<Console>,
+    ) -> miette::Result<Arc<AppContext>> {
+        self.app_context
+            .get_or_try_init(async || {
+                if !self.failures.is_empty() {
+                    let reasons = self
+                        .failures
+                        .iter()
+                        .map(|failure| format!("{}: {}", failure.stage, failure.message))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+
+                    return Err(miette::miette!(
+                        "Source {} failed to load: {reasons}",
+                        self.id
+                    ));
+                }
+
+                let vcs = match self.initialize_vcs().await {
+                    SourceVcsState::Ready(vcs) => vcs,
+                    SourceVcsState::Failed(reason) => {
+                        return Err(miette::miette!(
+                            "Source {} VCS initialization failed: {reason}",
+                            self.id
+                        ));
+                    }
+                };
+
+                Ok(Arc::new(AppContext {
+                    cli_version,
+                    source_id: self.id.clone(),
+                    moon_env: Arc::clone(&self.moon_env),
+                    proto_env: Arc::clone(&self.proto_env),
+                    cache_engine: self.get_cache_engine().await?,
+                    config_exts: self.config_loader.extensions.clone(),
+                    console,
+                    vcs,
+                    extensions_config: Arc::clone(&self.extensions_config),
+                    toolchains_config: Arc::clone(&self.toolchains_config),
+                    workspace_config: Arc::clone(&self.workspace_config),
+                    extension_registry: self.get_extension_registry().await?,
+                    toolchain_registry: self.get_toolchain_registry().await?,
+                    config_dir: self.config_loader.dir.clone(),
+                    daemon_dir: self.config_loader.dir.join("cache").join("daemon"),
+                    working_dir: self.working_dir.clone(),
+                    workspace_root: self.root.clone(),
+                }))
+            })
+            .await
+            .map(Arc::clone)
     }
 
     pub async fn get_cache_engine(&self) -> miette::Result<Arc<CacheEngine>> {

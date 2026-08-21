@@ -1,5 +1,5 @@
 use moon_cache::CacheEngine;
-use moon_common::path::WorkspaceRelativePathBuf;
+use moon_common::{SourceRootId, path::WorkspaceRelativePathBuf};
 use moon_config::{ExtensionsConfig, ToolchainsConfig, Version, WorkspaceConfig};
 use moon_console::Console;
 use moon_env::MoonEnvironment;
@@ -14,6 +14,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct AppContext {
     pub cli_version: Version,
+    pub source_id: SourceRootId,
     pub moon_env: Arc<MoonEnvironment>,
     pub proto_env: Arc<ProtoEnvironment>,
 

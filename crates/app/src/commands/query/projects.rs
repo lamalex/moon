@@ -4,7 +4,7 @@ use crate::queries::changed_files::*;
 use crate::queries::projects::*;
 use crate::session::{MoonSession, SessionResult};
 use clap::Args;
-use moon_affected::{AffectedTracker, DownstreamScope, UpstreamScope};
+use moon_affected::{AffectedTracker, AggregateAffectedTracker, DownstreamScope, UpstreamScope};
 use starbase_utils::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -87,6 +87,40 @@ pub async fn projects(session: MoonSession, args: QueryProjectsArgs) -> SessionR
 
     // Filter down to affected projects only
     if let Some(by) = &args.affected {
+        if session.sources.len() > 1 {
+            let workspace_graph = session.get_aggregate_workspace_graph().await?;
+            let observations = query_source_changed_files_for_affected(
+                session.get_source_runtime_registry().await?.as_ref(),
+                by.as_ref(),
+            )
+            .await?;
+            let mut tracker = AggregateAffectedTracker::new(
+                Arc::clone(&workspace_graph),
+                observations.observations,
+            )?;
+            tracker.set_project_scopes(args.upstream, args.downstream);
+
+            if session.workspace_config.experiments.async_affected_tracking {
+                tracker.track_projects_async().await?;
+            } else {
+                tracker.track_projects()?;
+            }
+
+            let affected = tracker.build();
+            let projects = query_projects_with_keys(&workspace_graph, &options)
+                .await?
+                .into_iter()
+                .filter(|(key, _)| affected.is_project_affected(key))
+                .collect::<BTreeMap<_, _>>();
+
+            session.console.out.write_line(json::format(
+                &QueryProjectsByKeyResult { projects, options },
+                true,
+            )?)?;
+
+            return Ok(None);
+        }
+
         let workspace_graph = session.get_workspace_graph().await?;
         let vcs = session.get_vcs_adapter().await?;
         let changed_files = query_changed_files_for_affected(&vcs, by.as_ref()).await?;

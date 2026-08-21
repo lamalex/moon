@@ -1,7 +1,7 @@
 use indexmap::IndexMap;
 use moon_common::path::WorkspaceRelativePathBuf;
 use moon_common::{Id, is_test_env};
-use moon_target::Target;
+use moon_target::{Target, TaskKey};
 use moon_toolchain::{ToolchainSpec, VersionSpec};
 use rustc_hash::FxHasher;
 use serde::Serialize;
@@ -56,18 +56,28 @@ pub struct RunTaskNode {
     pub interactive: bool, // Interactive with stdin
     pub persistent: bool,  // Never terminates
     pub priority: u8,
+    pub key: TaskKey,
     pub target: Target,
     pub id: Option<u64>, // For action graph states
 }
 
 impl RunTaskNode {
     pub fn new(target: Target) -> Self {
+        Self::new_with_key(
+            TaskKey::from_target(Default::default(), &target)
+                .expect("Run task targets must be project and task qualified"),
+            target,
+        )
+    }
+
+    pub fn new_with_key(key: TaskKey, target: Target) -> Self {
         Self {
             args: vec![],
             env: IndexMap::default(),
             interactive: false,
             persistent: false,
             priority: 2, // normal
+            key,
             target,
             id: None,
         }
@@ -76,6 +86,10 @@ impl RunTaskNode {
     fn calculate_id(&mut self) {
         let mut hasher = FxHasher::default();
         hasher.write(self.target.as_str().as_bytes());
+
+        if self.key.project_key().source_id() != &Default::default() {
+            hasher.write(self.key.project_key().source_id().as_str().as_bytes());
+        }
 
         if self.persistent {
             hasher.write_u8(100);
@@ -263,6 +277,10 @@ impl Hash for ActionNode {
             // For tasks with passthrough arguments and environment variables,
             // we need to ensure the hash is more unique in the graph
             Self::RunTask(inner) => {
+                if inner.key.project_key().source_id() != &Default::default() {
+                    inner.key.project_key().source_id().hash(state);
+                }
+
                 for arg in &inner.args {
                     state.write(arg.as_bytes());
                 }

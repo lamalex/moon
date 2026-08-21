@@ -16,7 +16,9 @@ use moon_exec_plan::{ExecutionPlan, TargetsBlock};
 use moon_pdk_api::{DefineRequirementsInput, LocateDependenciesRootInput};
 use moon_project::{Project, ProjectError};
 use moon_query::{Criteria, build_query};
-use moon_task::{Target, TargetError, TargetLocator, TargetProjectScope, TargetTaskScope, Task};
+use moon_task::{
+    Target, TargetError, TargetLocator, TargetProjectScope, TargetTaskScope, Task, TaskKey,
+};
 use moon_toolchain::{DependenciesWorkspace, DependenciesWorkspaceRole, ToolchainSpec};
 use moon_workspace_graph::projects::ProjectGraphError;
 use moon_workspace_graph::tasks::TaskGraph;
@@ -83,7 +85,7 @@ impl Default for RunRequirements {
 
 #[derive(Debug, Default)]
 pub struct RunPartition {
-    pub targets: FxHashMap<NodeIndex, Target>,
+    pub targets: FxHashMap<NodeIndex, TaskKey>,
     pub size: Option<usize>,
 }
 
@@ -139,13 +141,13 @@ pub struct ActionGraphBuilder<'query> {
     changed_files: Option<FxHashSet<WorkspaceRelativePathBuf>>,
 
     // Target tracking
-    ignored_dependencies: FxHashMap<Target, FxHashSet<Target>>,
+    ignored_dependencies: FxHashMap<TaskKey, FxHashSet<TaskKey>>,
     // Tasks whose dependents were out of scope when their node was created.
     // Consumed when the task is revisited with dependents in scope, since the
     // node-exists early return would otherwise skip the expansion entirely.
-    ignored_dependents: FxHashSet<Target>,
-    passthrough_targets: FxHashSet<Target>,
-    primary_targets: FxHashSet<Target>,
+    ignored_dependents: FxHashSet<TaskKey>,
+    passthrough_targets: FxHashSet<TaskKey>,
+    primary_targets: FxHashSet<TaskKey>,
 
     // Serial ordering edges added by `try_link_requirements`. Tracked so the
     // serial subtree walk doesn't follow them as if they were real dependency
@@ -195,7 +197,7 @@ impl<'query> ActionGraphBuilder<'query> {
 
         if !self.passthrough_targets.is_empty() {
             for target in mem::take(&mut self.passthrough_targets) {
-                context.set_target_state(target, TargetState::Passthrough);
+                context.set_task_state(target, TargetState::Passthrough);
             }
         }
 
@@ -545,7 +547,7 @@ impl<'query> ActionGraphBuilder<'query> {
         {
             // Only track primary targets at the top-level run methods,
             // as these are explicitly called by pipeline consumers!
-            self.primary_targets.insert(task.target.clone());
+            self.primary_targets.insert(task.key());
 
             return Ok(Some(index));
         }
@@ -709,7 +711,7 @@ impl<'query> ActionGraphBuilder<'query> {
 
         for task in tasks {
             if let Some(index) = self.run_task(&task, &reqs).await? {
-                partition.targets.insert(index, task.target.clone());
+                partition.targets.insert(index, task.key());
             }
         }
 
@@ -822,23 +824,15 @@ impl<'query> ActionGraphBuilder<'query> {
         let mut indexes = vec![];
 
         for dep_key in self.workspace_graph.tasks.dependents_of(task) {
-            let dep_target = Target::new(
-                dep_key.project_key().project_id().clone(),
-                dep_key.task_id().clone(),
-            )?;
-            for dep_task in self
-                .internal_resolve_tasks_from_target(&dep_target, true)
-                .await?
-            {
-                // Dependent chains reset the marker, so that deep scopes
-                // keep cascading through transitive dependents
-                let mut dep_state = state.clone();
-                dep_state.via_dependency = false;
+            let dep_task = self.workspace_graph.get_task_by_key(&dep_key)?;
+            // Dependent chains reset the marker, so that deep scopes
+            // keep cascading through transitive dependents
+            let mut dep_state = state.clone();
+            dep_state.via_dependency = false;
 
-                indexes.push(
-                    Box::pin(self.internal_run_task(&dep_task, reqs, None, &mut dep_state)).await?,
-                );
-            }
+            indexes.push(
+                Box::pin(self.internal_run_task(&dep_task, reqs, None, &mut dep_state)).await?,
+            );
         }
 
         Ok(indexes)
@@ -1055,9 +1049,10 @@ impl<'query> ActionGraphBuilder<'query> {
         config: Option<&TaskDependencyConfig>,
         state: &mut RunTaskState,
     ) -> miette::Result<Option<NodeIndex>> {
+        let task_key = task.key();
         let project = self
             .workspace_graph
-            .get_project(task.target.get_project_id()?)?;
+            .get_project_by_key(task_key.project_key())?;
         let mut child_reqs = reqs.clone();
 
         // Abort early if not affected
@@ -1066,7 +1061,7 @@ impl<'query> ActionGraphBuilder<'query> {
         }
 
         // These tasks shouldn't actually run, so filter them out
-        if self.passthrough_targets.contains(&task.target) {
+        if self.passthrough_targets.contains(&task_key) {
             debug!(
                 task_target = task.target.as_str(),
                 "Not running task {} because it has been marked as passthrough",
@@ -1094,7 +1089,7 @@ impl<'query> ActionGraphBuilder<'query> {
 
         // Only apply CI checks when requested
         if reqs.ci_check && !task.should_run(reqs.ci) {
-            self.passthrough_targets.insert(task.target.clone());
+            self.passthrough_targets.insert(task_key.clone());
 
             debug!(
                 task_target = task.target.as_str(),
@@ -1128,18 +1123,19 @@ impl<'query> ActionGraphBuilder<'query> {
             interactive: task.is_interactive() || reqs.interactive,
             persistent: task.is_persistent(),
             priority: task.options.priority.get_level(),
+            key: task_key.clone(),
             target: task.target.to_owned(),
             id: None,
         });
 
         let had_ignored_dependencies = if should_run_dependencies {
-            self.ignored_dependencies.remove(&task.target).is_some()
+            self.ignored_dependencies.remove(&task_key).is_some()
         } else {
             false
         };
 
         let had_ignored_dependents = if should_run_dependents {
-            self.ignored_dependents.remove(&task.target)
+            self.ignored_dependents.remove(&task_key)
         } else {
             false
         };
@@ -1186,8 +1182,14 @@ impl<'query> ActionGraphBuilder<'query> {
                 edges.extend(Box::pin(self.run_task_dependencies(task, &child_reqs, state)).await?);
             } else {
                 self.ignored_dependencies.insert(
-                    task.target.clone(),
-                    task.deps.iter().map(|dep| dep.target.clone()).collect(),
+                    task_key.clone(),
+                    task.deps
+                        .iter()
+                        .map(|dep| {
+                            TaskKey::from_target(task.source_id.clone(), &dep.target)
+                                .expect("Task dependencies must be project and task qualified")
+                        })
+                        .collect(),
                 );
             }
         }
@@ -1200,7 +1202,7 @@ impl<'query> ActionGraphBuilder<'query> {
 
             Box::pin(self.run_task_dependents(task, &child_reqs, state)).await?;
         } else {
-            self.ignored_dependents.insert(task.target.clone());
+            self.ignored_dependents.insert(task_key);
         }
 
         Ok(Some(index))

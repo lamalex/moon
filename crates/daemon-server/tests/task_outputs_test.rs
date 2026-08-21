@@ -4,12 +4,14 @@
 
 #![cfg(unix)]
 
-use moon_app_context::AppContext;
+use moon_app_context::{AppContext, SourceRuntime, SourceRuntimeRegistry};
 use moon_cache_storage::{Manifest, ManifestFile};
-use moon_daemon_client::DaemonClient;
+use moon_common::{SourceRootId, path::WorkspaceRelativePathBuf};
+use moon_daemon_client::{DaemonClient, DaemonTaskRouting};
 use moon_daemon_server::{DaemonService, DaemonState, serve_unix};
 use moon_daemon_utils::endpoint::*;
 use moon_hash::Digest;
+use moon_target::TaskKey;
 use moon_test_utils::{WorkspaceGraph, WorkspaceMocker};
 use starbase_sandbox::{Sandbox, create_empty_sandbox};
 use starbase_utils::fs;
@@ -22,6 +24,7 @@ const LOCAL_BACKEND: &str = "local-cache";
 
 struct TestDaemon {
     app_context: Arc<AppContext>,
+    child_context: Option<Arc<AppContext>>,
     client: DaemonClient,
     sandbox: Sandbox,
     shutdown_tx: broadcast::Sender<()>,
@@ -31,13 +34,52 @@ impl TestDaemon {
     /// Start a daemon whose app context is shared with the test, so assertions
     /// read the same cache the handlers wrote to.
     async fn start() -> Self {
+        Self::start_with_child(false).await
+    }
+
+    async fn start_with_child(include_child: bool) -> Self {
         let sandbox = create_empty_sandbox();
         let daemon_dir = sandbox.path().join("daemon");
 
         fs::create_dir_all(&daemon_dir).unwrap();
 
         let mocker = WorkspaceMocker::new(sandbox.path());
-        let app_context = Arc::new(mocker.mock_app_context());
+        let mut primary_context = mocker.mock_app_context();
+        Arc::make_mut(&mut primary_context.workspace_config)
+            .experiments
+            .native_file_hashing = true;
+        let app_context = Arc::new(primary_context);
+        let child_context = include_child.then(|| {
+            let child_id = SourceRootId::new("child").unwrap();
+            let child_root = sandbox.path().join("child-root");
+            fs::create_dir_all(&child_root).unwrap();
+            let mut context = WorkspaceMocker::new(&child_root).mock_app_context();
+            context.source_id = child_id;
+            Arc::make_mut(&mut context.workspace_config)
+                .experiments
+                .native_file_hashing = true;
+            Arc::new(context)
+        });
+        let source_runtime_registry = Arc::new(
+            SourceRuntimeRegistry::new(
+                Arc::clone(&app_context),
+                child_context
+                    .iter()
+                    .map(|context| {
+                        (
+                            context.source_id.clone(),
+                            SourceRuntime::Available(Arc::clone(context)),
+                        )
+                    })
+                    .chain(include_child.then(|| {
+                        (
+                            SourceRootId::new("unavailable").unwrap(),
+                            SourceRuntime::Unavailable("source failed to load".into()),
+                        )
+                    })),
+            )
+            .unwrap(),
+        );
 
         let endpoint = get_endpoint(&daemon_dir);
         let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
@@ -45,6 +87,7 @@ impl TestDaemon {
         let service = DaemonService::new(
             Arc::new(RwLock::new(DaemonState {
                 app_context: Arc::clone(&app_context),
+                source_runtime_registry,
                 workspace_graph: Arc::new(WorkspaceGraph::default()),
             })),
             endpoint.clone(),
@@ -75,6 +118,7 @@ impl TestDaemon {
 
         Self {
             app_context,
+            child_context,
             client,
             sandbox,
             shutdown_tx,
@@ -156,6 +200,14 @@ fn action_digest() -> Digest {
     Digest::from_bytes(b"fingerprint").unwrap()
 }
 
+fn source_id() -> SourceRootId {
+    SourceRootId::primary()
+}
+
+fn task_key() -> TaskKey {
+    "workspace::app:build".parse().unwrap()
+}
+
 fn manifest_with_output(contents: &'static [u8]) -> Manifest {
     Manifest {
         files: vec![ManifestFile {
@@ -180,7 +232,7 @@ mod archive {
             .client
             .clone()
             .archive_task_outputs(
-                "app:build".into(),
+                DaemonTaskRouting::new(&source_id(), &task_key()),
                 action.clone(),
                 manifest_with_output(b"output"),
                 true,
@@ -204,7 +256,7 @@ mod archive {
             .client
             .clone()
             .archive_task_outputs(
-                "app:build".into(),
+                DaemonTaskRouting::new(&source_id(), &task_key()),
                 action.clone(),
                 manifest_with_output(b"output"),
                 true,
@@ -235,7 +287,13 @@ mod archive {
         daemon
             .client
             .clone()
-            .archive_task_outputs("app:build".into(), action.clone(), manifest, true, false)
+            .archive_task_outputs(
+                DaemonTaskRouting::new(&source_id(), &task_key()),
+                action.clone(),
+                manifest,
+                true,
+                false,
+            )
             .await
             .unwrap();
 
@@ -267,16 +325,7 @@ mod archive {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn drops_the_action_blob_over_the_rpc() {
-        // KNOWN DEFECT, pinned here so a fix trips this test.
-        //
-        // `digest_source` names the fingerprint file that the action digest
-        // addresses. `ActionResult` has no field for it, so the client's
-        // `inherit_source` work is discarded in transit and the daemon never
-        // uploads it. Backends that validate the RE contract then reject the
-        // result with "action digest <hash>/<size> not found in CAS".
-        //
-        // When this is fixed, flip the daemon assertion to match the direct one.
+    async fn stores_the_action_blob_over_the_rpc() {
         let daemon = TestDaemon::start().await;
 
         let mut manifest = manifest_with_output(b"output");
@@ -296,8 +345,7 @@ mod archive {
             "archiving in-process uploads the action blob"
         );
 
-        // ...but going through the daemon loses it. Re-run against a cache with
-        // no action blob present to observe it independently.
+        // Going through the daemon must preserve it as inline digest-safe data.
         let daemon = TestDaemon::start().await;
         let action = Digest::from_bytes(b"other-fingerprint").unwrap();
 
@@ -311,16 +359,31 @@ mod archive {
         daemon
             .client
             .clone()
-            .archive_task_outputs("app:build".into(), action.clone(), manifest, true, false)
+            .archive_task_outputs(
+                DaemonTaskRouting::new(&source_id(), &task_key()),
+                action.clone(),
+                manifest,
+                true,
+                false,
+            )
             .await
             .unwrap();
 
         assert!(daemon.wait_for_manifest(&action).await);
         assert!(
-            !daemon.blob_exists(&action).await,
-            "action blob unexpectedly present — the RPC now carries digest_source, \
-             so update this test to assert it IS uploaded"
+            daemon.blob_exists(&action).await,
+            "the fingerprint action blob must reach the CAS"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_an_unavailable_source_explicitly() {
+        let daemon = TestDaemon::start_with_child(true).await;
+        let unavailable = SourceRootId::new("unavailable").unwrap();
+
+        let result = daemon.client.clone().hash_files(&unavailable, &[]).await;
+
+        assert!(result.is_err());
     }
 }
 
@@ -341,7 +404,7 @@ mod hydrate {
             .client
             .clone()
             .hydrate_task_outputs(
-                "app:build".into(),
+                DaemonTaskRouting::new(&source_id(), &task_key()),
                 action,
                 daemon.load_source_manifest(&action_digest()).await,
                 true,
@@ -374,7 +437,7 @@ mod hydrate {
             .client
             .clone()
             .hydrate_task_outputs(
-                "app:build".into(),
+                DaemonTaskRouting::new(&source_id(), &task_key()),
                 action,
                 daemon.load_source_manifest(&action_digest()).await,
                 true,
@@ -408,7 +471,7 @@ mod hydrate {
             .client
             .clone()
             .hydrate_task_outputs(
-                "app:build".into(),
+                DaemonTaskRouting::new(&source_id(), &task_key()),
                 action_digest(),
                 manifest,
                 true,
@@ -442,7 +505,7 @@ mod hydrate {
             .client
             .clone()
             .hydrate_task_outputs(
-                "app:build".into(),
+                DaemonTaskRouting::new(&source_id(), &task_key()),
                 action,
                 daemon.load_source_manifest(&action_digest()).await,
                 true,
@@ -455,5 +518,140 @@ mod hydrate {
         // mismatch fails the task instead of just re-running it.
         assert!(result.is_err());
         assert!(!daemon.sandbox.path().join("project/out.txt").exists());
+    }
+}
+
+mod source_routing {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hashes_the_same_relative_path_from_the_selected_root() {
+        let daemon = TestDaemon::start_with_child(true).await;
+        let child = daemon.child_context.as_ref().unwrap();
+        let file = WorkspaceRelativePathBuf::from("same.txt");
+
+        std::fs::write(
+            file.to_logical_path(&daemon.app_context.workspace_root),
+            "primary",
+        )
+        .unwrap();
+        std::fs::write(file.to_logical_path(&child.workspace_root), "child").unwrap();
+
+        let primary_hashes = daemon
+            .client
+            .clone()
+            .hash_files(&SourceRootId::primary(), std::slice::from_ref(&file))
+            .await
+            .unwrap();
+        let child_hashes = daemon
+            .client
+            .clone()
+            .hash_files(&child.source_id, std::slice::from_ref(&file))
+            .await
+            .unwrap();
+
+        assert_ne!(primary_hashes[&file], child_hashes[&file]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hydrates_only_into_the_selected_child_root() {
+        let daemon = TestDaemon::start_with_child(true).await;
+        let child = daemon.child_context.as_ref().unwrap();
+        let action = action_digest();
+        let manifest = manifest_with_output(b"child output");
+
+        child
+            .cache_engine
+            .storage
+            .archive_manifest(&action, manifest)
+            .await
+            .unwrap();
+        child
+            .cache_engine
+            .storage
+            .wait_for_background_tasks()
+            .await
+            .unwrap();
+        let source = child
+            .cache_engine
+            .storage
+            .load_manifest(&action)
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest;
+        let child_key: TaskKey = "child::app:build".parse().unwrap();
+
+        let response = daemon
+            .client
+            .clone()
+            .hydrate_task_outputs(
+                DaemonTaskRouting::new(&child.source_id, &child_key),
+                action,
+                source,
+                true,
+                false,
+                LOCAL_BACKEND.into(),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.hydrated);
+        assert_eq!(
+            std::fs::read_to_string(child.workspace_root.join("project/out.txt")).unwrap(),
+            "child output"
+        );
+        assert!(
+            !daemon
+                .app_context
+                .workspace_root
+                .join("project/out.txt")
+                .exists()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_source_task_mismatch_and_unknown_source_before_writing() {
+        let daemon = TestDaemon::start_with_child(true).await;
+        let child = daemon.child_context.as_ref().unwrap();
+        let primary_key = task_key();
+        let unknown_id = SourceRootId::new("unknown").unwrap();
+        let unknown_key: TaskKey = "unknown::app:build".parse().unwrap();
+
+        let mismatch = daemon
+            .client
+            .clone()
+            .hydrate_task_outputs(
+                DaemonTaskRouting::new(&child.source_id, &primary_key),
+                action_digest(),
+                manifest_with_output(b"mismatch"),
+                true,
+                false,
+                LOCAL_BACKEND.into(),
+            )
+            .await;
+        let unknown = daemon
+            .client
+            .clone()
+            .hydrate_task_outputs(
+                DaemonTaskRouting::new(&unknown_id, &unknown_key),
+                action_digest(),
+                manifest_with_output(b"unknown"),
+                true,
+                false,
+                LOCAL_BACKEND.into(),
+            )
+            .await;
+
+        assert!(mismatch.is_err());
+        assert!(unknown.is_err());
+        assert!(!child.workspace_root.join("project/out.txt").exists());
+        assert!(
+            !daemon
+                .app_context
+                .workspace_root
+                .join("project/out.txt")
+                .exists()
+        );
     }
 }

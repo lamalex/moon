@@ -1,4 +1,4 @@
-use crate::changed_files::ChangedFiles;
+use crate::changed_files::{ChangedFiles, ChangedFilesObservation};
 use async_trait::async_trait;
 use miette::IntoDiagnostic;
 use moon_common::path::{WorkspaceRelativePath, WorkspaceRelativePathBuf};
@@ -51,11 +51,29 @@ pub trait Vcs: Debug {
     /// Determine changed files from the local index / working tree.
     async fn get_changed_files(&self) -> miette::Result<ChangedFiles>;
 
+    /// Observe local changes while retaining provider completeness metadata.
+    async fn observe_changed_files(&self) -> miette::Result<ChangedFilesObservation> {
+        Ok(ChangedFilesObservation::exact(
+            self.get_changed_files().await?,
+        ))
+    }
+
     /// Determine changed files between a revision and its self (-1 revision).
     async fn get_changed_files_against_previous_revision(
         &self,
         revision: &str,
     ) -> miette::Result<ChangedFiles>;
+
+    /// Observe changes against the previous revision with completeness metadata.
+    async fn observe_changed_files_against_previous_revision(
+        &self,
+        revision: &str,
+    ) -> miette::Result<ChangedFilesObservation> {
+        Ok(ChangedFilesObservation::exact(
+            self.get_changed_files_against_previous_revision(revision)
+                .await?,
+        ))
+    }
 
     /// Determine changed files between 2 revisions. An empty head
     /// revision implies the current working tree.
@@ -64,6 +82,18 @@ pub trait Vcs: Debug {
         base_revision: &str,
         revision: &str,
     ) -> miette::Result<ChangedFiles>;
+
+    /// Observe changes between revisions with completeness metadata.
+    async fn observe_changed_files_between_revisions(
+        &self,
+        base_revision: &str,
+        revision: &str,
+    ) -> miette::Result<ChangedFilesObservation> {
+        Ok(ChangedFilesObservation::exact(
+            self.get_changed_files_between_revisions(base_revision, revision)
+                .await?,
+        ))
+    }
 
     /// Get the version of the current VCS binary
     async fn get_version(&self) -> miette::Result<Version>;

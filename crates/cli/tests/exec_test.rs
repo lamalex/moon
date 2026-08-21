@@ -24,6 +24,7 @@ fn extract_hash_from_run(fixture: &Path, target_id: &str) -> String {
         engine
             .state
             .states_dir
+            .join("tasks/workspace")
             .join(target_id.replace(':', "/"))
             .join("lastRun.json"),
     )
@@ -998,7 +999,7 @@ mod exec {
             assert!(
                 sandbox
                     .path()
-                    .join(".moon/cache/states")
+                    .join(".moon/cache/states/tasks/workspace")
                     .join(PROJECT_DIR)
                     .join("outputs/lastRun.json")
                     .exists()
@@ -1017,7 +1018,7 @@ mod exec {
 
             let cache_path = sandbox
                 .path()
-                .join(".moon/cache/states")
+                .join(".moon/cache/states/tasks/workspace")
                 .join(PROJECT_DIR)
                 .join("outputs/lastRun.json");
 
@@ -1074,7 +1075,9 @@ mod exec {
                     fs::read_file(
                         sandbox
                             .path()
-                            .join(".moon/cache/states/outputs/noOutput/stdout.log")
+                            .join(
+                                ".moon/cache/states/tasks/workspace/outputs/noOutput/stdout.log",
+                            )
                     )
                     .unwrap(),
                     "No outputs!\n"

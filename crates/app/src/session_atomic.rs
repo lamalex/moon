@@ -1,5 +1,6 @@
 use crate::session::MoonSession;
 use moon_daemon::AtomicDaemonState;
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tracing::debug;
 
@@ -32,9 +33,10 @@ impl MoonSession {
         let session = self.clone();
 
         tokio::spawn(async move {
-            if let Ok(app_context) = session.get_app_context().await {
+            if let Ok(registry) = session.get_source_runtime_registry().await {
                 let mut state = state.write().await;
-                state.app_context = app_context;
+                state.app_context = Arc::clone(registry.get_primary());
+                state.source_runtime_registry = registry;
             }
         })
     }
@@ -46,10 +48,11 @@ impl MoonSession {
 
         tokio::spawn(async move {
             if let Ok(graph) = session.get_workspace_graph().await
-                && let Ok(app_context) = session.get_app_context().await
+                && let Ok(registry) = session.get_source_runtime_registry().await
             {
                 let mut state = state.write().await;
-                state.app_context = app_context;
+                state.app_context = Arc::clone(registry.get_primary());
+                state.source_runtime_registry = registry;
                 state.workspace_graph = graph;
             }
         })
@@ -59,6 +62,7 @@ impl MoonSession {
         debug!("Resetting registries and graphs cache");
 
         self.aggregate_workspace_graph.take();
+        self.reset_runtime_contexts();
         self.extension_registry.take();
         self.toolchain_registry.take();
         self.project_graph.take();
@@ -66,9 +70,15 @@ impl MoonSession {
         self.workspace_graph.take();
     }
 
+    pub(crate) fn reset_runtime_contexts(&mut self) {
+        self.app_context.take();
+        self.source_runtime_registry.take();
+    }
+
     pub fn reset_vcs(&mut self) {
         debug!("Resetting VCS adapter");
 
+        self.reset_runtime_contexts();
         self.vcs_adapter.take();
     }
 }

@@ -194,10 +194,10 @@ mod connect {
 
         let mocker = WorkspaceMocker::new(sandbox.path());
         let service = DaemonService::new(
-            Arc::new(RwLock::new(DaemonState {
-                app_context: Arc::new(mocker.mock_app_context()),
-                workspace_graph: Arc::new(WorkspaceGraph::default()),
-            })),
+            Arc::new(RwLock::new(DaemonState::new(
+                Arc::new(mocker.mock_app_context()),
+                Arc::new(WorkspaceGraph::default()),
+            ))),
             endpoint.clone(),
             std::process::id(),
             shutdown_tx.clone(),
@@ -242,10 +242,10 @@ mod connect {
 
         let mocker = WorkspaceMocker::new(sandbox.path());
         let service = DaemonService::new(
-            Arc::new(RwLock::new(DaemonState {
-                app_context: Arc::new(mocker.mock_app_context()),
-                workspace_graph: Arc::new(WorkspaceGraph::default()),
-            })),
+            Arc::new(RwLock::new(DaemonState::new(
+                Arc::new(mocker.mock_app_context()),
+                Arc::new(WorkspaceGraph::default()),
+            ))),
             endpoint.clone(),
             std::process::id(),
             shutdown_tx.clone(),
@@ -292,10 +292,10 @@ mod connect {
 
         let mocker = WorkspaceMocker::new(sandbox.path());
         let service = DaemonService::new(
-            Arc::new(RwLock::new(DaemonState {
-                app_context: Arc::new(mocker.mock_app_context()),
-                workspace_graph: Arc::new(WorkspaceGraph::default()),
-            })),
+            Arc::new(RwLock::new(DaemonState::new(
+                Arc::new(mocker.mock_app_context()),
+                Arc::new(WorkspaceGraph::default()),
+            ))),
             endpoint.clone(),
             std::process::id(),
             shutdown_tx.clone(),

@@ -1,4 +1,6 @@
-use moon_action::{Action, ActionStatus, Operation};
+use moon_action::{Action, ActionNode, ActionStatus, Operation, RunTaskNode};
+use moon_common::{Id, SourceRootId};
+use moon_target::{ProjectKey, Target, TaskKey};
 
 fn task_op(exit_code: Option<i32>, status: ActionStatus) -> Operation {
     let mut op = Operation::task_execution("cmd");
@@ -9,6 +11,28 @@ fn task_op(exit_code: Option<i32>, status: ActionStatus) -> Operation {
 
     op.finish(status);
     op
+}
+
+#[test]
+fn run_task_identity_is_source_qualified() {
+    let target = Target::parse("app:build").unwrap();
+    let first_key = TaskKey::new(
+        ProjectKey::new(SourceRootId::new("first").unwrap(), Id::raw("app")).unwrap(),
+        Id::raw("build"),
+    )
+    .unwrap();
+    let second_key = TaskKey::new(
+        ProjectKey::new(SourceRootId::new("second").unwrap(), Id::raw("app")).unwrap(),
+        Id::raw("build"),
+    )
+    .unwrap();
+
+    let first = ActionNode::run_task(RunTaskNode::new_with_key(first_key, target.clone()));
+    let second = ActionNode::run_task(RunTaskNode::new_with_key(second_key, target));
+
+    assert_ne!(first, second);
+    assert_ne!(first.get_id(), second.get_id());
+    assert_eq!(first.label(), second.label());
 }
 
 mod get_exit_code {

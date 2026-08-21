@@ -296,7 +296,7 @@ impl<'task> TaskExecutor<'task> {
 
     fn prepare_state(&mut self, context: &ActionContext, report_item: &mut TaskReportItem) {
         let is_ci = is_ci_env();
-        let is_primary = context.is_primary_target(&self.task.target);
+        let is_primary = context.is_primary_task(&self.task.key());
         let is_only_primary = is_primary && context.primary_targets.len() == 1;
 
         // When the primary target, always stream the output for a better developer experience.

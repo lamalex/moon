@@ -1,10 +1,12 @@
 use crate::daemon_client_error::DaemonClientError;
 use hyper_util::rt::TokioIo;
-use moon_common::{color, format_error_chain};
+use moon_common::{SourceRootId, color, format_error_chain, path::WorkspaceRelativePathBuf};
 use moon_daemon_proto::{moon_daemon_client::MoonDaemonClient, *};
 use moon_daemon_utils::endpoint::*;
 use moon_hash::{Digest, InternalDigestExt};
 use moon_manifest::Manifest;
+use moon_target::TaskKey;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io::Error;
 use std::path::Path;
@@ -44,6 +46,21 @@ pub enum HandshakeOutcome {
     /// The daemon is a different moon version or protocol version and should
     /// be stopped and replaced.
     Restart,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DaemonTaskRouting<'a> {
+    pub source_id: &'a SourceRootId,
+    pub task_key: &'a TaskKey,
+}
+
+impl<'a> DaemonTaskRouting<'a> {
+    pub fn new(source_id: &'a SourceRootId, task_key: &'a TaskKey) -> Self {
+        Self {
+            source_id,
+            task_key,
+        }
+    }
 }
 
 fn map_rpc_error(error: Status) -> DaemonClientError {
@@ -203,12 +220,36 @@ impl DaemonClient {
     #[instrument(skip(self, manifest))]
     pub async fn archive_task_outputs(
         &mut self,
-        task_target: String,
+        routing: DaemonTaskRouting<'_>,
         digest: Digest,
-        manifest: Manifest,
+        mut manifest: Manifest,
         include_local: bool,
         include_remote: bool,
     ) -> miette::Result<ArchiveTaskOutputsResponse> {
+        let digest_source = manifest
+            .digest_source
+            .take()
+            .map(|source| -> miette::Result<ManifestDigestSource> {
+                let bytes = match source.bytes {
+                    Some(bytes) => bytes.to_vec(),
+                    None => std::fs::read(source.source_path.ok_or_else(|| {
+                        miette::miette!("Manifest digest source has no bytes or source path.")
+                    })?)
+                    .map_err(|error| miette::miette!(error))?,
+                };
+
+                Ok(ManifestDigestSource {
+                    digest: source.digest.map(|digest| digest.into_external_digest()),
+                    path: source.path.to_string(),
+                    bytes: bytes.into(),
+                })
+            })
+            .transpose()?;
+        let task_target = format!(
+            "{}:{}",
+            routing.task_key.project_key().project_id(),
+            routing.task_key.task_id()
+        );
         let response = with_deadline(
             "ArchiveTaskOutputs",
             WORK_DEADLINE,
@@ -219,6 +260,9 @@ impl DaemonClient {
                     manifest: Some(manifest.into_bazel_action_result(true)),
                     include_local,
                     include_remote,
+                    source_id: routing.source_id.to_string(),
+                    task_key: routing.task_key.to_string(),
+                    digest_source,
                 },
                 WORK_DEADLINE,
             )),
@@ -231,13 +275,18 @@ impl DaemonClient {
     #[instrument(skip(self, manifest))]
     pub async fn hydrate_task_outputs(
         &mut self,
-        task_target: String,
+        routing: DaemonTaskRouting<'_>,
         digest: Digest,
         manifest: Manifest,
         include_local: bool,
         include_remote: bool,
         backend_id: String,
     ) -> miette::Result<HydrateTaskOutputsResponse> {
+        let task_target = format!(
+            "{}:{}",
+            routing.task_key.project_key().project_id(),
+            routing.task_key.task_id()
+        );
         let response = with_deadline(
             "HydrateTaskOutputs",
             WORK_DEADLINE,
@@ -249,6 +298,8 @@ impl DaemonClient {
                     include_local,
                     include_remote,
                     backend_id,
+                    source_id: routing.source_id.to_string(),
+                    task_key: routing.task_key.to_string(),
                 },
                 WORK_DEADLINE,
             )),
@@ -256,6 +307,33 @@ impl DaemonClient {
         .await?;
 
         Ok(response.into_inner())
+    }
+
+    #[instrument(skip(self, files))]
+    pub async fn hash_files(
+        &mut self,
+        source_id: &SourceRootId,
+        files: &[WorkspaceRelativePathBuf],
+    ) -> miette::Result<BTreeMap<WorkspaceRelativePathBuf, String>> {
+        let response = with_deadline(
+            "HashFiles",
+            WORK_DEADLINE,
+            self.inner.hash_files(request_with_deadline(
+                HashFilesRequest {
+                    files: files.iter().map(ToString::to_string).collect(),
+                    source_id: source_id.to_string(),
+                },
+                WORK_DEADLINE,
+            )),
+        )
+        .await?
+        .into_inner();
+
+        Ok(response
+            .files
+            .into_iter()
+            .map(|(path, hash)| (WorkspaceRelativePathBuf::from(path), hash))
+            .collect())
     }
 
     #[instrument(skip(self))]

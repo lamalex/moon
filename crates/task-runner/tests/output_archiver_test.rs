@@ -2,15 +2,24 @@ mod utils;
 
 use moon_blob::Blob;
 use moon_cache::CacheMode;
+use moon_common::SourceRootId;
 use moon_env_var::GlobalEnvBag;
 use moon_hash::Digest;
-use moon_task_runner::output_archiver::ArchiveOutcome;
+use moon_task_runner::output_archiver::{ArchiveOutcome, OutputArchiver};
 use starbase_archive::Archiver;
-use std::fs;
+use std::{fs, sync::Arc};
 use utils::*;
 
 mod output_archiver {
     use super::*;
+
+    #[tokio::test]
+    async fn rejects_a_task_from_another_source() {
+        let mut container = TaskRunnerContainer::new("archive", "file-outputs").await;
+        Arc::make_mut(&mut container.task).source_id = SourceRootId::new("child").unwrap();
+
+        assert!(OutputArchiver::new(&container.app_context, &container.task, None).is_err());
+    }
 
     mod local_legacy {
         use super::*;
@@ -182,12 +191,19 @@ mod output_archiver {
         #[tokio::test(flavor = "multi_thread")]
         async fn includes_std_logs_in_archive() {
             let container = TaskRunnerContainer::new("archive", "file-outputs").await;
+            let key = container.task.key();
+            let state_rel = format!(
+                ".moon/cache/states/tasks/{}/{}/{}",
+                key.project_key().source_id(),
+                key.project_key().project_id(),
+                key.task_id(),
+            );
             container
                 .sandbox
-                .create_file(".moon/cache/states/project/file-outputs/stdout.log", "out");
+                .create_file(format!("{state_rel}/stdout.log"), "out");
             container
                 .sandbox
-                .create_file(".moon/cache/states/project/file-outputs/stderr.log", "err");
+                .create_file(format!("{state_rel}/stderr.log"), "err");
             container.sandbox.create_file("project/file.txt", "");
 
             let archiver = container.create_archiver();
@@ -204,8 +220,8 @@ mod output_archiver {
 
             Archiver::new(&dir, &file).unpack_from_ext().unwrap();
 
-            let err = dir.join(".moon/cache/states/project/file-outputs/stderr.log");
-            let out = dir.join(".moon/cache/states/project/file-outputs/stdout.log");
+            let err = dir.join(format!("{state_rel}/stderr.log"));
+            let out = dir.join(format!("{state_rel}/stdout.log"));
 
             assert!(err.exists());
             assert!(out.exists());

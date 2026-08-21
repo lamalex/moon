@@ -4,7 +4,7 @@ use miette::IntoDiagnostic;
 use moon_app_context::AppContext;
 use moon_cache::{Manifest, StorageOptions};
 use moon_common::color;
-use moon_daemon_client::DaemonClient;
+use moon_daemon_client::{DaemonClient, DaemonTaskRouting};
 use moon_manifest::ManifestPacker;
 use moon_task::Task;
 use starbase_archive::Archiver;
@@ -32,6 +32,14 @@ impl OutputArchiver<'_> {
         task: &'task Arc<Task>,
         daemon_client: Option<DaemonClient>,
     ) -> miette::Result<OutputArchiver<'task>> {
+        if task.source_id != app_context.source_id {
+            return Err(TaskRunnerError::SourceMismatch {
+                task_source: task.source_id.clone(),
+                context_source: app_context.source_id.clone(),
+            }
+            .into());
+        }
+
         Ok(OutputArchiver {
             task,
             app_context,
@@ -83,7 +91,7 @@ impl OutputArchiver<'_> {
             if let Some(mut daemon) = self.daemon_client.clone() {
                 daemon
                     .archive_task_outputs(
-                        self.task.target.to_string(),
+                        DaemonTaskRouting::new(&self.task.source_id, &self.task.key()),
                         state.digest.clone(),
                         manifest,
                         use_local,
@@ -233,7 +241,7 @@ impl OutputArchiver<'_> {
             }
 
             // Also include stdout/stderr logs in the tarball
-            let state_dir = app_context.cache_engine.state.get_target_dir(&task.target);
+            let state_dir = app_context.cache_engine.state.get_task_dir(&task.key());
 
             archive.add_source_file(state_dir.join("stdout.log"), None);
 

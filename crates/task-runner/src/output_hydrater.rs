@@ -4,7 +4,7 @@ use miette::IntoDiagnostic;
 use moon_app_context::AppContext;
 use moon_cache::{Manifest, ManifestSource, ManifestUnpacker, StorageOptions};
 use moon_common::{color, path::WorkspaceRelativePath};
-use moon_daemon_client::DaemonClient;
+use moon_daemon_client::{DaemonClient, DaemonTaskRouting};
 use moon_task::Task;
 use starbase_archive::Archiver;
 use starbase_utils::{fs, glob::GlobSet};
@@ -51,6 +51,14 @@ impl OutputHydrater<'_> {
         task: &'task Arc<Task>,
         daemon_client: Option<DaemonClient>,
     ) -> miette::Result<OutputHydrater<'task>> {
+        if task.source_id != app_context.source_id {
+            return Err(TaskRunnerError::SourceMismatch {
+                task_source: task.source_id.clone(),
+                context_source: app_context.source_id.clone(),
+            }
+            .into());
+        }
+
         Ok(OutputHydrater {
             task_output_globset: GlobSet::new_owned(task.output_globs.keys())?,
             task,
@@ -115,7 +123,7 @@ impl OutputHydrater<'_> {
                 if let Some(mut daemon) = self.daemon_client.clone() {
                     let res = daemon
                         .hydrate_task_outputs(
-                            self.task.target.to_string(),
+                            DaemonTaskRouting::new(&self.task.source_id, &self.task.key()),
                             state.digest.clone(),
                             source.manifest,
                             use_local,

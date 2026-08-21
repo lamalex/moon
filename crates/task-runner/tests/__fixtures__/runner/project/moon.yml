@@ -15,6 +15,20 @@ tasks:
     deps:
       - 'dep'
 
+  has-output-dep:
+    command: noop
+    outputs:
+      - 'file.txt'
+    deps:
+      - target: 'outputs'
+        cacheStrategy: 'outputs'
+
+  has-ignored-output-dep:
+    command: noop
+    deps:
+      - target: 'outputs'
+        cacheStrategy: 'outputs'
+
   no-deps:
     command: noop
 

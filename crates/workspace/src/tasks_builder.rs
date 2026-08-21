@@ -160,5 +160,9 @@ impl WorkspaceTasksBuilder {
         }
 
         task_graph
+            .resolve_source_local_dependencies()
+            .expect("Resolved task dependencies must use valid canonical targets.");
+
+        task_graph
     }
 }

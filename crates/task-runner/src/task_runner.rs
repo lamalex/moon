@@ -7,14 +7,15 @@ use crate::task_executor::TaskExecutor;
 use crate::task_runner_error::TaskRunnerError;
 use moon_action::{ActionNode, ActionStatus, Operation, OperationList, OperationMeta};
 use moon_action_context::{ActionContext, TargetState};
-use moon_app_context::AppContext;
+use moon_app_context::{AppContext, SourceRuntimeRegistry};
 use moon_cache::{CacheItem, StorageOptions};
 use moon_console::TaskReportItem;
 use moon_daemon_client::DaemonClient;
 use moon_hash::{ContentHash, ContentHasher};
 use moon_process::ProcessError;
 use moon_project::Project;
-use moon_task::{Task, TaskCheck, TaskCheckFingerprint, TaskCheckType};
+use moon_task::{Task, TaskCheck, TaskCheckFingerprint, TaskCheckType, TaskKey};
+use moon_task_graph::TaskGraph;
 use moon_task_hasher::*;
 use moon_time::{is_stale, now_millis};
 use starbase_utils::fs;
@@ -32,6 +33,8 @@ pub struct TaskRunner<'task> {
     app_context: &'task Arc<AppContext>,
     project: &'task Arc<Project>,
     pub task: &'task Arc<Task>,
+    source_runtime_registry: Option<Arc<SourceRuntimeRegistry>>,
+    task_graph: Option<Arc<TaskGraph>>,
 
     archiver: OutputArchiver<'task>,
     hydrater: OutputHydrater<'task>,
@@ -58,10 +61,10 @@ impl<'task> TaskRunner<'task> {
         let mut cache = app_context
             .cache_engine
             .state
-            .load_target_state::<TaskRunCacheState>(&task.target)?;
+            .load_task_state::<TaskRunCacheState>(&task.key())?;
 
-        if cache.data.target.is_empty() {
-            cache.data.target = task.target.to_string();
+        if cache.data.task_key.is_none() {
+            cache.data.task_key = Some(task.key());
         }
 
         Ok(Self {
@@ -75,9 +78,25 @@ impl<'task> TaskRunner<'task> {
                 ..Default::default()
             },
             task,
+            source_runtime_registry: None,
+            task_graph: None,
             app_context,
             operations: OperationList::default(),
         })
+    }
+
+    pub fn new_with_hashing_context(
+        app_context: &'task Arc<AppContext>,
+        project: &'task Arc<Project>,
+        task: &'task Arc<Task>,
+        daemon_client: Option<DaemonClient>,
+        task_graph: Arc<TaskGraph>,
+        source_runtime_registry: Arc<SourceRuntimeRegistry>,
+    ) -> miette::Result<Self> {
+        let mut runner = Self::new(app_context, project, task, daemon_client)?;
+        runner.task_graph = Some(task_graph);
+        runner.source_runtime_registry = Some(source_runtime_registry);
+        Ok(runner)
     }
 
     async fn internal_run(
@@ -130,7 +149,8 @@ impl<'task> TaskRunner<'task> {
         context: &ActionContext,
         node: &ActionNode,
     ) -> miette::Result<TaskRunResult> {
-        let is_primary = context.is_primary_target(&self.task.target);
+        let task_key = self.task.key();
+        let is_primary = context.is_primary_task(&task_key);
 
         self.report.output_prefix = Some(context.get_target_prefix(&self.task.target));
         self.report.primary = is_primary;
@@ -142,8 +162,8 @@ impl<'task> TaskRunner<'task> {
 
         match result {
             Ok(maybe_hash) => {
-                context.set_target_state(
-                    &self.task.target,
+                context.set_task_state(
+                    task_key.clone(),
                     self.state.target.take().unwrap_or(TargetState::Passthrough),
                 );
 
@@ -163,8 +183,8 @@ impl<'task> TaskRunner<'task> {
                 })
             }
             Err(error) => {
-                context.set_target_state(
-                    &self.task.target,
+                context.set_task_state(
+                    task_key,
                     self.state.target.take().unwrap_or(TargetState::Failed),
                 );
 
@@ -342,11 +362,13 @@ impl<'task> TaskRunner<'task> {
         }
 
         for dep in &self.task.deps {
-            if context.is_dependency_ignored(&self.task.target, &dep.target) {
+            let dep_key = TaskKey::from_target(self.task.source_id.clone(), &dep.target)?;
+
+            if context.is_dependency_ignored(&self.task.key(), &dep_key) {
                 continue;
             }
 
-            if let Some(dep_state) = context.target_states.get_sync(&dep.target) {
+            if let Some(dep_state) = context.target_states.get_sync(&dep_key) {
                 if dep_state.get().is_complete() {
                     continue;
                 }
@@ -384,6 +406,14 @@ impl<'task> TaskRunner<'task> {
         let hash_engine = &self.app_context.cache_engine.hash;
         let mut hasher = hash_engine.create_hasher(node.label());
         let mut operation = Operation::hash_generation();
+        let hash_context = self
+            .task_graph
+            .as_deref()
+            .zip(self.source_runtime_registry.as_deref())
+            .map(|(task_graph, source_runtime_registry)| TaskHashContext {
+                source_runtime_registry,
+                task_graph,
+            });
 
         // Hash common fields
         hash_common_task_contents(
@@ -392,6 +422,7 @@ impl<'task> TaskRunner<'task> {
             self.project,
             self.task,
             node,
+            hash_context,
             &mut hasher,
         )
         .await?;
@@ -829,7 +860,7 @@ impl<'task> TaskRunner<'task> {
                         .app_context
                         .cache_engine
                         .state
-                        .get_target_dir(&self.task.target);
+                        .get_task_dir(&self.task.key());
                     let err_path = state_dir.join("stderr.log");
                     let out_path = state_dir.join("stdout.log");
 
@@ -932,7 +963,7 @@ impl<'task> TaskRunner<'task> {
             .app_context
             .cache_engine
             .state
-            .get_target_dir(&self.task.target);
+            .get_task_dir(&self.task.key());
         let err_path = state_dir.join("stderr.log");
         let out_path = state_dir.join("stdout.log");
 

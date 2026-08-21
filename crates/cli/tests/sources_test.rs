@@ -44,6 +44,9 @@ tasks:
 tasks:
   build:
     command: echo child
+    inputs:
+      - file: changed.txt
+        content: child
 ",
         );
         sandbox.create_file("web/apps/lib/moon.yml", "{}");
@@ -76,6 +79,29 @@ tasks:
             .success()
             .stdout(predicate::str::contains("\"sourceId\": \"acme/platform\""))
             .stdout(predicate::str::contains("\"sourceId\": \"acme/web\""));
+    }
+
+    #[test]
+    fn aggregate_affected_queries_filter_by_owning_source() {
+        let sandbox = create_sources_sandbox();
+        sandbox.enable_git();
+        sandbox.create_file("web/apps/app/changed.txt", "child change");
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("query").arg("projects").arg("--affected");
+            })
+            .success()
+            .stdout(predicate::str::contains("\"acme/web::app\""))
+            .stdout(predicate::str::contains("\"acme/platform::app\"").not());
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("query").arg("tasks").arg("--affected");
+            })
+            .success()
+            .stdout(predicate::str::contains("\"acme/web::app:build\""))
+            .stdout(predicate::str::contains("\"acme/platform::app:build\"").not());
     }
 
     #[test]

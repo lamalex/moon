@@ -6,8 +6,9 @@ Manymoons is a design and implementation effort. The external configuration and 
 described by this document are intentionally undecided unless explicitly marked otherwise.
 
 Milestone 1, internal source-root qualification, Milestone 2, direct multi-workspace discovery,
-Milestone 3, aggregated querying, Milestone 4, cross-source project dependencies, and Milestone 5,
-the unified task graph, are complete. Milestone 6, cross-source hashing and cache safety, is next.
+Milestone 3, aggregated querying, Milestone 4, cross-source project dependencies, Milestone 5, the
+unified task graph, and Milestone 6, cross-source hashing and cache safety, are complete. Milestone
+7, cross-source action execution, is next.
 
 ## End Goal
 
@@ -351,6 +352,14 @@ produces an explicit unsupported-feature error.
   completeness information from #2620.
 
 Cached cross-source execution should not ship before this milestone is complete.
+
+Task fingerprints, dependency hashes, changed-file observations, and persisted task state use
+canonical source-qualified identities. Runtime services are addressable through an exact-match
+source registry, and task hashing routes dependency outputs through the producing source. Daemon
+hashing, packing, and hydration requests carry and validate source identity. Aggregate affected
+queries retain per-source completeness, while piped unqualified changed-file input remains scoped
+to the primary source and treats other sources conservatively. Cross-source action dispatch remains
+disabled until Milestone 7.
 
 Exit criteria: source-qualified hashing, state, packing, hydration, and daemon operations pass
 cross-source tests without enabling cross-source action dispatch.

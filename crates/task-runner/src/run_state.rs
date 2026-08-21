@@ -3,14 +3,14 @@ use moon_action_context::TargetState;
 use moon_app_context::AppContext;
 use moon_cache_item::cache_item;
 use moon_hash::Digest;
-use moon_task::Task;
+use moon_task::{Task, TaskKey};
 
 cache_item!(
     pub struct TaskRunCacheState {
         pub exit_code: i32,
         pub hash: String,
         pub last_run_time: u128,
-        pub target: String,
+        pub task_key: Option<TaskKey>,
     }
 );
 

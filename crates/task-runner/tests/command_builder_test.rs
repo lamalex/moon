@@ -5,11 +5,11 @@ mod utils;
 use moon_action::ActionNode;
 use moon_action_context::ActionContext;
 use moon_affected::Affected;
-use moon_common::is_ci;
+use moon_common::{Id, is_ci};
 use moon_config::*;
 use moon_env_var::GlobalEnvBag;
 use moon_process::{Command, CommandExecutable, Env};
-use moon_task::{Target, TargetLocator, TaskOptionAffectedFiles};
+use moon_task::{Target, TargetLocator, TaskKey, TaskOptionAffectedFiles};
 use std::env;
 use std::ffi::OsString;
 use utils::*;
@@ -19,6 +19,10 @@ fn get_env<'a>(command: &'a Command, key: &str) -> Option<&'a str> {
         .env
         .get(&OsString::from(key))
         .map(|v| v.get_value().unwrap().to_str().unwrap())
+}
+
+fn key(project: &str, task: &str) -> TaskKey {
+    TaskKey::primary(Id::raw(project), Id::raw(task)).unwrap()
 }
 
 fn get_args(command: &Command) -> Vec<&str> {
@@ -141,9 +145,7 @@ mod command_builder {
 
             let mut context = ActionContext::default();
             context.passthrough_args.push("--passthrough".into());
-            context
-                .primary_targets
-                .insert(Target::new("project", "base").unwrap());
+            context.primary_targets.insert(key("project", "base"));
 
             let command = container.create_command(context).await;
 
@@ -171,9 +173,7 @@ mod command_builder {
 
             let mut context = ActionContext::default();
             context.passthrough_args.push("--passthrough".into());
-            context
-                .primary_targets
-                .insert(Target::new("other-project", "base").unwrap());
+            context.primary_targets.insert(key("other-project", "base"));
 
             let command = container.create_command(context).await;
 
@@ -186,9 +186,7 @@ mod command_builder {
 
             let mut context = ActionContext::default();
             context.passthrough_args.push("--passthrough".into());
-            context
-                .primary_targets
-                .insert(Target::new("project", "base").unwrap());
+            context.primary_targets.insert(key("project", "base"));
 
             let command = container
                 .create_command_with_config(context, |_, node| {

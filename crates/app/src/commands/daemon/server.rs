@@ -1,6 +1,7 @@
 use crate::session::{MoonSession, SessionResult};
 use crate::watchers::WorkspaceWatcher;
 use moon_daemon::{DaemonState, start_daemon_server};
+use std::sync::Arc;
 
 fn install_daemon_panic_hook() {
     let previous_hook = std::panic::take_hook();
@@ -34,10 +35,12 @@ fn install_daemon_panic_hook() {
 
 pub async fn server(session: MoonSession) -> SessionResult {
     install_daemon_panic_hook();
+    let source_runtime_registry = session.get_source_runtime_registry().await?;
 
     start_daemon_server(
         DaemonState {
-            app_context: session.get_app_context().await?,
+            app_context: Arc::clone(source_runtime_registry.get_primary()),
+            source_runtime_registry,
             // Loaded in the background within the workspace watcher,
             // otherwise it causes this command to block for too long
             workspace_graph: Default::default(),

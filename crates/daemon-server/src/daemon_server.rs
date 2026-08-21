@@ -1,9 +1,11 @@
 use crate::daemon_server_error::DaemonServerError;
 use crate::daemon_watcher::{start_file_listener, start_file_watcher};
-use moon_app_context::AppContext;
-use moon_cache_storage::{Manifest, ManifestSource, ManifestUnpacker, StorageOptions};
+use moon_app_context::{AppContext, SourceRuntimeRegistry, SourceRuntimeRegistryError};
+use moon_cache_storage::{
+    Manifest, ManifestFile, ManifestSource, ManifestUnpacker, StorageOptions,
+};
 use moon_common::path::WorkspaceRelativePathBuf;
-use moon_common::{color, format_error_chain};
+use moon_common::{SourceRootId, color, format_error_chain};
 use moon_daemon_proto::{
     moon_daemon_server::{MoonDaemon, MoonDaemonServer},
     *,
@@ -14,11 +16,12 @@ use moon_file_watcher::{BoxedFileWatcher, FileEvent};
 use moon_hash::{Digest, InternalDigestExt};
 use moon_notifier::notify_webhook;
 use moon_process::ProcessRegistry;
+use moon_target::TaskKey;
 use moon_workspace_graph::WorkspaceGraph;
 use starbase_utils::fs;
 use std::env;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -49,7 +52,20 @@ const TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct DaemonState {
     pub app_context: Arc<AppContext>,
+    pub source_runtime_registry: Arc<SourceRuntimeRegistry>,
     pub workspace_graph: Arc<WorkspaceGraph>,
+}
+
+impl DaemonState {
+    pub fn new(app_context: Arc<AppContext>, workspace_graph: Arc<WorkspaceGraph>) -> Self {
+        Self {
+            source_runtime_registry: Arc::new(SourceRuntimeRegistry::single(Arc::clone(
+                &app_context,
+            ))),
+            app_context,
+            workspace_graph,
+        }
+    }
 }
 
 pub type AtomicDaemonState = Arc<RwLock<DaemonState>>;
@@ -115,6 +131,71 @@ impl DaemonService {
     }
 }
 
+fn parse_source_runtime(
+    registry: &SourceRuntimeRegistry,
+    source_id: &str,
+) -> Result<(SourceRootId, Arc<AppContext>), Status> {
+    let source_id = source_id
+        .parse::<SourceRootId>()
+        .map_err(|error| Status::invalid_argument(format!("Invalid source ID: {error}")))?;
+    let app_context = registry
+        .get(&source_id)
+        .map(Arc::clone)
+        .map_err(|error| match error {
+            SourceRuntimeRegistryError::UnknownSource { .. } => {
+                Status::not_found(error.to_string())
+            }
+            SourceRuntimeRegistryError::UnavailableSource { .. } => {
+                Status::failed_precondition(error.to_string())
+            }
+            _ => Status::internal(error.to_string()),
+        })?;
+
+    Ok((source_id, app_context))
+}
+
+fn parse_task_key(task_key: &str, source_id: &SourceRootId) -> Result<TaskKey, Status> {
+    let task_key = task_key
+        .parse::<TaskKey>()
+        .map_err(|error| Status::invalid_argument(format!("Invalid task key: {error}")))?;
+
+    if task_key.project_key().source_id() != source_id {
+        return Err(Status::invalid_argument(format!(
+            "Task key source {} does not match request source {source_id}.",
+            task_key.project_key().source_id()
+        )));
+    }
+
+    Ok(task_key)
+}
+
+fn parse_manifest_path(path: &str) -> Result<WorkspaceRelativePathBuf, Status> {
+    if Path::new(path).components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(Status::invalid_argument(format!(
+            "Manifest path must be source-root-relative: {path}"
+        )));
+    }
+
+    Ok(WorkspaceRelativePathBuf::from(path))
+}
+
+fn validate_manifest_paths(manifest: &Manifest) -> Result<(), Status> {
+    for file in &manifest.files {
+        parse_manifest_path(file.path.as_str())?;
+    }
+
+    for link in &manifest.symlinks {
+        parse_manifest_path(link.path.as_str())?;
+    }
+
+    Ok(())
+}
+
 #[tonic::async_trait]
 impl MoonDaemon for DaemonService {
     async fn archive_task_outputs(
@@ -123,8 +204,10 @@ impl MoonDaemon for DaemonService {
     ) -> Result<Response<ArchiveTaskOutputsResponse>, Status> {
         self.track_activity("ArchiveTaskOutputs");
 
-        let app_context = Arc::clone(&self.state.read().await.app_context);
         let request = request.into_inner();
+        let registry = Arc::clone(&self.state.read().await.source_runtime_registry);
+        let (source_id, app_context) = parse_source_runtime(&registry, &request.source_id)?;
+        let task_key = parse_task_key(&request.task_key, &source_id)?;
 
         let digest = Digest::from_external(
             request
@@ -132,13 +215,44 @@ impl MoonDaemon for DaemonService {
                 .ok_or_else(|| Status::invalid_argument("Missing digest"))?,
         )
         .map_err(|error| Status::unknown(error.to_string()))?;
-
-        let manifest = Manifest::from_bazel_action_result(
+        let mut manifest = Manifest::from_bazel_action_result(
             request
                 .manifest
                 .ok_or_else(|| Status::invalid_argument("Missing manifest"))?,
         )
         .map_err(|error| Status::unknown(error.to_string()))?;
+        validate_manifest_paths(&manifest)?;
+
+        if let Some(source) = request.digest_source {
+            let source_digest = Digest::from_external(
+                source
+                    .digest
+                    .ok_or_else(|| Status::invalid_argument("Missing digest source digest"))?,
+            )
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+
+            if source_digest != digest {
+                return Err(Status::invalid_argument(
+                    "Digest source does not match the task digest.",
+                ));
+            }
+
+            if Digest::from_bytes(&source.bytes)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?
+                != source_digest
+            {
+                return Err(Status::invalid_argument(
+                    "Digest source bytes do not match its digest.",
+                ));
+            }
+
+            manifest.digest_source = Some(ManifestFile {
+                bytes: Some(source.bytes),
+                digest: Some(source_digest),
+                path: parse_manifest_path(&source.path)?,
+                ..Default::default()
+            });
+        }
 
         self.run_in_background(async move {
             if let Err(error) = app_context
@@ -154,6 +268,7 @@ impl MoonDaemon for DaemonService {
             {
                 warn!(
                     task_target = &request.task_target,
+                    task_key = %task_key,
                     hash = digest.hash.as_str(),
                     error = format_error_chain(&error),
                     "Failed to archive task outputs",
@@ -170,8 +285,10 @@ impl MoonDaemon for DaemonService {
     ) -> Result<Response<HydrateTaskOutputsResponse>, Status> {
         self.track_activity("HydrateTaskOutputs");
 
-        let app_context = Arc::clone(&self.state.read().await.app_context);
         let request = request.into_inner();
+        let registry = Arc::clone(&self.state.read().await.source_runtime_registry);
+        let (source_id, app_context) = parse_source_runtime(&registry, &request.source_id)?;
+        let task_key = parse_task_key(&request.task_key, &source_id)?;
 
         let digest = Digest::from_external(
             request
@@ -179,13 +296,13 @@ impl MoonDaemon for DaemonService {
                 .ok_or_else(|| Status::invalid_argument("Missing digest"))?,
         )
         .map_err(|error| Status::unknown(error.to_string()))?;
-
         let manifest = Manifest::from_bazel_action_result(
             request
                 .manifest
                 .ok_or_else(|| Status::invalid_argument("Missing manifest"))?,
         )
         .map_err(|error| Status::unknown(error.to_string()))?;
+        validate_manifest_paths(&manifest)?;
 
         let storage = app_context
             .cache_engine
@@ -234,6 +351,7 @@ impl MoonDaemon for DaemonService {
             Err(error) => {
                 warn!(
                     task_target = &request.task_target,
+                    task_key = %task_key,
                     hash = digest.hash.as_str(),
                     error = format_error_chain(&error),
                     "Failed to hydrate task outputs",
@@ -274,14 +392,14 @@ impl MoonDaemon for DaemonService {
     ) -> Result<Response<HashFilesResponse>, Status> {
         self.track_activity("HashFiles");
 
-        let app_context = Arc::clone(&self.state.read().await.app_context);
-
+        let request = request.into_inner();
+        let registry = Arc::clone(&self.state.read().await.source_runtime_registry);
+        let (_, app_context) = parse_source_runtime(&registry, &request.source_id)?;
         let files = request
-            .into_inner()
             .files
             .into_iter()
-            .map(WorkspaceRelativePathBuf::from)
-            .collect::<Vec<_>>();
+            .map(|file| parse_manifest_path(&file))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let hashed_files = app_context
             .hash_files(&files)

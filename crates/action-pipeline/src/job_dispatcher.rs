@@ -169,6 +169,7 @@ mod tests {
 
     async fn create_job_context() -> JobContext {
         let (sender, _receiver) = mpsc::channel::<Action>(8);
+        let workspace_graph = Arc::new(WorkspaceGraph::default());
 
         JobContext {
             abort_token: CancellationToken::new(),
@@ -180,7 +181,8 @@ mod tests {
             result_sender: sender,
             running_jobs: Arc::new(RwLock::new(FxHashMap::default())),
             semaphore: Arc::new(Semaphore::new(1)),
-            workspace_graph: Arc::new(WorkspaceGraph::default()),
+            task_runner_context: None,
+            workspace_graph,
         }
     }
 

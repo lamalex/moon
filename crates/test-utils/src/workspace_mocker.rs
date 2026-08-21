@@ -3,7 +3,7 @@ use moon_action_pipeline::ActionPipeline;
 use moon_app_context::AppContext;
 use moon_cache::{CacheContext, CacheEngine};
 use moon_cache_local::LocalStorage;
-use moon_common::{Id, IdExt, SourceRegistry, path::WorkspaceRelativePathBuf};
+use moon_common::{Id, IdExt, SourceRegistry, SourceRootId, path::WorkspaceRelativePathBuf};
 use moon_config::*;
 use moon_config_loader::{ConfigLoader, ExtensionsConfigExt, ToolchainsConfigExt};
 use moon_console::{Console, MoonReporter};
@@ -342,6 +342,7 @@ impl WorkspaceMocker {
     pub fn mock_app_context(&self) -> AppContext {
         AppContext {
             cli_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            source_id: SourceRootId::primary(),
             cache_engine: Arc::new(self.mock_cache_engine()),
             config_dir: self.config_dir.clone(),
             config_exts: self.config_loader.extensions.clone(),

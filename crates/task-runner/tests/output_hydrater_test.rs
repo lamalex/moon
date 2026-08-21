@@ -1,11 +1,12 @@
 mod utils;
 
 use moon_cache::{CacheMode, Manifest, ManifestFile, ManifestSource};
+use moon_common::SourceRootId;
 use moon_env_var::GlobalEnvBag;
 use moon_hash::Digest;
 use moon_task_runner::TaskRunState;
-use moon_task_runner::output_hydrater::{HydrateFrom, HydrateOutcome};
-use std::fs;
+use moon_task_runner::output_hydrater::{HydrateFrom, HydrateOutcome, OutputHydrater};
+use std::{fs, sync::Arc};
 use utils::*;
 
 fn assert_hydrated(outcome: HydrateOutcome) {
@@ -27,6 +28,14 @@ fn assert_not_hydrated(outcome: HydrateOutcome) {
 
 mod output_hydrater {
     use super::*;
+
+    #[tokio::test]
+    async fn rejects_a_task_from_another_source() {
+        let mut container = TaskRunnerContainer::new("archive", "file-outputs").await;
+        Arc::make_mut(&mut container.task).source_id = SourceRootId::new("child").unwrap();
+
+        assert!(OutputHydrater::new(&container.app_context, &container.task, None).is_err());
+    }
 
     mod local_legacy {
         use super::*;
@@ -119,14 +128,14 @@ mod output_hydrater {
         async fn unpacks_logs_from_archive() {
             let container = TaskRunnerContainer::new("archive", "file-outputs").await;
             container.pack_archive();
+            let stdout = container
+                .app_context
+                .cache_engine
+                .state
+                .get_task_dir(&container.task.key())
+                .join("stdout.log");
 
-            assert!(
-                !container
-                    .sandbox
-                    .path()
-                    .join(".moon/cache/states/project/file-outputs/stdout.log")
-                    .exists()
-            );
+            assert!(!stdout.exists());
 
             let hydrater = container.create_hydrator();
             let state = container.create_state();
@@ -136,13 +145,7 @@ mod output_hydrater {
                 .await
                 .unwrap();
 
-            assert!(
-                container
-                    .sandbox
-                    .path()
-                    .join(".moon/cache/states/project/file-outputs/stdout.log")
-                    .exists()
-            );
+            assert!(stdout.exists());
         }
     }
 

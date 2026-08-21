@@ -6,7 +6,7 @@ use crate::{DiscoveredWorkspace, DiscoveredWorkspaceFailure, SourceContext};
 use async_trait::async_trait;
 use moon_action_graph::{ActionGraphBuilder, ActionGraphBuilderOptions};
 use moon_api::Launchpad;
-use moon_app_context::AppContext;
+use moon_app_context::{AppContext, SourceRuntime, SourceRuntimeRegistry};
 use moon_cache::{CacheContext, CacheEngine};
 use moon_cache_local::LocalStorage;
 use moon_cache_remote::{GrpcRemoteStorage, HttpRemoteStorage};
@@ -43,7 +43,7 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::OnceCell;
 use tokio::try_join;
-use tracing::debug;
+use tracing::{debug, warn};
 use version_spec::Version;
 
 pub type SessionResult = AppResult<miette::Report>;
@@ -62,10 +62,12 @@ pub struct MoonSession {
 
     // Lazy components
     pub(crate) aggregate_workspace_graph: OnceCell<Arc<WorkspaceGraph>>,
+    pub(crate) app_context: OnceCell<Arc<AppContext>>,
     pub(crate) cache_engine: OnceLock<Arc<CacheEngine>>,
     pub(crate) daemon_client: OnceLock<DaemonClient>,
     pub(crate) extension_registry: OnceCell<Arc<ExtensionRegistry>>,
     pub(crate) project_graph: OnceLock<Arc<ProjectGraph>>,
+    pub(crate) source_runtime_registry: OnceCell<Arc<SourceRuntimeRegistry>>,
     pub(crate) task_graph: OnceLock<Arc<TaskGraph>>,
     pub(crate) toolchain_registry: OnceCell<Arc<ToolchainRegistry>>,
     pub(crate) vcs_adapter: OnceCell<Arc<BoxedVcs>>,
@@ -96,6 +98,7 @@ impl MoonSession {
 
         Self {
             aggregate_workspace_graph: OnceCell::new(),
+            app_context: OnceCell::new(),
             exit_code: AppExitCode::default(),
             cache_engine: OnceLock::new(),
             cli_version: Version::parse(&cli_version).unwrap(),
@@ -111,6 +114,7 @@ impl MoonSession {
             source_aliases: Arc::new(FxHashMap::default()),
             source_contexts: Arc::new(FxHashMap::default()),
             source_discovery_failures: Arc::new(Vec::new()),
+            source_runtime_registry: OnceCell::new(),
             source_workspaces: Arc::new(FxHashMap::default()),
             sources: Arc::new(SourceRegistry::default()),
             task_graph: OnceLock::new(),
@@ -201,24 +205,78 @@ impl MoonSession {
     }
 
     pub async fn get_app_context(&self) -> miette::Result<Arc<AppContext>> {
-        Ok(Arc::new(AppContext {
-            cli_version: self.cli_version.clone(),
-            cache_engine: self.get_cache_engine().await?,
-            config_dir: self.config_dir.clone(),
-            config_exts: self.config_loader.extensions.clone(),
-            console: self.get_console()?,
-            daemon_dir: self.config_dir.join("cache").join("daemon"),
-            moon_env: Arc::clone(&self.moon_env),
-            proto_env: Arc::clone(&self.proto_env),
-            extensions_config: Arc::clone(&self.extensions_config),
-            extension_registry: self.get_extension_registry().await?,
-            toolchains_config: Arc::clone(&self.toolchains_config),
-            toolchain_registry: self.get_toolchain_registry().await?,
-            vcs: self.get_vcs_adapter().await?,
-            working_dir: self.working_dir.clone(),
-            workspace_config: Arc::clone(&self.workspace_config),
-            workspace_root: self.workspace_root.clone(),
-        }))
+        self.app_context
+            .get_or_try_init(async || {
+                Ok(Arc::new(AppContext {
+                    cli_version: self.cli_version.clone(),
+                    source_id: self.sources.primary_id().clone(),
+                    cache_engine: self.get_cache_engine().await?,
+                    config_dir: self.config_dir.clone(),
+                    config_exts: self.config_loader.extensions.clone(),
+                    console: self.get_console()?,
+                    daemon_dir: self.config_dir.join("cache").join("daemon"),
+                    moon_env: Arc::clone(&self.moon_env),
+                    proto_env: Arc::clone(&self.proto_env),
+                    extensions_config: Arc::clone(&self.extensions_config),
+                    extension_registry: self.get_extension_registry().await?,
+                    toolchains_config: Arc::clone(&self.toolchains_config),
+                    toolchain_registry: self.get_toolchain_registry().await?,
+                    vcs: self.get_vcs_adapter().await?,
+                    working_dir: self.working_dir.clone(),
+                    workspace_config: Arc::clone(&self.workspace_config),
+                    workspace_root: self.workspace_root.clone(),
+                }))
+            })
+            .await
+            .map(Arc::clone)
+    }
+
+    pub async fn get_source_runtime_registry(&self) -> miette::Result<Arc<SourceRuntimeRegistry>> {
+        self.source_runtime_registry
+            .get_or_try_init(async || {
+                let primary = self.get_app_context().await?;
+                let console = Arc::clone(&primary.console);
+                let mut runtimes = Vec::new();
+                let mut source_ids = self
+                    .sources
+                    .iter()
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                source_ids.sort();
+
+                for source_id in source_ids {
+                    if &source_id == self.sources.primary_id() {
+                        continue;
+                    }
+
+                    let Some(source) = self.source_contexts.get(&source_id) else {
+                        runtimes.push((
+                            source_id,
+                            SourceRuntime::Unavailable("Source context was not loaded.".into()),
+                        ));
+                        continue;
+                    };
+
+                    match source
+                        .get_app_context(self.cli_version.clone(), Arc::clone(&console))
+                        .await
+                    {
+                        Ok(context) => {
+                            runtimes.push((source_id, SourceRuntime::Available(context)));
+                        }
+                        Err(error) => {
+                            runtimes.push((
+                                source_id,
+                                SourceRuntime::Unavailable(error.to_string().into()),
+                            ));
+                        }
+                    }
+                }
+
+                Ok(Arc::new(SourceRuntimeRegistry::new(primary, runtimes)?))
+            })
+            .await
+            .map(Arc::clone)
     }
 
     /// Return the read-only graph composed from all successfully loaded sources.
@@ -482,11 +540,15 @@ impl MoonSession {
                 continue;
             }
 
-            let source_graph = self.source_contexts[&source_id]
-                .get_workspace_graph()
-                .await?;
-            project_graphs.push(Arc::clone(&source_graph.projects));
-            task_graphs.push(Arc::clone(&source_graph.tasks));
+            match self.source_contexts[&source_id].get_workspace_graph().await {
+                Ok(source_graph) => {
+                    project_graphs.push(Arc::clone(&source_graph.projects));
+                    task_graphs.push(Arc::clone(&source_graph.tasks));
+                }
+                Err(error) => {
+                    warn!(source = %source_id, error = %error, "Skipping unavailable source graph");
+                }
+            }
         }
 
         let projects = Arc::new(ProjectGraph::compose(

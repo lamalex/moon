@@ -11,7 +11,7 @@ use moon_config::{
 };
 use moon_exec_plan::{ExecutionPlan, GraphBlock, TargetsBlock};
 use moon_graph_utils::*;
-use moon_task::{Target, TargetLocator, Task, TaskFileInput};
+use moon_task::{Target, TargetLocator, Task, TaskFileInput, TaskKey};
 use moon_toolchain::ToolchainSpec;
 use rustc_hash::{FxHashMap, FxHashSet};
 use starbase_sandbox::{assert_snapshot, create_sandbox};
@@ -24,6 +24,14 @@ fn create_task(project: &str, id: &str) -> Task {
         toolchains: vec![Id::raw("node")],
         ..Task::default()
     }
+}
+
+fn primary_key(target: &str) -> TaskKey {
+    TaskKey::from_target(Default::default(), &Target::parse(target).unwrap()).unwrap()
+}
+
+fn key_target(key: TaskKey) -> Target {
+    Target::new(key.project_key().project_id(), key.task_id()).unwrap()
 }
 
 fn create_proto_version() -> VersionSpec {
@@ -2005,10 +2013,7 @@ mod action_graph_builder {
 
                 assert_eq!(
                     context.get_target_states(),
-                    FxHashMap::from_iter([(
-                        Target::parse("bar:build").unwrap(),
-                        TargetState::Passthrough
-                    )])
+                    FxHashMap::from_iter([(primary_key("bar:build"), TargetState::Passthrough)])
                 );
 
                 assert!(topo(graph).is_empty());
@@ -2041,10 +2046,7 @@ mod action_graph_builder {
 
                 assert_eq!(
                     context.get_target_states(),
-                    FxHashMap::from_iter([(
-                        Target::parse("bar:build").unwrap(),
-                        TargetState::Passthrough
-                    )])
+                    FxHashMap::from_iter([(primary_key("bar:build"), TargetState::Passthrough)])
                 );
 
                 assert!(topo(graph).is_empty());
@@ -2235,8 +2237,8 @@ mod action_graph_builder {
                 assert_eq!(
                     context.ignored_dependencies,
                     FxHashMap::from_iter([(
-                        Target::parse("deps:chain3").unwrap(),
-                        FxHashSet::from_iter([Target::parse("deps:chain4").unwrap()])
+                        primary_key("deps:chain3"),
+                        FxHashSet::from_iter([primary_key("deps:chain4")])
                     )])
                 );
             }
@@ -2332,8 +2334,8 @@ mod action_graph_builder {
                 assert_eq!(
                     context.ignored_dependencies,
                     FxHashMap::from_iter([(
-                        Target::parse("deps:chain4").unwrap(),
-                        FxHashSet::from_iter([Target::parse("deps:chain5").unwrap()])
+                        primary_key("deps:chain4"),
+                        FxHashSet::from_iter([primary_key("deps:chain5")])
                     )])
                 );
             }
@@ -2363,13 +2365,13 @@ mod action_graph_builder {
                 assert!(
                     !context
                         .ignored_dependencies
-                        .contains_key(&Target::parse("deps:chain3").unwrap())
+                        .contains_key(&primary_key("deps:chain3"))
                 );
                 assert_eq!(
                     context.ignored_dependencies,
                     FxHashMap::from_iter([(
-                        Target::parse("deps:chain4").unwrap(),
-                        FxHashSet::from_iter([Target::parse("deps:chain5").unwrap()])
+                        primary_key("deps:chain4"),
+                        FxHashSet::from_iter([primary_key("deps:chain5")])
                     )])
                 );
                 assert!(topo(graph).into_iter().any(|node| matches!(
@@ -2888,7 +2890,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [Target::parse("deps:parallel").unwrap()]
             );
         }
@@ -2912,7 +2918,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [Target::parse("deps:serial").unwrap()]
             );
         }
@@ -2936,7 +2946,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [Target::parse("deps:chain1").unwrap()]
             );
         }
@@ -2960,7 +2974,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [Target::parse("deps:base").unwrap()]
             );
         }
@@ -2990,7 +3008,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [Target::parse("deps:base").unwrap()]
             );
         }
@@ -3022,7 +3044,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [Target::parse("deps:base").unwrap()]
             );
         }
@@ -3077,7 +3103,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [Target::parse("app:build").unwrap()]
             );
         }
@@ -3223,7 +3253,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [
                     Target::parse("client:build").unwrap(),
                     Target::parse("base:build").unwrap(),
@@ -3255,7 +3289,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [Target::parse("server:build").unwrap()]
             );
         }
@@ -3324,7 +3362,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [Target::parse("client:lint").unwrap()]
             );
         }
@@ -3349,7 +3391,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [Target::parse("misc:requiresInternal").unwrap()]
             );
         }
@@ -3374,7 +3420,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [
                     Target::parse("client:lint").unwrap(),
                     Target::parse("common:lint").unwrap(),
@@ -3593,7 +3643,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [Target::parse("server:build").unwrap()]
             );
         }
@@ -3626,7 +3680,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [
                     Target::parse("deps-affected:c").unwrap(),
                     Target::parse("deps:a").unwrap(),
@@ -3659,7 +3717,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [
                     Target::parse("client:build").unwrap(),
                     Target::parse("common:build").unwrap(),
@@ -3688,12 +3750,16 @@ mod action_graph_builder {
             let dot = graph.to_dot();
 
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
-                [
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<FxHashSet<_>>(),
+                FxHashSet::from_iter([
                     Target::parse("client:lint").unwrap(),
                     Target::parse("client:test").unwrap(),
                     Target::parse("common:lint").unwrap(),
-                ]
+                ])
             );
 
             // common:internal is tagged but is internal, so excluded
@@ -3720,12 +3786,16 @@ mod action_graph_builder {
             let (context, _) = builder.build();
 
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
-                [
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<FxHashSet<_>>(),
+                FxHashSet::from_iter([
                     Target::parse("client:lint").unwrap(),
                     Target::parse("client:test").unwrap(),
                     Target::parse("common:lint").unwrap(),
-                ]
+                ])
             );
         }
 
@@ -3770,7 +3840,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [Target::parse("client:test").unwrap()]
             );
         }
@@ -3817,7 +3891,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [Target::parse("misc:requiresInternal").unwrap()]
             );
         }
@@ -3847,7 +3925,11 @@ mod action_graph_builder {
 
             assert_snapshot!(graph.to_dot());
             assert_eq!(
-                context.primary_targets.into_iter().collect::<Vec<_>>(),
+                context
+                    .primary_targets
+                    .into_iter()
+                    .map(key_target)
+                    .collect::<Vec<_>>(),
                 [Target::parse("base:build").unwrap()]
             );
         }

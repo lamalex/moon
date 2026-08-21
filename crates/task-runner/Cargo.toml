@@ -28,6 +28,7 @@ moon_process_augment = { path = "../process-augment" }
 moon_project = { path = "../project" }
 moon_task = { path = "../task" }
 moon_task_hasher = { path = "../task-hasher" }
+moon_task_graph = { path = "../task-graph" }
 moon_time = { path = "../time" }
 miette = { workspace = true }
 rustc-hash = { workspace = true }

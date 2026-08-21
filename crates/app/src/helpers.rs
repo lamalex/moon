@@ -80,6 +80,10 @@ pub async fn run_action_pipeline(
         session.get_app_context().await?,
         session.get_workspace_graph().await?,
         session.connect_to_daemon().await?,
+    )
+    .with_hashing_context(
+        Arc::clone(&session.get_aggregate_workspace_graph().await?.tasks),
+        session.get_source_runtime_registry().await?,
     );
 
     if let Some(concurrency) = &session.cli.concurrency {

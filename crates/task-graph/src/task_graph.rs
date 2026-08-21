@@ -1,6 +1,8 @@
 use crate::TaskGraphError;
 use daggy::Dag;
-use moon_config::{DependencyScope, TaskDependencyType};
+use moon_config::{
+    DependencyScope, EnvMap, TaskDependencyCacheStrategy, TaskDependencyConfig, TaskDependencyType,
+};
 use moon_graph_utils::*;
 use moon_project::ProjectError;
 use moon_project_graph::ProjectGraph;
@@ -16,6 +18,7 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use rustc_hash::FxHashMap;
 use scc::hash_map::Entry;
+use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tracing::{debug, instrument};
@@ -24,6 +27,15 @@ use tracing::{debug, instrument};
 pub struct TaskNode {
     pub index: NodeIndex,
     pub task: Task,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedTaskDependency {
+    pub task_key: TaskKey,
+    pub cache_strategy: TaskDependencyCacheStrategy,
+    pub dependency_type: TaskDependencyType,
+    pub args: Vec<String>,
+    pub env: EnvMap,
 }
 
 #[derive(Debug, Default)]
@@ -41,6 +53,9 @@ pub struct TaskGraph {
 
     /// Map of task nodes by canonical key.
     pub nodes: FxHashMap<TaskKey, TaskNode>,
+
+    /// Canonical resolved dependency metadata by owning task key.
+    resolved_dependencies: FxHashMap<TaskKey, Vec<ResolvedTaskDependency>>,
 
     /// Project graph, required for expansion.
     project_graph: Arc<ProjectGraph>,
@@ -136,6 +151,7 @@ impl TaskGraph {
             aggregate.add_edge(&source_key, &target_key, dependency_type)?;
         }
 
+        aggregate.resolve_source_local_dependencies()?;
         aggregate.add_composed_project_dependencies()?;
 
         Ok(aggregate)
@@ -222,14 +238,17 @@ impl TaskGraph {
                         },
                     )?;
 
+                    let dependency_type = if dep_config.optional.is_some_and(|optional| optional) {
+                        TaskDependencyType::Optional
+                    } else {
+                        TaskDependencyType::Required
+                    };
+
                     edges.push((
                         source_key.clone(),
                         target_key,
-                        if dep_config.optional.is_some_and(|optional| optional) {
-                            TaskDependencyType::Optional
-                        } else {
-                            TaskDependencyType::Required
-                        },
+                        dependency_type,
+                        dep_config.clone(),
                     ));
                 }
             }
@@ -237,8 +256,9 @@ impl TaskGraph {
 
         edges.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
 
-        for (source_key, target_key, dependency_type) in edges {
+        for (source_key, target_key, dependency_type, config) in edges {
             self.add_edge(&source_key, &target_key, dependency_type)?;
+            self.add_resolved_dependency(&source_key, &target_key, dependency_type, &config);
         }
 
         Ok(())
@@ -280,6 +300,87 @@ impl TaskGraph {
             })?;
 
         Ok(())
+    }
+
+    fn add_resolved_dependency(
+        &mut self,
+        owner: &TaskKey,
+        dependency: &TaskKey,
+        dependency_type: TaskDependencyType,
+        config: &TaskDependencyConfig,
+    ) {
+        let cache_strategy = config.cache_strategy.unwrap_or_else(|| {
+            if self.nodes[dependency].task.has_outputs() {
+                TaskDependencyCacheStrategy::Hash
+            } else {
+                TaskDependencyCacheStrategy::Ignored
+            }
+        });
+        let resolved = ResolvedTaskDependency {
+            task_key: dependency.clone(),
+            cache_strategy,
+            dependency_type,
+            args: config.args.clone(),
+            env: config.env.clone(),
+        };
+        let dependencies = self.resolved_dependencies.entry(owner.clone()).or_default();
+
+        if let Some(current) = dependencies
+            .iter_mut()
+            .find(|current| current.task_key == *dependency)
+        {
+            let current_required = current.dependency_type == TaskDependencyType::Required;
+            let incoming_required = dependency_type == TaskDependencyType::Required;
+            let replace = incoming_required && !current_required
+                || incoming_required == current_required
+                    && resolved_dependency_cmp(&resolved, current) == Ordering::Less;
+
+            if replace {
+                *current = resolved;
+            } else if incoming_required {
+                current.dependency_type = TaskDependencyType::Required;
+            }
+        } else {
+            dependencies.push(resolved);
+        }
+
+        dependencies.sort_by(|a, b| a.task_key.cmp(&b.task_key));
+    }
+
+    /// Populate canonical metadata for already-resolved source-local dependencies.
+    pub fn resolve_source_local_dependencies(&mut self) -> miette::Result<()> {
+        let mut owners = self.nodes.keys().cloned().collect::<Vec<_>>();
+        owners.sort();
+
+        for owner in owners {
+            let configs = self.nodes[&owner].task.deps.clone();
+
+            for config in configs {
+                let dependency =
+                    TaskKey::from_target(owner.project_key().source_id().clone(), &config.target)?;
+
+                if !self.nodes.contains_key(&dependency) {
+                    continue;
+                }
+
+                let dependency_type = if config.optional.is_some_and(|optional| optional) {
+                    TaskDependencyType::Optional
+                } else {
+                    TaskDependencyType::Required
+                };
+                self.add_resolved_dependency(&owner, &dependency, dependency_type, &config);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Return canonical resolved dependency metadata for an owning task.
+    pub fn resolved_dependencies_of(&self, key: &TaskKey) -> &[ResolvedTaskDependency] {
+        self.resolved_dependencies
+            .get(key)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     /// Return a task with the provided primary-source target from the graph.
@@ -476,12 +577,29 @@ impl TaskGraph {
                 .unwrap();
         }
 
+        let resolved_dependencies = self
+            .resolved_dependencies
+            .iter()
+            .filter(|(owner, _)| tasks.contains_key(*owner))
+            .map(|(owner, dependencies)| {
+                (
+                    owner.clone(),
+                    dependencies
+                        .iter()
+                        .filter(|dependency| tasks.contains_key(&dependency.task_key))
+                        .cloned()
+                        .collect(),
+                )
+            })
+            .collect();
+
         Ok(Self {
             indexes,
             context: self.context.clone(),
             contexts: self.contexts.clone(),
             graph: dag,
             nodes: tasks,
+            resolved_dependencies,
             project_graph: self.project_graph.clone(),
             tasks: self.tasks.clone(),
         })
@@ -511,6 +629,23 @@ impl TaskGraph {
         })
         .map(Arc::clone)
     }
+}
+
+fn resolved_dependency_cmp(a: &ResolvedTaskDependency, b: &ResolvedTaskDependency) -> Ordering {
+    let strategy_rank = |strategy| match strategy {
+        TaskDependencyCacheStrategy::Hash => 0,
+        TaskDependencyCacheStrategy::Ignored => 1,
+        TaskDependencyCacheStrategy::Outputs => 2,
+    };
+    let mut a_env = a.env.iter().collect::<Vec<_>>();
+    let mut b_env = b.env.iter().collect::<Vec<_>>();
+    a_env.sort();
+    b_env.sort();
+
+    strategy_rank(a.cache_strategy)
+        .cmp(&strategy_rank(b.cache_strategy))
+        .then_with(|| a.args.cmp(&b.args))
+        .then_with(|| a_env.cmp(&b_env))
 }
 
 impl TaskLookup for TaskGraph {
@@ -556,7 +691,7 @@ impl GraphToJson<Task, TaskDependencyType, TaskKey> for TaskGraph {}
 mod tests {
     use super::*;
     use moon_common::{Id, SourceRegistry, SourceRootId};
-    use moon_config::TaskDependencyConfig;
+    use moon_config::{TaskDependencyCacheStrategy, TaskDependencyConfig};
     use moon_project::Project;
     use moon_project_graph::ProjectNode;
     use moon_target::ProjectKey;
@@ -667,6 +802,13 @@ mod tests {
             graph.cross_source_dependencies_of(&source_key)[0].to_string(),
             "child::lib:build"
         );
+        let resolved = graph.resolved_dependencies_of(&source_key);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].task_key.to_string(), "child::lib:build");
+        assert_eq!(
+            resolved[0].cache_strategy,
+            TaskDependencyCacheStrategy::Ignored
+        );
         assert_eq!(graph.contexts.len(), 2);
         assert_eq!(
             graph.contexts[&SourceRootId::new("child").unwrap()].workspace_root,
@@ -753,5 +895,133 @@ mod tests {
                 .to_string(),
             "child::lib:build"
         );
+    }
+
+    #[test]
+    fn defaults_cross_source_strategy_from_outputs_and_preserves_focused_metadata() {
+        let (projects, primary_project, child_project) =
+            projects(&[(0, 1, DependencyScope::Build)]);
+        let primary = tasks(
+            context(primary_project.source_id().clone(), "/primary"),
+            Arc::clone(&projects),
+            &primary_project,
+            &[(
+                "build",
+                vec![TaskDependencyConfig::new(
+                    moon_target::Target::new("^", "build").unwrap(),
+                )],
+            )],
+        );
+        let mut child = tasks(
+            context(child_project.source_id().clone(), "/child"),
+            Arc::clone(&projects),
+            &child_project,
+            &[("build", vec![])],
+        );
+        Arc::get_mut(&mut child)
+            .unwrap()
+            .nodes
+            .values_mut()
+            .next()
+            .unwrap()
+            .task
+            .output_files
+            .insert("dist/file.js".into(), Default::default());
+        let graph = TaskGraph::compose(projects, [primary, child]).unwrap();
+        let source_key = TaskKey::new(primary_project, Id::raw("build")).unwrap();
+        let focused = graph.focus_for_key(&source_key, false).unwrap();
+        let resolved = focused.resolved_dependencies_of(&source_key);
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].task_key.to_string(), "child::lib:build");
+        assert_eq!(
+            resolved[0].cache_strategy,
+            TaskDependencyCacheStrategy::Hash
+        );
+    }
+
+    #[test]
+    fn deterministically_merges_duplicate_configs_with_required_dominating() {
+        let make_graph = |reverse: bool| {
+            let (projects, primary_project, child_project) =
+                projects(&[(0, 1, DependencyScope::Build)]);
+            let target = moon_target::Target::new("^", "build").unwrap();
+            let mut configs = vec![
+                TaskDependencyConfig {
+                    optional: Some(true),
+                    cache_strategy: Some(TaskDependencyCacheStrategy::Outputs),
+                    ..TaskDependencyConfig::new(target.clone())
+                },
+                TaskDependencyConfig {
+                    optional: Some(false),
+                    cache_strategy: Some(TaskDependencyCacheStrategy::Ignored),
+                    ..TaskDependencyConfig::new(target)
+                },
+            ];
+            if reverse {
+                configs.reverse();
+            }
+            let primary = tasks(
+                context(primary_project.source_id().clone(), "/primary"),
+                Arc::clone(&projects),
+                &primary_project,
+                &[("build", configs)],
+            );
+            let child = tasks(
+                context(child_project.source_id().clone(), "/child"),
+                Arc::clone(&projects),
+                &child_project,
+                &[("build", vec![])],
+            );
+            let graph = TaskGraph::compose(projects, [primary, child]).unwrap();
+            let owner = TaskKey::new(primary_project, Id::raw("build")).unwrap();
+
+            graph.resolved_dependencies_of(&owner).to_vec()
+        };
+
+        let forward = make_graph(false);
+        let reverse = make_graph(true);
+
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.len(), 1);
+        assert_eq!(forward[0].dependency_type, TaskDependencyType::Required);
+        assert_eq!(
+            forward[0].cache_strategy,
+            TaskDependencyCacheStrategy::Ignored
+        );
+    }
+
+    #[test]
+    fn resolves_source_local_dependency_metadata() {
+        let (projects, primary_project, _) = projects(&[]);
+        let dep_target = moon_target::Target::new("app", "build").unwrap();
+        let mut config = TaskDependencyConfig {
+            args: vec!["--release".into()],
+            cache_strategy: Some(TaskDependencyCacheStrategy::Outputs),
+            optional: Some(true),
+            ..TaskDependencyConfig::new(dep_target)
+        };
+        config.env.insert("MODE".into(), Some("ci".into()));
+        let mut graph = tasks(
+            context(primary_project.source_id().clone(), "/primary"),
+            projects,
+            &primary_project,
+            &[("consume", vec![]), ("build", vec![])],
+        );
+        let graph = Arc::get_mut(&mut graph).unwrap();
+        let owner = TaskKey::new(primary_project, Id::raw("consume")).unwrap();
+        graph.nodes.get_mut(&owner).unwrap().task.deps.push(config);
+        graph.resolve_source_local_dependencies().unwrap();
+        let resolved = graph.resolved_dependencies_of(&owner);
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].task_key.to_string(), "primary::app:build");
+        assert_eq!(
+            resolved[0].cache_strategy,
+            TaskDependencyCacheStrategy::Outputs
+        );
+        assert_eq!(resolved[0].dependency_type, TaskDependencyType::Optional);
+        assert_eq!(resolved[0].args, ["--release"]);
+        assert_eq!(resolved[0].env["MODE"], Some("ci".into()));
     }
 }

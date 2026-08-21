@@ -12,7 +12,7 @@ pub enum ActionGraphError {
 
     #[diagnostic(
         code(action_graph::unsupported_cross_source_task_dependency),
-        help = "Cross-source task execution will be enabled after source-qualified hashing and action dispatch are implemented."
+        help = "Cross-source task execution will be enabled when action dispatch is implemented in Milestone 7."
     )]
     #[error(
         "Task {} cannot be executed because its dependency {} belongs to another source root.",

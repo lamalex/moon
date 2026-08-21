@@ -394,6 +394,8 @@ impl WorkspaceBuilder {
             *task_graph.graph.node_weight_mut(index).unwrap() = index;
         }
 
+        task_graph.resolve_source_local_dependencies()?;
+
         let task_graph = Arc::new(task_graph);
 
         Ok(WorkspaceGraph::new_with_sources(

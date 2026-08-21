@@ -1,13 +1,14 @@
 use crate::task_fingerprint::TaskFingerprint;
 use crate::task_hasher_error::TaskHasherError;
 use miette::IntoDiagnostic;
-use moon_app_context::AppContext;
-use moon_common::color;
+use moon_app_context::{AppContext, SourceRuntimeRegistry};
 use moon_common::path::{PathExt, WorkspaceRelativePath, WorkspaceRelativePathBuf};
+use moon_common::{SourcePathBuf, color};
 use moon_config::{HasherConfig, HasherWalkStrategy};
 use moon_env_var::GlobalEnvBag;
 use moon_project::Project;
-use moon_task::{Target, Task};
+use moon_task::{Task, TaskKey};
+use moon_task_graph::TaskGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
 use starbase_utils::glob::GlobSet;
 use std::path::PathBuf;
@@ -54,8 +55,15 @@ impl<'task> TaskHasher<'task> {
         }
     }
 
-    pub fn hash_deps(&mut self, deps: impl IntoIterator<Item = (&'task Target, String)>) {
+    pub fn hash_deps(&mut self, deps: impl IntoIterator<Item = (TaskKey, String)>) {
         self.fingerprint.deps.extend(deps);
+    }
+
+    pub fn hash_canonical_inputs(
+        &mut self,
+        inputs: impl IntoIterator<Item = (SourcePathBuf, String)>,
+    ) {
+        self.fingerprint.inputs.extend(inputs);
     }
 
     pub fn hash_env(
@@ -68,13 +76,34 @@ impl<'task> TaskHasher<'task> {
     }
 
     pub async fn hash_inputs(&mut self) -> miette::Result<()> {
+        self.hash_project_sources().await
+    }
+
+    pub async fn hash_project_sources(&mut self) -> miette::Result<()> {
+        if self.app_context.source_id != self.task.source_id {
+            return Err(TaskHasherError::SourceMismatch {
+                runtime_source: self.app_context.source_id.clone(),
+                task_source: self.task.source_id.clone(),
+                target: self.task.target.clone(),
+            }
+            .into());
+        }
+
         let absolute_inputs = self.aggregate_inputs().await?;
         let processed_inputs = self.process_inputs(absolute_inputs)?;
 
         if !processed_inputs.is_empty() && self.app_context.vcs.is_enabled() {
             let files = processed_inputs.into_iter().collect::<Vec<_>>();
 
-            self.fingerprint.inputs = self.app_context.hash_files(&files).await?;
+            let source_id = self.task.source_id.clone();
+            let inputs = self
+                .app_context
+                .hash_files(&files)
+                .await?
+                .into_iter()
+                .map(|(path, hash)| (SourcePathBuf::new(source_id.clone(), path), hash));
+
+            self.hash_canonical_inputs(inputs);
         }
 
         if !self.task.input_env.is_empty() {
@@ -85,6 +114,51 @@ impl<'task> TaskHasher<'task> {
                     .input_env
                     .insert(input, bag.get(input).unwrap_or_default());
             }
+        }
+
+        Ok(())
+    }
+
+    /// Hash cross-source output files from canonical `cacheStrategy: outputs` dependencies.
+    pub async fn hash_resolved_dependency_outputs(
+        &mut self,
+        runtimes: &SourceRuntimeRegistry,
+        task_graph: &TaskGraph,
+        owner: &TaskKey,
+    ) -> miette::Result<()> {
+        let consumer_source_id = owner.project_key().source_id();
+        let ignore = GlobSet::new(&self.hasher_config.ignore_patterns)?;
+
+        for dependency in task_graph.resolved_dependencies_of(owner) {
+            if dependency.cache_strategy != moon_config::TaskDependencyCacheStrategy::Outputs {
+                continue;
+            }
+
+            let source_id = dependency.task_key.project_key().source_id();
+
+            // Source-local outputs are already injected into task inputs during expansion,
+            // where the normal input and output filtering semantics are applied.
+            if source_id == consumer_source_id {
+                continue;
+            }
+
+            let runtime = runtimes.get(source_id)?;
+            let task = task_graph.get_by_key(&dependency.task_key)?;
+            let mut files = task
+                .get_output_files(&runtime.workspace_root, true)?
+                .into_iter()
+                .filter(|file| file.is_file() && !ignore.is_included(file))
+                .map(|file| file.relative_to(&runtime.workspace_root).into_diagnostic())
+                .collect::<miette::Result<Vec<_>>>()?;
+            files.sort();
+            files.dedup();
+
+            let inputs = runtimes
+                .hash_files_for_source(source_id, &files)
+                .await?
+                .into_iter()
+                .map(|(path, hash)| (SourcePathBuf::new(source_id.clone(), path), hash));
+            self.hash_canonical_inputs(inputs);
         }
 
         Ok(())

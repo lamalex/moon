@@ -2,19 +2,25 @@ mod utils;
 
 use moon_action::ActionStatus;
 use moon_action_context::*;
+use moon_app_context::SourceRuntimeRegistry;
 use moon_cache::{CacheMode, Manifest};
+use moon_common::Id;
 use moon_config::{
-    TaskCheck, TaskCheckConditionConfig, TaskCheckFingerprint, TaskCheckFingerprintConfig,
-    TaskCheckRequirementConfig,
+    GlobPath, PortablePath, TaskCheck, TaskCheckConditionConfig, TaskCheckFingerprint,
+    TaskCheckFingerprintConfig, TaskCheckRequirementConfig,
 };
 use moon_env_var::GlobalEnvBag;
 use moon_hash::{ContentHasher, Digest};
-use moon_task::Target;
+use moon_task::TaskKey;
 use moon_task_runner::TaskRunner;
 use moon_task_runner::output_hydrater::HydrateFrom;
 use moon_time::now_millis;
 use rustc_hash::FxHashSet;
 use utils::*;
+
+fn key(project: &str, task: &str) -> TaskKey {
+    TaskKey::primary(Id::raw(project), Id::raw(task)).unwrap()
+}
 
 mod task_runner {
     use super::*;
@@ -34,7 +40,7 @@ mod task_runner {
             assert_ne!(
                 context
                     .target_states
-                    .get_sync(&runner.task.target)
+                    .get_sync(&runner.task.key())
                     .unwrap()
                     .get(),
                 &TargetState::Failed
@@ -43,6 +49,142 @@ mod task_runner {
 
         mod has_deps {
             use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn production_hashing_uses_canonical_resolved_dependencies() {
+                let container = TaskRunnerContainer::new("runner", "has-deps").await;
+                let node = container.create_action_node();
+                let context = ActionContext::default();
+                context
+                    .target_states
+                    .insert_sync(
+                        key("project", "dep"),
+                        TargetState::Passed("canonical-hash".into()),
+                    )
+                    .unwrap();
+                let task_graph = std::sync::Arc::clone(&container.workspace_graph.tasks);
+                assert_eq!(
+                    task_graph.resolved_dependencies_of(&container.task.key())[0].task_key,
+                    key("project", "dep")
+                );
+                let runtimes = std::sync::Arc::new(SourceRuntimeRegistry::single(
+                    std::sync::Arc::clone(&container.app_context),
+                ));
+                let mut runner = TaskRunner::new_with_hashing_context(
+                    &container.app_context,
+                    &container.project,
+                    &container.task,
+                    None,
+                    std::sync::Arc::clone(&task_graph),
+                    std::sync::Arc::clone(&runtimes),
+                )
+                .unwrap();
+                let canonical_hash = runner.hash(&context, &node).await.unwrap();
+
+                let mut task_without_direct_deps = container.task.as_ref().clone();
+                task_without_direct_deps.deps.clear();
+                let task_without_direct_deps = std::sync::Arc::new(task_without_direct_deps);
+                let mut runner = TaskRunner::new_with_hashing_context(
+                    &container.app_context,
+                    &container.project,
+                    &task_without_direct_deps,
+                    None,
+                    task_graph,
+                    runtimes,
+                )
+                .unwrap();
+
+                assert_eq!(runner.hash(&context, &node).await.unwrap(), canonical_hash);
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn production_hashing_preserves_same_source_output_filtering() {
+                let container = TaskRunnerContainer::new("runner", "has-output-dep").await;
+                let node = container.create_action_node();
+                let context = ActionContext::default();
+                context
+                    .target_states
+                    .insert_sync(
+                        key("project", "outputs"),
+                        TargetState::Passed("stable-producer-hash".into()),
+                    )
+                    .unwrap();
+                let task_graph = std::sync::Arc::clone(&container.workspace_graph.tasks);
+                let runtimes = std::sync::Arc::new(SourceRuntimeRegistry::single(
+                    std::sync::Arc::clone(&container.app_context),
+                ));
+                container.sandbox.create_file("project/file.txt", "before");
+                let mut runner = TaskRunner::new_with_hashing_context(
+                    &container.app_context,
+                    &container.project,
+                    &container.task,
+                    None,
+                    std::sync::Arc::clone(&task_graph),
+                    std::sync::Arc::clone(&runtimes),
+                )
+                .unwrap();
+                let before = runner.hash(&context, &node).await.unwrap();
+
+                container.sandbox.create_file("project/file.txt", "after");
+                let mut runner = TaskRunner::new_with_hashing_context(
+                    &container.app_context,
+                    &container.project,
+                    &container.task,
+                    None,
+                    task_graph,
+                    runtimes,
+                )
+                .unwrap();
+
+                assert_eq!(runner.hash(&context, &node).await.unwrap(), before);
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn production_hashing_preserves_same_source_ignore_patterns() {
+                let mut container =
+                    TaskRunnerContainer::new("runner", "has-ignored-output-dep").await;
+                let app_context = std::sync::Arc::get_mut(&mut container.app_context).unwrap();
+                std::sync::Arc::make_mut(&mut app_context.workspace_config)
+                    .hasher
+                    .ignore_patterns = vec![GlobPath::parse("**/file.txt").unwrap()];
+                let node = container.create_action_node();
+                let context = ActionContext::default();
+                context
+                    .target_states
+                    .insert_sync(
+                        key("project", "outputs"),
+                        TargetState::Passed("stable-producer-hash".into()),
+                    )
+                    .unwrap();
+                let task_graph = std::sync::Arc::clone(&container.workspace_graph.tasks);
+                let runtimes = std::sync::Arc::new(SourceRuntimeRegistry::single(
+                    std::sync::Arc::clone(&container.app_context),
+                ));
+                container.sandbox.create_file("project/file.txt", "before");
+                let mut runner = TaskRunner::new_with_hashing_context(
+                    &container.app_context,
+                    &container.project,
+                    &container.task,
+                    None,
+                    std::sync::Arc::clone(&task_graph),
+                    std::sync::Arc::clone(&runtimes),
+                )
+                .unwrap();
+                let before = runner.hash(&context, &node).await.unwrap();
+
+                container.sandbox.create_file("project/file.txt", "after");
+                let mut runner = TaskRunner::new_with_hashing_context(
+                    &container.app_context,
+                    &container.project,
+                    &container.task,
+                    None,
+                    task_graph,
+                    runtimes,
+                )
+                .unwrap();
+
+                assert_eq!(runner.hash(&context, &node).await.unwrap(), before);
+            }
 
             #[tokio::test(flavor = "multi_thread")]
             #[should_panic(expected = "Encountered a missing hash for task project:dep")]
@@ -64,7 +206,7 @@ mod task_runner {
                 let context = ActionContext::default();
                 context
                     .target_states
-                    .insert_sync(Target::new("project", "dep").unwrap(), TargetState::Skipped)
+                    .insert_sync(key("project", "dep"), TargetState::Skipped)
                     .unwrap();
 
                 runner.run_with_panic(&context, &node).await.unwrap();
@@ -72,7 +214,7 @@ mod task_runner {
                 assert_eq!(
                     context
                         .target_states
-                        .get_sync(&runner.task.target)
+                        .get_sync(&runner.task.key())
                         .unwrap()
                         .get(),
                     &TargetState::Skipped
@@ -88,7 +230,7 @@ mod task_runner {
                 let context = ActionContext::default();
                 context
                     .target_states
-                    .insert_sync(Target::new("project", "dep").unwrap(), TargetState::Failed)
+                    .insert_sync(key("project", "dep"), TargetState::Failed)
                     .unwrap();
 
                 runner.run_with_panic(&context, &node).await.unwrap();
@@ -96,7 +238,7 @@ mod task_runner {
                 assert_eq!(
                     context
                         .target_states
-                        .get_sync(&runner.task.target)
+                        .get_sync(&runner.task.key())
                         .unwrap()
                         .get(),
                     &TargetState::Skipped
@@ -127,7 +269,7 @@ mod task_runner {
 
                 let state = context
                     .target_states
-                    .get_sync(&task.target)
+                    .get_sync(&task.key())
                     .unwrap()
                     .get()
                     .clone();
@@ -158,7 +300,7 @@ mod task_runner {
 
                 let state = context
                     .target_states
-                    .get_sync(&task.target)
+                    .get_sync(&task.key())
                     .unwrap()
                     .get()
                     .clone();
@@ -205,7 +347,7 @@ mod task_runner {
                 context
                     .target_states
                     .insert_sync(
-                        Target::new("project", "dep").unwrap(),
+                        key("project", "dep"),
                         TargetState::SkippedConditional("abc123".into()),
                     )
                     .unwrap();
@@ -214,7 +356,7 @@ mod task_runner {
 
                 let state = context
                     .target_states
-                    .get_sync(&runner.task.target)
+                    .get_sync(&runner.task.key())
                     .unwrap()
                     .get()
                     .clone();
@@ -240,11 +382,11 @@ mod task_runner {
 
                 assert!(
                     container
-                        .sandbox
-                        .path()
-                        .join(".moon/cache/states")
-                        .join(container.project_id)
-                        .join("create-file/lastRun.json")
+                        .app_context
+                        .cache_engine
+                        .state
+                        .get_task_dir(&container.task.key())
+                        .join("lastRun.json")
                         .exists()
                 );
             }
@@ -408,11 +550,11 @@ mod task_runner {
 
                 assert!(
                     container
-                        .sandbox
-                        .path()
-                        .join(".moon/cache/states")
-                        .join(container.project_id)
-                        .join("without-cache/lastRun.json")
+                        .app_context
+                        .cache_engine
+                        .state
+                        .get_task_dir(&container.task.key())
+                        .join("lastRun.json")
                         .exists()
                 );
             }
@@ -742,7 +884,7 @@ mod task_runner {
 
             context
                 .target_states
-                .insert_sync(Target::new("project", "dep").unwrap(), TargetState::Failed)
+                .insert_sync(key("project", "dep"), TargetState::Failed)
                 .unwrap();
 
             assert!(!runner.is_dependencies_complete(&context).unwrap());
@@ -756,7 +898,7 @@ mod task_runner {
 
             context
                 .target_states
-                .insert_sync(Target::new("project", "dep").unwrap(), TargetState::Skipped)
+                .insert_sync(key("project", "dep"), TargetState::Skipped)
                 .unwrap();
 
             assert!(!runner.is_dependencies_complete(&context).unwrap());
@@ -770,10 +912,7 @@ mod task_runner {
 
             context
                 .target_states
-                .insert_sync(
-                    Target::new("project", "dep").unwrap(),
-                    TargetState::Passed("hash123".into()),
-                )
+                .insert_sync(key("project", "dep"), TargetState::Passed("hash123".into()))
                 .unwrap();
 
             assert!(runner.is_dependencies_complete(&context).unwrap());
@@ -788,7 +927,7 @@ mod task_runner {
             context
                 .target_states
                 .insert_sync(
-                    Target::new("project", "dep").unwrap(),
+                    key("project", "dep"),
                     TargetState::SkippedConditional("hash123".into()),
                 )
                 .unwrap();
@@ -813,8 +952,8 @@ mod task_runner {
             let mut context = ActionContext::default();
 
             context.ignored_dependencies.insert(
-                runner.task.target.clone(),
-                FxHashSet::from_iter([Target::new("project", "dep").unwrap()]),
+                runner.task.key(),
+                FxHashSet::from_iter([key("project", "dep")]),
             );
 
             assert!(runner.is_dependencies_complete(&context).unwrap());
@@ -828,8 +967,8 @@ mod task_runner {
             let mut context = ActionContext::default();
 
             context.ignored_dependencies.insert(
-                Target::new("project", "other").unwrap(),
-                FxHashSet::from_iter([Target::new("project", "dep").unwrap()]),
+                key("project", "other"),
+                FxHashSet::from_iter([key("project", "dep")]),
             );
 
             runner.is_dependencies_complete(&context).unwrap();
@@ -865,9 +1004,7 @@ mod task_runner {
 
             let before_hash = runner.hash(&context, &node).await.unwrap();
 
-            context
-                .primary_targets
-                .insert(Target::new("project", "base").unwrap());
+            context.primary_targets.insert(key("project", "base"));
             context.passthrough_args.push("--extra".into());
 
             let after_hash = runner.hash(&context, &node).await.unwrap();
@@ -1037,11 +1174,11 @@ mod task_runner {
 
             assert!(
                 container
-                    .sandbox
-                    .path()
-                    .join(".moon/cache/states")
-                    .join(container.project_id)
-                    .join("success/stdout.log")
+                    .app_context
+                    .cache_engine
+                    .state
+                    .get_task_dir(&container.task.key())
+                    .join("stdout.log")
                     .exists()
             );
         }
