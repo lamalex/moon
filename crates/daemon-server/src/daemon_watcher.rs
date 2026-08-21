@@ -1,11 +1,10 @@
 use crate::daemon_server_error::DaemonServerError;
-use moon_common::format_error_chain;
-use moon_common::path::PathExt;
+use moon_common::{SourceRegistry, format_error_chain};
 use moon_file_watcher::*;
 use notify_debouncer_full::{new_debouncer, notify::RecursiveMode};
 use rustc_hash::FxHashSet;
 use std::path::{Component, Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, trace, warn};
@@ -56,12 +55,12 @@ fn map_notify_error(error: notify_debouncer_full::notify::Error) -> DaemonServer
     }
 }
 
-fn create_file_event(workspace_root: &Path, path: &Path, kind: EventKind) -> Option<FileEvent> {
+fn create_file_event(sources: &SourceRegistry, path: &Path, kind: EventKind) -> Option<FileEvent> {
     if is_ignored(path) {
         return None;
     }
 
-    let path_relative = match path.relative_to(workspace_root) {
+    let source_path = match sources.qualify(path) {
         Ok(path) => path,
         Err(error) => {
             warn!(
@@ -75,10 +74,36 @@ fn create_file_event(workspace_root: &Path, path: &Path, kind: EventKind) -> Opt
     };
 
     Some(FileEvent {
+        source_id: source_path.source,
         path_original: path.to_owned(),
-        path: path_relative,
+        path: source_path.path,
         kind,
     })
+}
+
+fn get_watch_roots(sources: &SourceRegistry) -> Vec<PathBuf> {
+    let mut roots = sources
+        .iter()
+        .map(|(_, root)| root.to_path_buf())
+        .collect::<Vec<_>>();
+    roots.sort_by(|a, b| {
+        a.components()
+            .count()
+            .cmp(&b.components().count())
+            .then_with(|| a.cmp(b))
+    });
+
+    // A recursive parent watch already covers nested source roots. Registering
+    // both may deliver the same physical mutation more than once.
+    let mut watched = Vec::<PathBuf>::new();
+
+    for root in roots {
+        if !watched.iter().any(|parent| root.starts_with(parent)) {
+            watched.push(root);
+        }
+    }
+
+    watched
 }
 
 /// Start watching the workspace root for file changes.
@@ -87,10 +112,10 @@ fn create_file_event(workspace_root: &Path, path: &Path, kind: EventKind) -> Opt
 /// runs until `shutdown_rx` receives a message, at which point it
 /// drops the underlying OS watcher and returns.
 ///
-/// Errors from the `notify` backend are logged but do not stop the
-/// watcher — only a shutdown signal does.
+/// Errors from the `notify` backend stop the watcher so the daemon can retire
+/// instead of serving with incomplete filesystem observations.
 pub async fn start_file_watcher(
-    workspace_root: PathBuf,
+    sources: Arc<SourceRegistry>,
     event_tx: broadcast::Sender<FileEvent>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> miette::Result<()> {
@@ -104,27 +129,31 @@ pub async fn start_file_watcher(
     })
     .map_err(map_notify_error)?;
 
-    // Watch the workspace recursively. `notify` sets this up as a single
+    // Watch every distinct source tree recursively. `notify` sets this up as an
     // efficient watch (one FSEvents stream on macOS; per-directory inotify
     // watches on Linux); events inside ignored directories are filtered out
     // by `create_file_event`. Registering watches per-directory ourselves was
     // untenable — walking a real repo's `target`/build output is tens of
     // thousands of directories and never finishes setup.
-    debouncer
-        .watch(&workspace_root, RecursiveMode::Recursive)
-        .map_err(map_notify_error)?;
+    let watch_roots = get_watch_roots(&sources);
 
-    debug!(path = ?workspace_root, "File watcher started");
+    for root in &watch_roots {
+        debouncer
+            .watch(root, RecursiveMode::Recursive)
+            .map_err(map_notify_error)?;
+    }
+
+    debug!(roots = ?watch_roots, "File watcher started");
 
     loop {
         tokio::select! {
-            Some(result) = bridge_rx.recv() => {
+            result = bridge_rx.recv() => {
                 match result {
-                    Ok(events) => {
+                    Some(Ok(events)) => {
                         for event in events {
                             for path in &event.paths {
                                 if let Some(file_event) =
-                                    create_file_event(&workspace_root, path, event.kind)
+                                    create_file_event(&sources, path, event.kind)
                                 {
                                     // We only care about mutations, not access, etc
                                     if file_event.is_mutated() {
@@ -141,10 +170,16 @@ pub async fn start_file_watcher(
                             }
                         }
                     }
-                    Err(errors) => {
-                        for error in errors {
-                            warn!(error = error.to_string(), "File watcher error");
-                        }
+                    Some(Err(errors)) => {
+                        let error = errors
+                            .into_iter()
+                            .next()
+                            .expect("Notify must return at least one watcher error");
+
+                        return Err(map_notify_error(error).into());
+                    }
+                    None => {
+                        return Err(miette::miette!("File watcher event bridge stopped unexpectedly"));
                     }
                 }
             }
@@ -210,6 +245,11 @@ pub async fn start_file_listener<T: Clone + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moon_common::SourceRootId;
+
+    fn sources() -> SourceRegistry {
+        SourceRegistry::single(PathBuf::from("/workspace"))
+    }
 
     #[test]
     fn test_is_ignored_git() {
@@ -257,13 +297,90 @@ mod tests {
     #[test]
     fn creates_workspace_relative_file_event() {
         let event = create_file_event(
-            Path::new("/workspace"),
+            &sources(),
             Path::new("/workspace/src/main.rs"),
             EventKind::Any,
         )
         .unwrap();
 
         assert_eq!(event.path.as_str(), "src/main.rs");
+        assert_eq!(event.source_id, SourceRootId::primary());
+    }
+
+    #[test]
+    fn tags_nested_events_with_the_most_specific_source() {
+        let mut sources = sources();
+        let child = SourceRootId::new("child").unwrap();
+        sources
+            .register(child.clone(), PathBuf::from("/workspace/packages/child"))
+            .unwrap();
+
+        let event = create_file_event(
+            &sources,
+            Path::new("/workspace/packages/child/src/main.rs"),
+            EventKind::Any,
+        )
+        .unwrap();
+
+        assert_eq!(event.source_id, child);
+        assert_eq!(event.path.as_str(), "src/main.rs");
+        assert_eq!(get_watch_roots(&sources), vec![PathBuf::from("/workspace")]);
+    }
+
+    #[test]
+    fn tags_child_root_removal_without_dropping_the_empty_path() {
+        let mut sources = sources();
+        let child = SourceRootId::new("child").unwrap();
+        sources
+            .register(child.clone(), PathBuf::from("/workspace/packages/child"))
+            .unwrap();
+
+        let event = create_file_event(
+            &sources,
+            Path::new("/workspace/packages/child"),
+            EventKind::Remove(RemoveKind::Folder),
+        )
+        .unwrap();
+
+        assert_eq!(event.source_id, child);
+        assert!(event.path.as_str().is_empty());
+        assert!(event.is_source_root_removed_or_renamed());
+    }
+
+    #[test]
+    fn tags_child_root_rename_without_dropping_the_empty_path() {
+        let mut sources = sources();
+        let child = SourceRootId::new("child").unwrap();
+        sources
+            .register(child.clone(), PathBuf::from("/workspace/packages/child"))
+            .unwrap();
+
+        let event = create_file_event(
+            &sources,
+            Path::new("/workspace/packages/child"),
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+        )
+        .unwrap();
+
+        assert_eq!(event.source_id, child);
+        assert!(event.path.as_str().is_empty());
+        assert!(event.is_source_root_removed_or_renamed());
+    }
+
+    #[test]
+    fn watches_disjoint_source_roots() {
+        let mut sources = sources();
+        sources
+            .register(
+                SourceRootId::new("child").unwrap(),
+                PathBuf::from("/other/child"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            get_watch_roots(&sources),
+            vec![PathBuf::from("/workspace"), PathBuf::from("/other/child")]
+        );
     }
 
     #[test]
@@ -274,6 +391,6 @@ mod tests {
 
         let path = PathBuf::from(OsStr::from_bytes(b"/workspace/src/\xFF.rs"));
 
-        assert!(create_file_event(Path::new("/workspace"), &path, EventKind::Any,).is_none());
+        assert!(create_file_event(&sources(), &path, EventKind::Any).is_none());
     }
 }

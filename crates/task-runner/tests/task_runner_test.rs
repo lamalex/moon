@@ -4,13 +4,14 @@ use moon_action::ActionStatus;
 use moon_action_context::*;
 use moon_app_context::SourceRuntimeRegistry;
 use moon_cache::{CacheMode, Manifest};
-use moon_common::Id;
+use moon_common::{Id, SourceRootId};
 use moon_config::{
     GlobPath, PortablePath, TaskCheck, TaskCheckConditionConfig, TaskCheckFingerprint,
     TaskCheckFingerprintConfig, TaskCheckRequirementConfig,
 };
 use moon_env_var::GlobalEnvBag;
 use moon_hash::{ContentHasher, Digest};
+use moon_target::{ProjectKey, TaskInvocationKey};
 use moon_task::TaskKey;
 use moon_task_runner::TaskRunner;
 use moon_task_runner::output_hydrater::HydrateFrom;
@@ -25,6 +26,30 @@ fn key(project: &str, task: &str) -> TaskKey {
 mod task_runner {
     use super::*;
 
+    #[tokio::test]
+    async fn rejects_mismatched_invocation_task_keys() {
+        let container = TaskRunnerContainer::new("runner", "base").await;
+        let same_source = TaskKey::primary(Id::raw("project"), Id::raw("other")).unwrap();
+        let different_source = TaskKey::new(
+            ProjectKey::new(SourceRootId::new("child").unwrap(), Id::raw("project")).unwrap(),
+            Id::raw("base"),
+        )
+        .unwrap();
+
+        for invocation_key in [same_source, different_source] {
+            assert!(
+                TaskRunner::new_for_invocation(
+                    &container.app_context,
+                    &container.project,
+                    &container.task,
+                    invocation_key.into(),
+                    None,
+                )
+                .is_err()
+            );
+        }
+    }
+
     mod run {
         use super::*;
 
@@ -38,12 +63,8 @@ mod task_runner {
             runner.run_with_panic(&context, &node).await.unwrap();
 
             assert_ne!(
-                context
-                    .target_states
-                    .get_sync(&runner.task.key())
-                    .unwrap()
-                    .get(),
-                &TargetState::Failed
+                context.get_task_state(&runner.task.key()).unwrap(),
+                TargetState::Failed
             );
         }
 
@@ -55,13 +76,10 @@ mod task_runner {
                 let container = TaskRunnerContainer::new("runner", "has-deps").await;
                 let node = container.create_action_node();
                 let context = ActionContext::default();
-                context
-                    .target_states
-                    .insert_sync(
-                        key("project", "dep"),
-                        TargetState::Passed("canonical-hash".into()),
-                    )
-                    .unwrap();
+                context.set_task_state(
+                    key("project", "dep"),
+                    TargetState::Passed("canonical-hash".into()),
+                );
                 let task_graph = std::sync::Arc::clone(&container.workspace_graph.tasks);
                 assert_eq!(
                     task_graph.resolved_dependencies_of(&container.task.key())[0].task_key,
@@ -102,13 +120,10 @@ mod task_runner {
                 let container = TaskRunnerContainer::new("runner", "has-output-dep").await;
                 let node = container.create_action_node();
                 let context = ActionContext::default();
-                context
-                    .target_states
-                    .insert_sync(
-                        key("project", "outputs"),
-                        TargetState::Passed("stable-producer-hash".into()),
-                    )
-                    .unwrap();
+                context.set_task_state(
+                    key("project", "outputs"),
+                    TargetState::Passed("stable-producer-hash".into()),
+                );
                 let task_graph = std::sync::Arc::clone(&container.workspace_graph.tasks);
                 let runtimes = std::sync::Arc::new(SourceRuntimeRegistry::single(
                     std::sync::Arc::clone(&container.app_context),
@@ -149,13 +164,10 @@ mod task_runner {
                     .ignore_patterns = vec![GlobPath::parse("**/file.txt").unwrap()];
                 let node = container.create_action_node();
                 let context = ActionContext::default();
-                context
-                    .target_states
-                    .insert_sync(
-                        key("project", "outputs"),
-                        TargetState::Passed("stable-producer-hash".into()),
-                    )
-                    .unwrap();
+                context.set_task_state(
+                    key("project", "outputs"),
+                    TargetState::Passed("stable-producer-hash".into()),
+                );
                 let task_graph = std::sync::Arc::clone(&container.workspace_graph.tasks);
                 let runtimes = std::sync::Arc::new(SourceRuntimeRegistry::single(
                     std::sync::Arc::clone(&container.app_context),
@@ -204,20 +216,13 @@ mod task_runner {
                 let node = container.create_action_node();
 
                 let context = ActionContext::default();
-                context
-                    .target_states
-                    .insert_sync(key("project", "dep"), TargetState::Skipped)
-                    .unwrap();
+                context.set_task_state(key("project", "dep"), TargetState::Skipped);
 
                 runner.run_with_panic(&context, &node).await.unwrap();
 
                 assert_eq!(
-                    context
-                        .target_states
-                        .get_sync(&runner.task.key())
-                        .unwrap()
-                        .get(),
-                    &TargetState::Skipped
+                    context.get_task_state(&runner.task.key()).unwrap(),
+                    TargetState::Skipped
                 );
             }
 
@@ -228,20 +233,13 @@ mod task_runner {
                 let node = container.create_action_node();
 
                 let context = ActionContext::default();
-                context
-                    .target_states
-                    .insert_sync(key("project", "dep"), TargetState::Failed)
-                    .unwrap();
+                context.set_task_state(key("project", "dep"), TargetState::Failed);
 
                 runner.run_with_panic(&context, &node).await.unwrap();
 
                 assert_eq!(
-                    context
-                        .target_states
-                        .get_sync(&runner.task.key())
-                        .unwrap()
-                        .get(),
-                    &TargetState::Skipped
+                    context.get_task_state(&runner.task.key()).unwrap(),
+                    TargetState::Skipped
                 );
             }
         }
@@ -267,12 +265,7 @@ mod task_runner {
 
                 runner.run(&context, &node).await.unwrap();
 
-                let state = context
-                    .target_states
-                    .get_sync(&task.key())
-                    .unwrap()
-                    .get()
-                    .clone();
+                let state = context.get_task_state(&task.key()).unwrap();
 
                 assert!(
                     matches!(state, TargetState::SkippedConditional(_)),
@@ -298,12 +291,7 @@ mod task_runner {
 
                 runner.run(&context, &node).await.unwrap();
 
-                let state = context
-                    .target_states
-                    .get_sync(&task.key())
-                    .unwrap()
-                    .get()
-                    .clone();
+                let state = context.get_task_state(&task.key()).unwrap();
 
                 assert!(
                     !matches!(state, TargetState::SkippedConditional(_)),
@@ -344,22 +332,14 @@ mod task_runner {
                 let node = container.create_action_node();
 
                 let context = ActionContext::default();
-                context
-                    .target_states
-                    .insert_sync(
-                        key("project", "dep"),
-                        TargetState::SkippedConditional("abc123".into()),
-                    )
-                    .unwrap();
+                context.set_task_state(
+                    key("project", "dep"),
+                    TargetState::SkippedConditional("abc123".into()),
+                );
 
                 runner.run_with_panic(&context, &node).await.unwrap();
 
-                let state = context
-                    .target_states
-                    .get_sync(&runner.task.key())
-                    .unwrap()
-                    .get()
-                    .clone();
+                let state = context.get_task_state(&runner.task.key()).unwrap();
 
                 assert_ne!(state, TargetState::Skipped);
                 assert_ne!(state, TargetState::Failed);
@@ -368,6 +348,56 @@ mod task_runner {
 
         mod with_cache {
             use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn variants_use_distinct_cache_state_paths() {
+                let container = TaskRunnerContainer::new("runner", "base").await;
+                let task_key = container.task.key();
+                let first = TaskInvocationKey::new(
+                    task_key.clone(),
+                    ["--mode=a"],
+                    Vec::<(&str, Option<&str>)>::new(),
+                );
+                let second = TaskInvocationKey::new(
+                    task_key.clone(),
+                    ["--mode=b"],
+                    Vec::<(&str, Option<&str>)>::new(),
+                );
+                let ordinary = TaskRunner::new(
+                    &container.app_context,
+                    &container.project,
+                    &container.task,
+                    None,
+                )
+                .unwrap();
+                let first_runner = TaskRunner::new_for_invocation(
+                    &container.app_context,
+                    &container.project,
+                    &container.task,
+                    first,
+                    None,
+                )
+                .unwrap();
+                let second_runner = TaskRunner::new_for_invocation(
+                    &container.app_context,
+                    &container.project,
+                    &container.task,
+                    second,
+                    None,
+                )
+                .unwrap();
+
+                assert_eq!(
+                    ordinary.cache.path,
+                    container
+                        .app_context
+                        .cache_engine
+                        .state
+                        .get_task_dir(&task_key)
+                        .join("lastRun.json")
+                );
+                assert_ne!(first_runner.cache.path, second_runner.cache.path);
+            }
 
             #[tokio::test(flavor = "multi_thread")]
             async fn creates_cache_state_file() {
@@ -882,10 +912,7 @@ mod task_runner {
             let runner = container.create_runner();
             let context = ActionContext::default();
 
-            context
-                .target_states
-                .insert_sync(key("project", "dep"), TargetState::Failed)
-                .unwrap();
+            context.set_task_state(key("project", "dep"), TargetState::Failed);
 
             assert!(!runner.is_dependencies_complete(&context).unwrap());
         }
@@ -896,10 +923,7 @@ mod task_runner {
             let runner = container.create_runner();
             let context = ActionContext::default();
 
-            context
-                .target_states
-                .insert_sync(key("project", "dep"), TargetState::Skipped)
-                .unwrap();
+            context.set_task_state(key("project", "dep"), TargetState::Skipped);
 
             assert!(!runner.is_dependencies_complete(&context).unwrap());
         }
@@ -910,10 +934,7 @@ mod task_runner {
             let runner = container.create_runner();
             let context = ActionContext::default();
 
-            context
-                .target_states
-                .insert_sync(key("project", "dep"), TargetState::Passed("hash123".into()))
-                .unwrap();
+            context.set_task_state(key("project", "dep"), TargetState::Passed("hash123".into()));
 
             assert!(runner.is_dependencies_complete(&context).unwrap());
         }
@@ -924,14 +945,45 @@ mod task_runner {
             let runner = container.create_runner();
             let context = ActionContext::default();
 
-            context
-                .target_states
-                .insert_sync(
-                    key("project", "dep"),
-                    TargetState::SkippedConditional("hash123".into()),
-                )
-                .unwrap();
+            context.set_task_state(
+                key("project", "dep"),
+                TargetState::SkippedConditional("hash123".into()),
+            );
 
+            assert!(runner.is_dependencies_complete(&context).unwrap());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn checks_every_exact_required_variant() {
+            let container = TaskRunnerContainer::new("runner", "has-variant-deps").await;
+            let task_graph = std::sync::Arc::clone(&container.workspace_graph.tasks);
+            let dependencies = task_graph.resolved_dependencies_of(&container.task.key());
+            assert_eq!(dependencies.len(), 2);
+            let context = ActionContext::default();
+            context.set_invocation_state(
+                dependencies[0].invocation_key(),
+                TargetState::Passed("first".into()),
+            );
+            context.set_invocation_state(dependencies[1].invocation_key(), TargetState::Failed);
+            let runtimes = std::sync::Arc::new(SourceRuntimeRegistry::single(
+                std::sync::Arc::clone(&container.app_context),
+            ));
+            let runner = TaskRunner::new_with_hashing_context(
+                &container.app_context,
+                &container.project,
+                &container.task,
+                None,
+                std::sync::Arc::clone(&task_graph),
+                runtimes,
+            )
+            .unwrap();
+
+            assert!(!runner.is_dependencies_complete(&context).unwrap());
+
+            context.set_invocation_state(
+                dependencies[1].invocation_key(),
+                TargetState::Passed("second".into()),
+            );
             assert!(runner.is_dependencies_complete(&context).unwrap());
         }
 

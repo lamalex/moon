@@ -33,16 +33,23 @@ pub async fn run_task(
     action.allow_failure = task.options.allow_failure;
 
     let mut runner = if let Some(runner_context) = runner_context {
-        TaskRunner::new_with_hashing_context(
+        TaskRunner::new_with_hashing_context_for_invocation(
             &app_context,
             &project,
             &task,
+            node.invocation_key(),
             daemon_client,
             runner_context.task_graph,
             runner_context.source_runtime_registry,
         )?
     } else {
-        TaskRunner::new(&app_context, &project, &task, daemon_client)?
+        TaskRunner::new_for_invocation(
+            &app_context,
+            &project,
+            &task,
+            node.invocation_key(),
+            daemon_client,
+        )?
     };
     let result = runner.run(&action_context, &action.node).await?;
 

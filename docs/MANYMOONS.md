@@ -7,8 +7,8 @@ described by this document are intentionally undecided unless explicitly marked 
 
 Milestone 1, internal source-root qualification, Milestone 2, direct multi-workspace discovery,
 Milestone 3, aggregated querying, Milestone 4, cross-source project dependencies, Milestone 5, the
-unified task graph, and Milestone 6, cross-source hashing and cache safety, are complete. Milestone
-7, cross-source action execution, is next.
+unified task graph, Milestone 6, cross-source hashing and cache safety, and Milestone 7,
+cross-source action execution, are complete. Manymoons is ready for user acceptance testing.
 
 ## End Goal
 
@@ -281,8 +281,8 @@ declaring workspace and may be reused elsewhere.
 Exit criteria: multiple sources can be listed and diagnosed, while all existing unqualified
 commands remain scoped to the current or primary source.
 
-Live child-root watcher routing remains deferred to Milestone 7. Milestone 2 loads and isolates
-every direct source for each session, while daemon file events remain primary-root scoped.
+Live child-root watcher routing was deferred to Milestone 7. Milestone 2 loads and isolates every
+direct source for each session; Milestone 7 source-qualifies daemon file events and invalidation.
 
 ### Milestone 3: Aggregated Querying
 
@@ -358,8 +358,8 @@ canonical source-qualified identities. Runtime services are addressable through 
 source registry, and task hashing routes dependency outputs through the producing source. Daemon
 hashing, packing, and hydration requests carry and validate source identity. Aggregate affected
 queries retain per-source completeness, while piped unqualified changed-file input remains scoped
-to the primary source and treats other sources conservatively. Cross-source action dispatch remains
-disabled until Milestone 7.
+to the primary source and treats other sources conservatively. Cross-source action dispatch
+remained disabled until Milestone 7.
 
 Exit criteria: source-qualified hashing, state, packing, hydration, and daemon operations pass
 cross-source tests without enabling cross-source action dispatch.
@@ -374,6 +374,14 @@ cross-source tests without enabling cross-source action dispatch.
   interactive behavior, and persistent-task behavior.
 
 This milestone completes the end-to-end path without introducing a second scheduler.
+
+Primary-source target selection remains unchanged, while canonical dependency and dependent edges
+expand through one aggregate action graph. Every executable action carries source ownership and is
+routed through the exact source runtime by the existing pipeline and dispatcher. Changed files and
+affected state are source-qualified, shared setup operations are serialized safely, and cache
+cleanup covers every available source. Daemon watchers tag events by source, rebuild only affected
+child contexts for ordinary changes, and retire safely when source topology changes require
+rediscovery.
 
 Exit criteria: cross-source dependencies execute and cache correctly through one action graph, and
 single-source commands produce the same target selection and action semantics as before.

@@ -4,14 +4,15 @@ use moon_action::*;
 use moon_action_context::TargetState;
 use moon_action_graph::{ActionGraph, ActionGraphBuilderOptions, RunRequirements};
 use moon_affected::{AffectedBy, DownstreamScope, UpstreamScope};
-use moon_common::{Id, path::WorkspaceRelativePathBuf};
+use moon_common::{Id, SourceRootId, path::WorkspaceRelativePathBuf};
 use moon_config::{
     EnvMap, PROTO_CLI_VERSION, PipelineActionSwitch, TaskDependencyConfig, TaskOptionRunInCI,
     UnresolvedVersionSpec, Version, VersionSpec,
 };
 use moon_exec_plan::{ExecutionPlan, GraphBlock, TargetsBlock};
 use moon_graph_utils::*;
-use moon_task::{Target, TargetLocator, Task, TaskFileInput, TaskKey};
+use moon_target::TaskInvocationKey;
+use moon_task::{ProjectKey, Target, TargetLocator, Task, TaskFileInput, TaskKey};
 use moon_toolchain::ToolchainSpec;
 use rustc_hash::{FxHashMap, FxHashSet};
 use starbase_sandbox::{assert_snapshot, create_sandbox};
@@ -28,6 +29,14 @@ fn create_task(project: &str, id: &str) -> Task {
 
 fn primary_key(target: &str) -> TaskKey {
     TaskKey::from_target(Default::default(), &Target::parse(target).unwrap()).unwrap()
+}
+
+fn primary_source() -> SourceRootId {
+    SourceRootId::primary()
+}
+
+fn primary_project(id: &str) -> ProjectKey {
+    ProjectKey::primary(Id::raw(id)).unwrap()
 }
 
 fn key_target(key: TaskKey) -> Target {
@@ -104,7 +113,10 @@ mod action_graph_builder {
             let (_, graph) = builder.build();
 
             assert_snapshot!(graph.to_dot());
-            assert_eq!(topo(graph), vec![ActionNode::sync_workspace()]);
+            assert_eq!(
+                topo(graph),
+                vec![ActionNode::sync_workspace(primary_source())]
+            );
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -128,10 +140,11 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::install_dependencies(InstallDependenciesNode {
+                        source_id: primary_source(),
                         members: None,
-                        project_id: Some(Id::raw("bar")),
+                        project_key: Some(primary_project("bar")),
                         root: WorkspaceRelativePathBuf::from("bar"),
                         toolchain_id: spec.id,
                     })
@@ -160,14 +173,16 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::sync_workspace(primary_source()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: spec.clone()
                     }),
                     ActionNode::install_dependencies(InstallDependenciesNode {
+                        source_id: primary_source(),
                         members: None,
-                        project_id: Some(Id::raw("bar")),
+                        project_key: Some(primary_project("bar")),
                         root: WorkspaceRelativePathBuf::from("bar"),
                         toolchain_id: spec.id,
                     })
@@ -206,15 +221,20 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::sync_workspace(primary_source()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: spec1.clone()
                     }),
-                    ActionNode::setup_toolchain(SetupToolchainNode { toolchain: spec2 }),
+                    ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
+                        toolchain: spec2
+                    }),
                     ActionNode::install_dependencies(InstallDependenciesNode {
+                        source_id: primary_source(),
                         members: None,
-                        project_id: Some(Id::raw("bar")),
+                        project_key: Some(primary_project("bar")),
                         root: WorkspaceRelativePathBuf::from("bar"),
                         toolchain_id: spec1.id,
                     })
@@ -258,15 +278,17 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::sync_workspace(primary_source()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: ToolchainSpec::new(
                             Id::raw("rust"),
                             UnresolvedVersionSpec::parse("1.70.0").unwrap()
                         )
                     }),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: ToolchainSpec::new(
                             Id::raw("rust"),
                             UnresolvedVersionSpec::parse("1.90.0").unwrap()
@@ -299,15 +321,17 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::setup_environment(SetupEnvironmentNode {
-                        project_id: Some(Id::raw("bar")),
+                        source_id: primary_source(),
+                        project_key: Some(primary_project("bar")),
                         root: WorkspaceRelativePathBuf::from("bar"),
                         toolchain_id: spec.id.clone(),
                     }),
                     ActionNode::install_dependencies(InstallDependenciesNode {
+                        source_id: primary_source(),
                         members: None,
-                        project_id: Some(Id::raw("bar")),
+                        project_key: Some(primary_project("bar")),
                         root: WorkspaceRelativePathBuf::from("bar"),
                         toolchain_id: spec.id,
                     })
@@ -345,22 +369,25 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::sync_workspace(primary_source()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: ToolchainSpec::new(
                             Id::raw("tc-tier3"),
                             create_unresolved_version(Version::new(1, 2, 3)),
                         )
                     }),
                     ActionNode::setup_environment(SetupEnvironmentNode {
-                        project_id: Some(Id::raw("bar")),
+                        source_id: primary_source(),
+                        project_key: Some(primary_project("bar")),
                         root: WorkspaceRelativePathBuf::from("bar"),
                         toolchain_id: spec.id.clone(),
                     }),
                     ActionNode::install_dependencies(InstallDependenciesNode {
+                        source_id: primary_source(),
                         members: None,
-                        project_id: Some(Id::raw("bar")),
+                        project_key: Some(primary_project("bar")),
                         root: WorkspaceRelativePathBuf::from("bar"),
                         toolchain_id: spec.id,
                     })
@@ -482,10 +509,11 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::install_dependencies(InstallDependenciesNode {
+                        source_id: primary_source(),
                         members: None,
-                        project_id: Some(Id::raw("bar")),
+                        project_key: Some(primary_project("bar")),
                         root: WorkspaceRelativePathBuf::from("bar"),
                         toolchain_id: spec.id,
                     })
@@ -513,10 +541,11 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::install_dependencies(InstallDependenciesNode {
+                        source_id: primary_source(),
                         members: None,
-                        project_id: Some(Id::raw("isolated")),
+                        project_key: Some(primary_project("isolated")),
                         root: WorkspaceRelativePathBuf::from("isolated"),
                         toolchain_id: spec.id,
                     })
@@ -547,7 +576,10 @@ mod action_graph_builder {
 
             let (_, graph) = builder.build();
 
-            assert_eq!(topo(graph), vec![ActionNode::sync_workspace()]);
+            assert_eq!(
+                topo(graph),
+                vec![ActionNode::sync_workspace(primary_source())]
+            );
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -569,7 +601,10 @@ mod action_graph_builder {
 
             let (_, graph) = builder.build();
 
-            assert_eq!(topo(graph), vec![ActionNode::sync_workspace()]);
+            assert_eq!(
+                topo(graph),
+                vec![ActionNode::sync_workspace(primary_source())]
+            );
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -596,9 +631,12 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
-                    ActionNode::setup_proto(create_proto_version()),
-                    ActionNode::setup_toolchain(SetupToolchainNode { toolchain: spec }),
+                    ActionNode::sync_workspace(primary_source()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
+                    ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
+                        toolchain: spec,
+                    })
                 ]
             );
         }
@@ -623,10 +661,11 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::install_dependencies(InstallDependenciesNode {
+                        source_id: primary_source(),
                         members: Some(vec!["in".into()]),
-                        project_id: None,
+                        project_key: None,
                         root: WorkspaceRelativePathBuf::new(),
                         toolchain_id: spec.id,
                     })
@@ -654,10 +693,11 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::install_dependencies(InstallDependenciesNode {
+                        source_id: primary_source(),
                         members: Some(vec!["in".into()]),
-                        project_id: None,
+                        project_key: None,
                         root: WorkspaceRelativePathBuf::new(),
                         toolchain_id: spec.id,
                     })
@@ -689,10 +729,11 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::install_dependencies(InstallDependenciesNode {
+                        source_id: primary_source(),
                         members: None,
-                        project_id: None,
+                        project_key: None,
                         root: WorkspaceRelativePathBuf::new(),
                         toolchain_id: spec.id,
                     })
@@ -718,14 +759,16 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::sync_workspace(primary_source()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: spec.clone()
                     }),
                     ActionNode::install_dependencies(InstallDependenciesNode {
+                        source_id: primary_source(),
                         members: None,
-                        project_id: None,
+                        project_key: None,
                         root: WorkspaceRelativePathBuf::new(),
                         toolchain_id: spec.id,
                     })
@@ -751,15 +794,17 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::setup_environment(SetupEnvironmentNode {
-                        project_id: None,
+                        source_id: primary_source(),
+                        project_key: None,
                         root: WorkspaceRelativePathBuf::new(),
                         toolchain_id: spec.id.clone(),
                     }),
                     ActionNode::install_dependencies(InstallDependenciesNode {
+                        source_id: primary_source(),
                         members: None,
-                        project_id: None,
+                        project_key: None,
                         root: WorkspaceRelativePathBuf::new(),
                         toolchain_id: spec.id,
                     })
@@ -787,10 +832,11 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::install_dependencies(InstallDependenciesNode {
+                        source_id: primary_source(),
                         members: Some(vec!["in".into()]),
-                        project_id: None,
+                        project_key: None,
                         root: WorkspaceRelativePathBuf::new(),
                         toolchain_id: spec.id,
                     })
@@ -822,10 +868,11 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::install_dependencies(InstallDependenciesNode {
+                        source_id: primary_source(),
                         members: Some(vec!["in".into()]),
-                        project_id: None,
+                        project_key: None,
                         root: WorkspaceRelativePathBuf::new(),
                         toolchain_id: spec.id,
                     })
@@ -976,12 +1023,13 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw("bar"),
+                        project_key: primary_project("bar"),
                     }),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: create_node_spec(),
                     }),
                     ActionNode::run_task(RunTaskNode::new(task.target.clone()))
@@ -1017,12 +1065,13 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw("bar"),
+                        project_key: primary_project("bar"),
                     }),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: create_node_spec(),
                     }),
                     ActionNode::run_task(RunTaskNode::new(task.target.clone()))
@@ -1168,12 +1217,13 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw("bar"),
+                        project_key: primary_project("bar"),
                     }),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: create_node_spec(),
                     }),
                     ActionNode::run_task(RunTaskNode::new(task.target.clone())),
@@ -1229,12 +1279,13 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw("bar"),
+                        project_key: primary_project("bar"),
                     }),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: create_node_spec(),
                     }),
                     ActionNode::run_task({
@@ -1284,12 +1335,13 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw("bar"),
+                        project_key: primary_project("bar"),
                     }),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: create_node_spec(),
                     }),
                     ActionNode::run_task({
@@ -1350,12 +1402,13 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw("bar"),
+                        project_key: primary_project("bar"),
                     }),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: create_node_spec(),
                     }),
                     ActionNode::run_task(RunTaskNode::new(task.target.clone())),
@@ -1411,12 +1464,13 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw("bar"),
+                        project_key: primary_project("bar"),
                     }),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: create_node_spec(),
                     }),
                     ActionNode::run_task({
@@ -1491,12 +1545,13 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw("bar"),
+                        project_key: primary_project("bar"),
                     }),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: create_node_spec(),
                     }),
                     ActionNode::run_task(RunTaskNode::new(task.target.clone())),
@@ -1622,9 +1677,9 @@ mod action_graph_builder {
                 assert_eq!(
                     topo(graph),
                     vec![
-                        ActionNode::sync_workspace(),
+                        ActionNode::sync_workspace(primary_source()),
                         ActionNode::sync_project(SyncProjectNode {
-                            project_id: Id::raw("deps-affected"),
+                            project_key: primary_project("deps-affected"),
                         }),
                         ActionNode::run_task(RunTaskNode::new(
                             Target::parse("deps-affected:d").unwrap(),
@@ -2016,6 +2071,79 @@ mod action_graph_builder {
                     FxHashMap::from_iter([(primary_key("bar:build"), TargetState::Passthrough)])
                 );
 
+                assert!(topo(graph).is_empty());
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn publishes_exact_passthrough_state_for_skipped_dependency_variant() {
+                let sandbox = create_sandbox("projects");
+                let mut container = ActionGraphContainer::new(sandbox.path());
+                let mut builder = container
+                    .create_builder(container.create_workspace_graph().await)
+                    .await;
+                let mut task = create_task("bar", "build");
+                task.options.run_in_ci = TaskOptionRunInCI::Skip;
+                let mut config = TaskDependencyConfig {
+                    args: vec!["--mode=ci".into()],
+                    ..TaskDependencyConfig::new(task.target.clone())
+                };
+                config.env.insert("MODE".into(), Some("ci".into()));
+                let invocation_key = TaskInvocationKey::new(
+                    task.key(),
+                    &config.args,
+                    config.env.iter().map(|(key, value)| (key, value.as_ref())),
+                );
+                let mut second_config = TaskDependencyConfig {
+                    args: vec!["--mode=test".into()],
+                    ..TaskDependencyConfig::new(task.target.clone())
+                };
+                second_config.env.insert("MODE".into(), Some("test".into()));
+                let second_invocation_key = TaskInvocationKey::new(
+                    task.key(),
+                    &second_config.args,
+                    second_config
+                        .env
+                        .iter()
+                        .map(|(key, value)| (key, value.as_ref())),
+                );
+
+                builder
+                    .run_task_with_config(
+                        &task,
+                        &RunRequirements {
+                            ci: true,
+                            ci_check: true,
+                            ..Default::default()
+                        },
+                        &config,
+                    )
+                    .await
+                    .unwrap();
+                builder
+                    .run_task_with_config(
+                        &task,
+                        &RunRequirements {
+                            ci: true,
+                            ci_check: true,
+                            ..Default::default()
+                        },
+                        &second_config,
+                    )
+                    .await
+                    .unwrap();
+
+                let (context, graph) = builder.build();
+
+                assert_eq!(
+                    context.get_invocation_state(&invocation_key),
+                    Some(TargetState::Passthrough)
+                );
+                assert_eq!(
+                    context.get_invocation_state(&second_invocation_key),
+                    Some(TargetState::Passthrough)
+                );
+                assert_eq!(context.get_invocation_states().len(), 2);
+                assert!(context.get_task_state(&task.key()).is_none());
                 assert!(topo(graph).is_empty());
             }
 
@@ -2872,6 +3000,81 @@ mod action_graph_builder {
         use super::*;
 
         #[tokio::test(flavor = "multi_thread")]
+        async fn constructs_all_distinct_args_and_env_variants() {
+            let sandbox = create_sandbox("dependency-variants");
+            let mut container = ActionGraphContainer::new(sandbox.path());
+            let wg = container.create_workspace_graph().await;
+            let mut builder = container.create_builder(wg.clone()).await;
+            let task = wg.get_task_from_project("app", "consumer").unwrap();
+
+            builder
+                .run_task(&task, &RunRequirements::default())
+                .await
+                .unwrap();
+
+            let (_, graph) = builder.build();
+            let mut variants = topo(graph)
+                .into_iter()
+                .filter_map(|node| match node {
+                    ActionNode::RunTask(inner) if inner.target.as_str() == "app:base" => {
+                        Some((inner.args, inner.env))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            variants.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.iter().cmp(b.1.iter())));
+
+            assert_eq!(variants.len(), 4);
+            assert!(variants.contains(&(vec![], EnvMap::default())));
+            assert!(
+                variants.contains(&(vec!["a".into(), "b".into(), "c".into()], EnvMap::default()))
+            );
+            assert!(variants.contains(&(
+                vec![],
+                EnvMap::from_iter([("TEST_VAR".into(), Some("value".into()))])
+            )));
+            assert!(variants.contains(&(
+                vec!["x".into(), "y".into(), "z".into()],
+                EnvMap::from_iter([("TEST_VAR".into(), Some("value".into()))])
+            )));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn serial_variants_follow_declaration_order() {
+            let sandbox = create_sandbox("dependency-variants");
+            let mut container = ActionGraphContainer::new(sandbox.path());
+            let wg = container.create_workspace_graph().await;
+            let mut builder = container.create_builder(wg.clone()).await;
+            let task = wg.get_task_from_project("app", "serial-consumer").unwrap();
+
+            builder
+                .run_task(&task, &RunRequirements::default())
+                .await
+                .unwrap();
+
+            let (_, graph) = builder.build();
+            let variants = topo(graph)
+                .into_iter()
+                .filter_map(|node| match node {
+                    ActionNode::RunTask(inner) if inner.target.as_str() == "app:base" => {
+                        Some(inner.args)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                variants,
+                [
+                    Vec::<String>::new(),
+                    vec!["a".into(), "b".into(), "c".into()],
+                    Vec::<String>::new(),
+                    vec!["x".into(), "y".into(), "z".into()],
+                ]
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
         async fn runs_deps_in_parallel() {
             let sandbox = create_sandbox("tasks");
             let mut container = ActionGraphContainer::new(sandbox.path());
@@ -3259,10 +3462,10 @@ mod action_graph_builder {
                     .map(key_target)
                     .collect::<Vec<_>>(),
                 [
-                    Target::parse("client:build").unwrap(),
-                    Target::parse("base:build").unwrap(),
                     Target::parse("common:build").unwrap(),
                     Target::parse("server:build").unwrap(),
+                    Target::parse("client:build").unwrap(),
+                    Target::parse("base:build").unwrap(),
                 ]
             );
         }
@@ -3686,13 +3889,13 @@ mod action_graph_builder {
                     .map(key_target)
                     .collect::<Vec<_>>(),
                 [
-                    Target::parse("deps-affected:c").unwrap(),
+                    Target::parse("ci:ci4-dependency").unwrap(),
                     Target::parse("deps:a").unwrap(),
+                    Target::parse("ci:ci3-dependency").unwrap(),
+                    Target::parse("deps-affected:a").unwrap(),
                     Target::parse("deps:c").unwrap(),
                     Target::parse("ci:ci2-dependency").unwrap(),
-                    Target::parse("ci:ci3-dependency").unwrap(),
-                    Target::parse("ci:ci4-dependency").unwrap(),
-                    Target::parse("deps-affected:a").unwrap(),
+                    Target::parse("deps-affected:c").unwrap(),
                 ]
             );
         }
@@ -4102,9 +4305,10 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::setup_environment(SetupEnvironmentNode {
-                        project_id: Some(Id::raw("bar")),
+                        source_id: primary_source(),
+                        project_key: Some(primary_project("bar")),
                         root: WorkspaceRelativePathBuf::from("bar"),
                         toolchain_id: spec.id,
                     })
@@ -4140,14 +4344,16 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::setup_environment(SetupEnvironmentNode {
-                        project_id: Some(Id::raw("bar")),
+                        source_id: primary_source(),
+                        project_key: Some(primary_project("bar")),
                         root: WorkspaceRelativePathBuf::from("bar"),
                         toolchain_id: spec.id.clone(),
                     }),
                     ActionNode::setup_environment(SetupEnvironmentNode {
-                        project_id: Some(Id::raw("baz")),
+                        source_id: primary_source(),
+                        project_key: Some(primary_project("baz")),
                         root: WorkspaceRelativePathBuf::from("baz"),
                         toolchain_id: spec.id,
                     })
@@ -4183,9 +4389,10 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::setup_environment(SetupEnvironmentNode {
-                        project_id: Some(Id::raw("bar")),
+                        source_id: primary_source(),
+                        project_key: Some(primary_project("bar")),
                         root: WorkspaceRelativePathBuf::from("bar"),
                         toolchain_id: spec.id,
                     })
@@ -4310,9 +4517,10 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::setup_environment(SetupEnvironmentNode {
-                        project_id: Some(Id::raw("bar")),
+                        source_id: primary_source(),
+                        project_key: Some(primary_project("bar")),
                         root: WorkspaceRelativePathBuf::from("bar"),
                         toolchain_id: spec.id,
                     })
@@ -4353,16 +4561,18 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::sync_workspace(primary_source()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: ToolchainSpec::new(
                             Id::raw("tc-tier3"),
                             create_unresolved_version(Version::new(1, 2, 3)),
                         )
                     }),
                     ActionNode::setup_environment(SetupEnvironmentNode {
-                        project_id: Some(Id::raw("bar")),
+                        source_id: primary_source(),
+                        project_key: Some(primary_project("bar")),
                         root: WorkspaceRelativePathBuf::from("bar"),
                         toolchain_id: spec.id,
                     })
@@ -4404,19 +4614,22 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::sync_workspace(primary_source()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: ToolchainSpec::new(
                             Id::raw("tc-tier3"),
                             create_unresolved_version(Version::new(1, 2, 3)),
                         )
                     }),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: spec.clone(),
                     }),
                     ActionNode::setup_environment(SetupEnvironmentNode {
-                        project_id: Some(Id::raw("bar")),
+                        source_id: primary_source(),
+                        project_key: Some(primary_project("bar")),
                         root: WorkspaceRelativePathBuf::from("bar"),
                         toolchain_id: spec.id,
                     })
@@ -4517,21 +4730,24 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::sync_workspace(primary_source()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: ToolchainSpec::new(
                             Id::raw("tc-tier3"),
                             create_unresolved_version(Version::new(1, 2, 3)),
                         )
                     }),
                     ActionNode::setup_environment(SetupEnvironmentNode {
-                        project_id: Some(Id::raw("bar")),
+                        source_id: primary_source(),
+                        project_key: Some(primary_project("bar")),
                         root: WorkspaceRelativePathBuf::from("bar"),
                         toolchain_id: spec.id.clone(),
                     }),
                     ActionNode::setup_environment(SetupEnvironmentNode {
-                        project_id: Some(Id::raw("baz")),
+                        source_id: primary_source(),
+                        project_key: Some(primary_project("baz")),
                         root: WorkspaceRelativePathBuf::from("baz"),
                         toolchain_id: spec.id,
                     })
@@ -4563,9 +4779,10 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::setup_environment(SetupEnvironmentNode {
-                        project_id: None,
+                        source_id: primary_source(),
+                        project_key: None,
                         root: WorkspaceRelativePathBuf::new(),
                         toolchain_id: spec.id,
                     })
@@ -4602,16 +4819,18 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::sync_workspace(primary_source()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: ToolchainSpec::new(
                             Id::raw("tc-tier3"),
                             create_unresolved_version(Version::new(1, 2, 3)),
                         )
                     }),
                     ActionNode::setup_environment(SetupEnvironmentNode {
-                        project_id: None,
+                        source_id: primary_source(),
+                        project_key: None,
                         root: WorkspaceRelativePathBuf::new(),
                         toolchain_id: spec.id,
                     })
@@ -4771,9 +4990,12 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
-                    ActionNode::setup_proto(create_proto_version()),
-                    ActionNode::setup_toolchain(SetupToolchainNode { toolchain: node }),
+                    ActionNode::sync_workspace(primary_source()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
+                    ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
+                        toolchain: node
+                    }),
                 ]
             );
         }
@@ -4810,11 +5032,20 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
-                    ActionNode::setup_proto(create_proto_version()),
-                    ActionNode::setup_toolchain(SetupToolchainNode { toolchain: node1 }),
-                    ActionNode::setup_toolchain(SetupToolchainNode { toolchain: node2 }),
-                    ActionNode::setup_toolchain(SetupToolchainNode { toolchain: node3 }),
+                    ActionNode::sync_workspace(primary_source()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
+                    ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
+                        toolchain: node1
+                    }),
+                    ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
+                        toolchain: node2
+                    }),
+                    ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
+                        toolchain: node3
+                    }),
                 ]
             );
         }
@@ -4837,9 +5068,12 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
-                    ActionNode::setup_proto(create_proto_version()),
-                    ActionNode::setup_toolchain(SetupToolchainNode { toolchain: node }),
+                    ActionNode::sync_workspace(primary_source()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
+                    ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
+                        toolchain: node
+                    }),
                 ]
             );
         }
@@ -4940,9 +5174,12 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
-                    ActionNode::setup_proto(create_proto_version()),
-                    ActionNode::setup_toolchain(SetupToolchainNode { toolchain: node }),
+                    ActionNode::sync_workspace(primary_source()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
+                    ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
+                        toolchain: node
+                    }),
                 ]
             );
         }
@@ -4968,15 +5205,19 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::sync_workspace(primary_source()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: ToolchainSpec::new(
                             Id::raw("tc-tier3"),
                             create_unresolved_version(Version::new(1, 2, 3)),
                         )
                     }),
-                    ActionNode::setup_toolchain(SetupToolchainNode { toolchain: node }),
+                    ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
+                        toolchain: node
+                    }),
                 ]
             );
         }
@@ -5002,15 +5243,17 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
-                    ActionNode::setup_proto(create_proto_version()),
+                    ActionNode::sync_workspace(primary_source()),
+                    ActionNode::setup_proto(primary_source(), create_proto_version()),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: ToolchainSpec::new(
                             Id::raw("tc-tier3"),
                             create_unresolved_version(Version::new(1, 2, 3)),
                         )
                     }),
                     ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: primary_source(),
                         toolchain: ToolchainSpec::new(
                             Id::raw("tc-tier2-reqs"),
                             create_unresolved_version(Version::new(1, 2, 3)),
@@ -5075,9 +5318,9 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw("bar"),
+                        project_key: primary_project("bar"),
                     })
                 ]
             );
@@ -5115,15 +5358,15 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw("bar"),
+                        project_key: primary_project("bar"),
                     }),
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw("foo"),
+                        project_key: primary_project("foo"),
                     }),
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw("qux"),
+                        project_key: primary_project("qux"),
                     }),
                 ]
             );
@@ -5163,12 +5406,12 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw("foo"),
+                        project_key: primary_project("foo"),
                     }),
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw("qux"),
+                        project_key: primary_project("qux"),
                     }),
                 ]
             );
@@ -5202,12 +5445,12 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw("bar"),
+                        project_key: primary_project("bar"),
                     }),
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw("foo"),
+                        project_key: primary_project("foo"),
                     })
                 ]
             );
@@ -5297,9 +5540,9 @@ mod action_graph_builder {
             assert_eq!(
                 topo(graph),
                 vec![
-                    ActionNode::sync_workspace(),
+                    ActionNode::sync_workspace(primary_source()),
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw("bar"),
+                        project_key: primary_project("bar"),
                     })
                 ]
             );
@@ -5323,7 +5566,10 @@ mod action_graph_builder {
             let (_, graph) = builder.build();
 
             assert_snapshot!(graph.to_dot());
-            assert_eq!(topo(graph), vec![ActionNode::sync_workspace()]);
+            assert_eq!(
+                topo(graph),
+                vec![ActionNode::sync_workspace(primary_source())]
+            );
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -5341,7 +5587,10 @@ mod action_graph_builder {
 
             let (_, graph) = builder.build();
 
-            assert_eq!(topo(graph), vec![ActionNode::sync_workspace()]);
+            assert_eq!(
+                topo(graph),
+                vec![ActionNode::sync_workspace(primary_source())]
+            );
         }
 
         #[tokio::test(flavor = "multi_thread")]

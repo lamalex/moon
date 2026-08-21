@@ -1,6 +1,7 @@
 use crate::event_emitter::EventEmitter;
 use moon_action::Action;
 use moon_actions::actions::TaskRunnerContext;
+use moon_app_context::SourceRuntimeRegistry;
 use moon_daemon_client::DaemonClient;
 use moon_workspace_graph::WorkspaceGraph;
 use petgraph::graph::NodeIndex;
@@ -37,6 +38,9 @@ pub struct JobContext {
 
     /// Acquires a permit for concurrency
     pub semaphore: Arc<Semaphore>,
+
+    /// Source-qualified runtime contexts used to execute actions.
+    pub source_runtime_registry: Arc<SourceRuntimeRegistry>,
 
     /// Canonical dependency metadata and source runtimes used while hashing tasks.
     pub task_runner_context: Option<TaskRunnerContext>,

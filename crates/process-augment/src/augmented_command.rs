@@ -387,12 +387,21 @@ impl<'app> AugmentedCommand<'app> {
 
     pub fn inherit_proto(&mut self) {
         let proto_version = self.context.toolchains_config.proto.version.to_string();
+        let proto_lookup_dir = self
+            .context
+            .proto_env
+            .store
+            .inventory_dir
+            .join("proto")
+            .join(&proto_version);
 
         // Inherit common proto env vars
         self.env("PROTO_AUTO_INSTALL", "false");
         self.env("PROTO_IGNORE_MIGRATE_WARNING", "true");
         self.env("PROTO_NO_PROGRESS", "true");
+        self.env("PROTO_LOOKUP_DIR", proto_lookup_dir);
         self.env("PROTO_VERSION", &proto_version);
+        self.env("PROTO_VERSION_CHECK", "false");
         self.env("STARBASE_FORCE_TTY", "true");
 
         // If not using globals, inherit proto and moon paths

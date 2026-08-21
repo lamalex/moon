@@ -77,6 +77,18 @@ fn request_with_deadline<T>(message: T, deadline: Duration) -> Request<T> {
     request
 }
 
+fn create_clean_cache_request(
+    source_id: &SourceRootId,
+    lifetime: String,
+    all: bool,
+) -> CleanCacheRequest {
+    CleanCacheRequest {
+        lifetime,
+        all,
+        source_id: source_id.to_string(),
+    }
+}
+
 /// Await an RPC with a client-side deadline. The `grpc-timeout` header only
 /// instructs the server; this bounds the call locally so a stalled daemon
 /// cannot hang the caller.
@@ -339,6 +351,7 @@ impl DaemonClient {
     #[instrument(skip(self))]
     pub async fn clean_cache(
         &mut self,
+        source_id: &SourceRootId,
         lifetime: String,
         all: bool,
     ) -> miette::Result<CleanCacheResponse> {
@@ -346,7 +359,7 @@ impl DaemonClient {
             "CleanCache",
             WORK_DEADLINE,
             self.inner.clean_cache(request_with_deadline(
-                CleanCacheRequest { lifetime, all },
+                create_clean_cache_request(source_id, lifetime, all),
                 WORK_DEADLINE,
             )),
         )
@@ -437,6 +450,21 @@ async fn connect_channel(endpoint: &str) -> Result<Channel, TransportError> {
             }
         }))
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qualifies_clean_cache_requests_by_source() {
+        let source_id = SourceRootId::new("child").unwrap();
+        let request = create_clean_cache_request(&source_id, "7 days".into(), false);
+
+        assert_eq!(request.source_id, "child");
+        assert_eq!(request.lifetime, "7 days");
+        assert!(!request.all);
+    }
 }
 
 #[cfg(windows)]

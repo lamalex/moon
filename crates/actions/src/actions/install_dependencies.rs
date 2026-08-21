@@ -42,6 +42,14 @@ pub async fn install_dependencies(
     workspace_graph: Arc<WorkspaceGraph>,
     node: &InstallDependenciesNode,
 ) -> miette::Result<ActionStatus> {
+    if node.source_id != app_context.source_id {
+        return Err(miette::miette!(
+            "Install dependencies action for source {} cannot run in source {}.",
+            node.source_id,
+            app_context.source_id
+        ));
+    }
+
     let deps_root = node.root.to_logical_path(&app_context.workspace_root);
 
     // Skip this action if requested by the user
@@ -81,7 +89,7 @@ pub async fn install_dependencies(
 
     // When running against affected files, avoid install as it interrupts the workflow,
     // especially when used with VSC hooks
-    if action_context.affected.is_some() && !is_ci() {
+    if action_context.is_affected() && !is_ci() {
         debug!(
             root = node.root.as_str(),
             toolchain_id = node.toolchain_id.as_str(),
@@ -128,9 +136,9 @@ pub async fn install_dependencies(
         ..Default::default()
     };
 
-    let project = match &node.project_id {
-        Some(project_id) => {
-            let project = workspace_graph.get_project(project_id)?;
+    let project = match &node.project_key {
+        Some(project_key) => {
+            let project = workspace_graph.get_project_by_key(project_key)?;
 
             input.project = Some(project.to_fragment());
             input.toolchain_config = app_context

@@ -157,19 +157,28 @@ mod tests {
     use crate::event_emitter::EventEmitter;
     use moon_action::{Action, ActionNode, RunTaskNode, SyncProjectNode};
     use moon_action_graph::{ActionGraph, ActionGraphType};
-    use moon_common::Id;
+    use moon_common::{Id, SourceRootId};
     use moon_config::TaskDependencyType;
-    use moon_task::Target;
+    use moon_task::{ProjectKey, Target};
+    use moon_test_utils::WorkspaceMocker;
     use moon_workspace_graph::WorkspaceGraph;
     use rustc_hash::FxHashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
     use tokio::sync::{RwLock, Semaphore, mpsc};
     use tokio_util::sync::CancellationToken;
 
     async fn create_job_context() -> JobContext {
+        static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
+
         let (sender, _receiver) = mpsc::channel::<Action>(8);
         let workspace_graph = Arc::new(WorkspaceGraph::default());
+        let workspace_root = std::env::temp_dir().join(format!(
+            "moon-job-dispatcher-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
 
         JobContext {
             abort_token: CancellationToken::new(),
@@ -181,6 +190,9 @@ mod tests {
             result_sender: sender,
             running_jobs: Arc::new(RwLock::new(FxHashMap::default())),
             semaphore: Arc::new(Semaphore::new(1)),
+            source_runtime_registry: Arc::new(moon_app_context::SourceRuntimeRegistry::single(
+                Arc::new(WorkspaceMocker::new(workspace_root).mock_app_context()),
+            )),
             task_runner_context: None,
             workspace_graph,
         }
@@ -191,7 +203,7 @@ mod tests {
         let mut nodes = FxHashMap::default();
 
         let root = graph.add_node(NodeIndex::new(0));
-        nodes.insert(root, ActionNode::sync_workspace());
+        nodes.insert(root, ActionNode::sync_workspace(SourceRootId::primary()));
 
         let mut layers = vec![];
 
@@ -203,7 +215,8 @@ mod tests {
                 nodes.insert(
                     index,
                     ActionNode::sync_project(SyncProjectNode {
-                        project_id: Id::raw(format!("p{layer}-{node}")),
+                        project_key: ProjectKey::primary(Id::raw(format!("p{layer}-{node}")))
+                            .unwrap(),
                     }),
                 );
                 indices.push(index);
@@ -288,5 +301,40 @@ mod tests {
             "dispatcher search took {:?} on a blocked sync-heavy graph",
             elapsed
         );
+    }
+
+    #[tokio::test]
+    async fn serializes_task_variants_but_not_different_source_tasks() {
+        let target = Target::parse("app:build").unwrap();
+        let primary_key = moon_task::TaskKey::primary(Id::raw("app"), Id::raw("build")).unwrap();
+        let child_key = moon_task::TaskKey::new(
+            ProjectKey::new(SourceRootId::new("child").unwrap(), Id::raw("app")).unwrap(),
+            Id::raw("build"),
+        )
+        .unwrap();
+        let mut first = RunTaskNode::new_with_key(primary_key.clone(), target.clone());
+        first.args.push("--mode=a".into());
+        let mut second = RunTaskNode::new_with_key(primary_key, target.clone());
+        second.env.insert("MODE".into(), Some("b".into()));
+        let third = RunTaskNode::new_with_key(child_key, target);
+        let mut graph = ActionGraphType::new();
+        let mut nodes = FxHashMap::default();
+        for node in [first, second, third] {
+            let index = graph.add_node(NodeIndex::new(graph.node_count()));
+            nodes.insert(index, ActionNode::run_task(node));
+        }
+        let action_graph = ActionGraph::new(graph, nodes);
+        let context = create_job_context().await;
+        let groups = BTreeMap::from([(
+            2,
+            vec![NodeIndex::new(0), NodeIndex::new(1), NodeIndex::new(2)],
+        )]);
+        let mut dispatcher = JobDispatcher::new(&action_graph, context.clone(), groups);
+
+        assert_eq!(dispatcher.next().await, Some(NodeIndex::new(0)));
+        assert_eq!(dispatcher.next().await, Some(NodeIndex::new(2)));
+
+        context.mark_completed(NodeIndex::new(0)).await;
+        assert_eq!(dispatcher.next().await, Some(NodeIndex::new(1)));
     }
 }

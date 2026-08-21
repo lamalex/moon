@@ -6,6 +6,7 @@ use moon_cache::{Manifest, StorageOptions};
 use moon_common::color;
 use moon_daemon_client::{DaemonClient, DaemonTaskRouting};
 use moon_manifest::ManifestPacker;
+use moon_target::TaskInvocationKey;
 use moon_task::Task;
 use starbase_archive::Archiver;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ pub enum ArchiveOutcome {
 pub struct OutputArchiver<'task> {
     app_context: &'task Arc<AppContext>,
     task: &'task Arc<Task>,
+    invocation_key: TaskInvocationKey,
     daemon_client: Option<DaemonClient>,
 }
 
@@ -32,6 +34,23 @@ impl OutputArchiver<'_> {
         task: &'task Arc<Task>,
         daemon_client: Option<DaemonClient>,
     ) -> miette::Result<OutputArchiver<'task>> {
+        Self::new_for_invocation(app_context, task, task.key().into(), daemon_client)
+    }
+
+    pub fn new_for_invocation<'task>(
+        app_context: &'task Arc<AppContext>,
+        task: &'task Arc<Task>,
+        invocation_key: TaskInvocationKey,
+        daemon_client: Option<DaemonClient>,
+    ) -> miette::Result<OutputArchiver<'task>> {
+        if invocation_key.task_key() != &task.key() {
+            return Err(TaskRunnerError::InvocationMismatch {
+                invocation_key: invocation_key.task_key().clone(),
+                task_key: task.key(),
+            }
+            .into());
+        }
+
         if task.source_id != app_context.source_id {
             return Err(TaskRunnerError::SourceMismatch {
                 task_source: task.source_id.clone(),
@@ -42,6 +61,7 @@ impl OutputArchiver<'_> {
 
         Ok(OutputArchiver {
             task,
+            invocation_key,
             app_context,
             daemon_client,
         })
@@ -226,6 +246,7 @@ impl OutputArchiver<'_> {
         // Clone values to run in a blocking thread
         let app_context = Arc::clone(self.app_context);
         let task = Arc::clone(self.task);
+        let invocation_key = self.invocation_key.clone();
         let hash = hash.to_string();
 
         spawn_blocking(move || {
@@ -241,7 +262,10 @@ impl OutputArchiver<'_> {
             }
 
             // Also include stdout/stderr logs in the tarball
-            let state_dir = app_context.cache_engine.state.get_task_dir(&task.key());
+            let state_dir = app_context
+                .cache_engine
+                .state
+                .get_task_invocation_dir(&invocation_key);
 
             archive.add_source_file(state_dir.join("stdout.log"), None);
 

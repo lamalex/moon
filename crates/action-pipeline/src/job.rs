@@ -2,7 +2,6 @@ use crate::action_runner::run_action;
 use crate::job_context::JobContext;
 use moon_action::{Action, ActionNode, ActionStatus};
 use moon_action_context::ActionContext;
-use moon_app_context::AppContext;
 use std::sync::Arc;
 use tracing::{debug, instrument};
 
@@ -12,7 +11,6 @@ pub struct Job {
 
     /// Contexts of all the things
     pub context: JobContext,
-    pub app_context: Arc<AppContext>,
     pub action_context: Arc<ActionContext>,
 }
 
@@ -44,6 +42,28 @@ impl Job {
             return;
         }
 
+        if matches!(&*action.node, ActionNode::None) {
+            action.start();
+            action.finish(ActionStatus::Skipped);
+            self.context.send_result(action).await;
+            return;
+        }
+
+        let source_id = action
+            .node
+            .source_id()
+            .expect("Executable action nodes must own a source ID");
+        let app_context = match self.context.source_runtime_registry.get(source_id) {
+            Ok(context) => Arc::clone(context),
+            Err(error) => {
+                action.start();
+                action.fail(error.into());
+                action.finish(ActionStatus::Aborted);
+                self.context.send_result(action).await;
+                return;
+            }
+        };
+
         // Don't use `tokio::select!` here because if the abort or cancel tokens
         // are triggered, then the async task running the task child process
         // is cancelled, immediately terminating the process, and ignoring
@@ -55,7 +75,7 @@ impl Job {
         if Box::pin(run_action(
             &mut action,
             self.action_context,
-            self.app_context,
+            app_context,
             self.context.clone(),
         ))
         .await

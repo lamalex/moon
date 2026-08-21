@@ -1,9 +1,10 @@
 mod utils;
 
 use moon_cache::{CacheMode, Manifest, ManifestFile, ManifestSource};
-use moon_common::SourceRootId;
+use moon_common::{Id, SourceRootId};
 use moon_env_var::GlobalEnvBag;
 use moon_hash::Digest;
+use moon_target::{ProjectKey, TaskInvocationKey, TaskKey};
 use moon_task_runner::TaskRunState;
 use moon_task_runner::output_hydrater::{HydrateFrom, HydrateOutcome, OutputHydrater};
 use std::{fs, sync::Arc};
@@ -35,6 +36,29 @@ mod output_hydrater {
         Arc::make_mut(&mut container.task).source_id = SourceRootId::new("child").unwrap();
 
         assert!(OutputHydrater::new(&container.app_context, &container.task, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_mismatched_invocation_task_keys() {
+        let container = TaskRunnerContainer::new("archive", "file-outputs").await;
+        let same_source = TaskKey::primary(Id::raw("project"), Id::raw("other")).unwrap();
+        let different_source = TaskKey::new(
+            ProjectKey::new(SourceRootId::new("child").unwrap(), Id::raw("project")).unwrap(),
+            Id::raw("file-outputs"),
+        )
+        .unwrap();
+
+        for task_key in [same_source, different_source] {
+            assert!(
+                OutputHydrater::new_for_invocation(
+                    &container.app_context,
+                    &container.task,
+                    TaskInvocationKey::from(task_key),
+                    None,
+                )
+                .is_err()
+            );
+        }
     }
 
     mod local_legacy {

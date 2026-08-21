@@ -1,12 +1,20 @@
 use miette::Diagnostic;
 use moon_common::{SourceRootId, Style, Stylize};
 use moon_process::ProcessError;
+use moon_target::TaskKey;
 use moon_task::Target;
 use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug, Diagnostic)]
 pub enum TaskRunnerError {
+    #[diagnostic(code(task_runner::invocation_mismatch))]
+    #[error("Task invocation {invocation_key} does not match task {task_key}.")]
+    InvocationMismatch {
+        invocation_key: TaskKey,
+        task_key: TaskKey,
+    },
+
     #[diagnostic(code(task_runner::source_mismatch))]
     #[error("Task source {task_source} does not match app context source {context_source}.")]
     SourceMismatch {

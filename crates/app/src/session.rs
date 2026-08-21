@@ -150,11 +150,12 @@ impl MoonSession {
     ) -> miette::Result<ActionGraphBuilder<'graph>> {
         let app_context = self.get_app_context().await?;
         let workspace_graph = self.get_workspace_graph().await?;
-        let aggregate_task_graph = Arc::clone(&self.get_aggregate_workspace_graph().await?.tasks);
+        let aggregate_workspace_graph = self.get_aggregate_workspace_graph().await?;
+        let source_runtime_registry = self.get_source_runtime_registry().await?;
 
         Ok(
             ActionGraphBuilder::new(app_context, workspace_graph, options)?
-                .with_aggregate_task_graph(aggregate_task_graph),
+                .with_aggregate_workspace_graph(aggregate_workspace_graph, source_runtime_registry),
         )
     }
 

@@ -5,6 +5,25 @@ use moon_hash::ContentHasher;
 use serde::Serialize;
 use starbase_utils::fs::{self, FileLock};
 use std::path::PathBuf;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::{Mutex, OwnedMutexGuard};
+
+static PROTO_STORE_LOCKS: LazyLock<scc::HashMap<PathBuf, Arc<Mutex<()>>>> =
+    LazyLock::new(scc::HashMap::new);
+
+pub async fn lock_proto_store(app_context: &AppContext) -> OwnedMutexGuard<()> {
+    let store = app_context.proto_env.store.dir.clone();
+    let mutex = match PROTO_STORE_LOCKS.entry_async(store).await {
+        scc::hash_map::Entry::Occupied(entry) => Arc::clone(&entry),
+        scc::hash_map::Entry::Vacant(entry) => {
+            let mutex = Arc::new(Mutex::new(()));
+            entry.insert_entry(Arc::clone(&mutex));
+            mutex
+        }
+    };
+
+    mutex.lock_owned().await
+}
 
 pub struct HashLock {
     #[allow(dead_code)]

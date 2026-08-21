@@ -18,7 +18,6 @@ use moon_common::{color, is_remote, is_test_env};
 use moon_console::Level;
 use moon_daemon_client::DaemonClient;
 use moon_process::{ProcessRegistry, SignalType};
-use moon_task_graph::TaskGraph;
 use moon_workspace_graph::WorkspaceGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::mem;
@@ -47,7 +46,6 @@ pub struct ActionPipeline {
     daemon_client: Option<DaemonClient>,
     emitter: Arc<EventEmitter>,
     source_runtime_registry: Arc<SourceRuntimeRegistry>,
-    task_graph: Arc<TaskGraph>,
     workspace_graph: Arc<WorkspaceGraph>,
 }
 
@@ -61,8 +59,6 @@ impl ActionPipeline {
 
         let source_runtime_registry =
             Arc::new(SourceRuntimeRegistry::single(Arc::clone(&app_context)));
-        let task_graph = Arc::clone(&workspace_graph.tasks);
-
         Self {
             action_context: Arc::new(ActionContext::default()),
             actions: vec![],
@@ -77,18 +73,17 @@ impl ActionPipeline {
             status: ActionPipelineStatus::Pending,
             summary: None,
             source_runtime_registry,
-            task_graph,
             workspace_graph,
         }
     }
 
-    pub fn with_hashing_context(
+    pub fn with_execution_context(
         mut self,
-        task_graph: Arc<TaskGraph>,
+        workspace_graph: Arc<WorkspaceGraph>,
         source_runtime_registry: Arc<SourceRuntimeRegistry>,
     ) -> Self {
-        self.task_graph = task_graph;
         self.source_runtime_registry = source_runtime_registry;
+        self.workspace_graph = workspace_graph;
         self
     }
 
@@ -103,7 +98,6 @@ impl ActionPipeline {
         action_graph: ActionGraph,
         action_context: ActionContext,
     ) -> miette::Result<Vec<Action>> {
-        self.workspace_graph.ensure_execution_local()?;
         self.action_context = Arc::new(action_context);
         self.setup_subscribers().await;
 
@@ -186,9 +180,10 @@ impl ActionPipeline {
             semaphore: Arc::new(Semaphore::new(self.concurrency)),
             running_jobs: Arc::new(RwLock::new(FxHashMap::default())),
             workspace_graph: self.workspace_graph.clone(),
+            source_runtime_registry: Arc::clone(&self.source_runtime_registry),
             task_runner_context: Some(TaskRunnerContext {
                 source_runtime_registry: Arc::clone(&self.source_runtime_registry),
-                task_graph: Arc::clone(&self.task_graph),
+                task_graph: Arc::clone(&self.workspace_graph.tasks),
             }),
         };
 
@@ -291,7 +286,6 @@ impl ActionPipeline {
         let node_indices = action_graph.sort_topological()?;
         let node_count = node_indices.len();
         let priority_groups = action_graph.group_priorities(node_indices);
-        let app_context = Arc::clone(&self.app_context);
         let action_context = Arc::clone(&self.action_context);
 
         debug!(total_jobs = node_count, "Dispatching jobs in the pipeline");
@@ -353,7 +347,6 @@ impl ActionPipeline {
                     node.to_owned(),
                     node_index.index(),
                     job_context.clone(),
-                    Arc::clone(&app_context),
                     Arc::clone(&action_context),
                 ));
 
@@ -389,9 +382,7 @@ impl ActionPipeline {
                     // Since the task is persistent, set the state early since
                     // it "never finishes", otherwise the runner will error about
                     // a missing hash if it's a dependency of another persistent task
-                    if let ActionNode::RunTask(inner) = node {
-                        action_context.set_task_state(inner.key.clone(), TargetState::Passthrough);
-                    }
+                    premark_persistent_task(&action_context, node);
 
                     Some((node.to_owned(), node_index.index()))
                 })
@@ -400,7 +391,6 @@ impl ActionPipeline {
                         node,
                         node_index,
                         job_context.clone(),
-                        Arc::clone(&app_context),
                         Arc::clone(&action_context),
                     ));
                 });
@@ -499,7 +489,7 @@ impl ActionPipeline {
 
             self.emitter
                 .subscribe(CleanupSubscriber::new(
-                    Arc::clone(&self.app_context.cache_engine),
+                    Arc::clone(&self.source_runtime_registry),
                     self.daemon_client.clone(),
                     lifetime,
                 ))
@@ -519,19 +509,23 @@ impl ActionPipeline {
     }
 }
 
-#[instrument(skip(job_context, app_context, action_context))]
+fn premark_persistent_task(action_context: &ActionContext, node: &ActionNode) {
+    if let ActionNode::RunTask(inner) = node {
+        action_context.set_invocation_state(inner.invocation_key(), TargetState::Passthrough);
+    }
+}
+
+#[instrument(skip(job_context, action_context))]
 async fn dispatch_job(
     node: ActionNode,
     node_index: usize,
     job_context: JobContext,
-    app_context: Arc<AppContext>,
     action_context: Arc<ActionContext>,
 ) {
     let job = Job {
         node,
         node_index,
         context: job_context,
-        app_context,
         action_context,
     };
 
@@ -542,7 +536,6 @@ async fn dispatch_job_with_permit(
     node: ActionNode,
     node_index: usize,
     job_context: JobContext,
-    app_context: Arc<AppContext>,
     action_context: Arc<ActionContext>,
 ) {
     let permit = job_context
@@ -552,7 +545,7 @@ async fn dispatch_job_with_permit(
         .await
         .expect("Failed to dispatch job!");
 
-    dispatch_job(node, node_index, job_context, app_context, action_context).await;
+    dispatch_job(node, node_index, job_context, action_context).await;
 
     drop(permit);
 }
@@ -566,4 +559,51 @@ async fn exhaust_job_handles<T: 'static>(set: &mut JoinSet<T>, job_context: &Job
     set.detach_all();
 
     job_context.is_aborted_or_cancelled()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use moon_action::RunTaskNode;
+    use moon_common::Id;
+    use moon_task::{Target, TaskKey};
+
+    #[test]
+    fn persistent_variants_are_premarked_as_complete_by_exact_invocation() {
+        let task_key = TaskKey::primary(Id::raw("app"), Id::raw("serve")).unwrap();
+        let mut run_task =
+            RunTaskNode::new_with_key(task_key.clone(), Target::parse("app:serve").unwrap());
+        run_task.args.push("--port=3000".into());
+        run_task.env.insert("MODE".into(), Some("dev".into()));
+        run_task.persistent = true;
+        let invocation_key = run_task.invocation_key();
+        let node = ActionNode::run_task(run_task);
+        let context = ActionContext::default();
+
+        premark_persistent_task(&context, &node);
+
+        assert!(
+            context
+                .get_invocation_state(&invocation_key)
+                .is_some_and(|state| state.is_complete())
+        );
+        assert!(context.get_task_state(&task_key).is_none());
+    }
+
+    #[test]
+    fn persistent_tasks_without_variants_keep_plain_task_state() {
+        let task_key = TaskKey::primary(Id::raw("app"), Id::raw("serve")).unwrap();
+        let mut run_task =
+            RunTaskNode::new_with_key(task_key.clone(), Target::parse("app:serve").unwrap());
+        run_task.persistent = true;
+        let node = ActionNode::run_task(run_task);
+        let context = ActionContext::default();
+
+        premark_persistent_task(&context, &node);
+
+        assert_eq!(
+            context.get_task_state(&task_key),
+            Some(TargetState::Passthrough)
+        );
+    }
 }

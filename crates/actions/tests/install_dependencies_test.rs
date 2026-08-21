@@ -1,7 +1,8 @@
 use moon_action::{Action, ActionStatus, InstallDependenciesNode};
 use moon_action_context::ActionContext;
 use moon_actions::actions::install_dependencies;
-use moon_common::{Id, is_ci, path::WorkspaceRelativePathBuf};
+use moon_affected::{Affected, AggregateAffected};
+use moon_common::{Id, SourceRootId, is_ci, path::WorkspaceRelativePathBuf};
 use moon_test_utils::WorkspaceMocker;
 use starbase_sandbox::{Sandbox, create_empty_sandbox};
 use starbase_utils::json::JsonValue;
@@ -35,17 +36,25 @@ fn create_workspace() -> (Sandbox, WorkspaceMocker) {
 }
 
 async fn run_action(ws: &WorkspaceMocker) -> (Action, ActionStatus) {
+    run_action_with_context(ws, ActionContext::default()).await
+}
+
+async fn run_action_with_context(
+    ws: &WorkspaceMocker,
+    context: ActionContext,
+) -> (Action, ActionStatus) {
     let mut action = Action::default();
     let node = InstallDependenciesNode {
         members: None,
-        project_id: None,
+        project_key: None,
         root: WorkspaceRelativePathBuf::default(),
+        source_id: SourceRootId::primary(),
         toolchain_id: Id::raw("tc-tier2"),
     };
 
     let status = install_dependencies(
         &mut action,
-        ActionContext::default().into(),
+        context.into(),
         ws.mock_app_context().into(),
         ws.mock_workspace_graph().await.into(),
         &node,
@@ -132,5 +141,35 @@ mod install_dependencies {
             assert_eq!(status, ActionStatus::Passed);
             assert_eq!(count_execs(&action), 2);
         }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skips_install_for_local_affected_mode() {
+        let (_sandbox, ws) = create_workspace();
+        let context = ActionContext {
+            affected: Some(Affected::default()),
+            ..ActionContext::default()
+        };
+
+        let (action, status) = run_action_with_context(&ws, context).await;
+
+        assert_eq!(status, ActionStatus::Skipped);
+        assert_eq!(count_execs(&action), 0);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skips_install_for_aggregate_affected_mode() {
+        let (_sandbox, ws) = create_workspace();
+        let context = ActionContext {
+            aggregate_affected: Some(AggregateAffected::default()),
+            ..ActionContext::default()
+        };
+
+        let (action, status) = run_action_with_context(&ws, context).await;
+
+        assert_eq!(status, ActionStatus::Skipped);
+        assert_eq!(count_execs(&action), 0);
     }
 }

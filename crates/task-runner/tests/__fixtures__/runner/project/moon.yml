@@ -15,6 +15,14 @@ tasks:
     deps:
       - 'dep'
 
+  has-variant-deps:
+    command: noop
+    deps:
+      - target: 'dep'
+        args: ['--mode=a']
+      - target: 'dep'
+        args: ['--mode=b']
+
   has-output-dep:
     command: noop
     outputs:

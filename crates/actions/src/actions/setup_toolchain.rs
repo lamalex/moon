@@ -1,5 +1,5 @@
 use crate::plugins::*;
-use crate::utils::{create_hash_and_return_lock, should_skip_action_matching};
+use crate::utils::{create_hash_and_return_lock, lock_proto_store, should_skip_action_matching};
 use moon_action::{Action, ActionStatus, Operation, SetupToolchainNode};
 use moon_action_context::ActionContext;
 use moon_app_context::AppContext;
@@ -27,6 +27,14 @@ pub async fn setup_toolchain(
     app_context: Arc<AppContext>,
     node: &SetupToolchainNode,
 ) -> miette::Result<ActionStatus> {
+    if node.source_id != app_context.source_id {
+        return Err(miette::miette!(
+            "Setup toolchain action for source {} cannot run in source {}.",
+            node.source_id,
+            app_context.source_id
+        ));
+    }
+
     // No version configured, use globals on PATH
     if node.toolchain.is_global()
         || is_using_global_toolchain(GlobalEnvBag::instance(), &node.toolchain.id)
@@ -53,6 +61,8 @@ pub async fn setup_toolchain(
 
         return Ok(ActionStatus::Skipped);
     }
+
+    let _store_lock = lock_proto_store(&app_context).await;
 
     // Load the toolchain
     let toolchain = app_context

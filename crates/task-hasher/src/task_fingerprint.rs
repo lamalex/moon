@@ -3,6 +3,7 @@ use moon_config::Output;
 use moon_hash::fingerprint;
 use moon_process::OutputInfo;
 use moon_project::Project;
+use moon_target::TaskInvocationKey;
 use moon_task::{ProjectKey, Task, TaskKey};
 use std::collections::BTreeMap;
 
@@ -19,7 +20,7 @@ fingerprint!(
         pub args: Vec<&'task str>,
 
         // Task `deps` mapped to their hash
-        pub deps: BTreeMap<TaskKey, String>,
+        pub deps: BTreeMap<TaskInvocationKey, String>,
 
         // Environment variables
         pub env: BTreeMap<&'task str, Option<&'task str>>,
@@ -86,7 +87,8 @@ impl<'task> TaskFingerprint<'task> {
             // 2 - New task runner crate, tarball structure changed
             // 3 - New action pipeline
             // 4 - Source-qualified task, dependency, project, and input identities
-            version: "4".into(),
+            // 5 - Invocation-qualified dependency identities
+            version: "5".into(),
         }
     }
 }

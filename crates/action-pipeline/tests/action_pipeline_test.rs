@@ -1,10 +1,13 @@
-use moon_action::Action;
-use moon_action_graph::{ActionGraph, RunRequirements};
-use moon_common::Id;
+use moon_action::{Action, ActionNode, ActionStatus, SetupToolchainNode};
+use moon_action_graph::{ActionGraph, ActionGraphType, RunRequirements};
+use moon_app_context::{SourceRuntime, SourceRuntimeRegistry};
+use moon_common::{Id, SourceRootId};
 use moon_task::Target;
 use moon_test_utils::WorkspaceMocker;
 use moon_toolchain::ToolchainSpec;
 use moon_workspace_graph::WorkspaceGraph;
+use petgraph::graph::NodeIndex;
+use rustc_hash::FxHashMap;
 use starbase_sandbox::{Sandbox, create_sandbox};
 use std::sync::Arc;
 
@@ -130,8 +133,27 @@ mod action_pipeline {
         }
     }
 
+    fn create_action_graph(nodes: impl IntoIterator<Item = ActionNode>) -> ActionGraph {
+        let mut graph = ActionGraphType::new();
+        let mut node_map = FxHashMap::default();
+
+        for node in nodes {
+            let index = graph.add_node(NodeIndex::new(graph.node_count()));
+            node_map.insert(index, node);
+        }
+
+        ActionGraph::new(graph, node_map)
+    }
+
+    fn create_setup_node(source_id: SourceRootId) -> ActionNode {
+        ActionNode::setup_toolchain(SetupToolchainNode {
+            source_id,
+            toolchain: ToolchainSpec::system(),
+        })
+    }
+
     #[tokio::test]
-    async fn rejects_aggregate_workspace_graphs_before_running() {
+    async fn accepts_aggregate_workspace_graphs() {
         let sandbox = create_sandbox("pipeline");
         let mocker = WorkspaceMocker::new(sandbox.path()).with_default_projects();
         let local = Arc::new(mocker.mock_workspace_graph().await);
@@ -149,12 +171,122 @@ mod action_pipeline {
             None,
         );
 
-        assert!(
-            pipeline
-                .run(ActionGraph::new(Default::default(), Default::default()))
-                .await
-                .is_err()
+        assert!(pipeline.run(create_action_graph([])).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn routes_primary_and_child_actions_to_their_source_runtimes() {
+        let sandbox = create_sandbox("pipeline");
+        let mocker = WorkspaceMocker::new(sandbox.path()).with_default_projects();
+        let local = Arc::new(mocker.mock_workspace_graph().await);
+        let aggregate = Arc::new(
+            WorkspaceGraph::new_aggregate(
+                Arc::clone(&local.projects),
+                Arc::clone(&local.sources),
+                [Arc::clone(&local.tasks)],
+            )
+            .unwrap(),
         );
+        let primary = Arc::new(mocker.mock_app_context());
+        let child_id = SourceRootId::new("child").unwrap();
+        let mut child = (*primary).clone();
+        child.source_id = child_id.clone();
+        child.workspace_root = sandbox.path().join("child");
+        let child = Arc::new(child);
+        let registry = Arc::new(
+            SourceRuntimeRegistry::new(
+                Arc::clone(&primary),
+                [(
+                    child_id.clone(),
+                    SourceRuntime::Available(Arc::clone(&child)),
+                )],
+            )
+            .unwrap(),
+        );
+        let mut pipeline = moon_action_pipeline::ActionPipeline::new(
+            Arc::clone(&primary),
+            Arc::clone(&local),
+            None,
+        )
+        .with_execution_context(aggregate, registry);
+        pipeline.quiet = true;
+
+        let actions = pipeline
+            .run(create_action_graph([
+                create_setup_node(primary.source_id.clone()),
+                create_setup_node(child_id),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(actions.len(), 2);
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.status == ActionStatus::Skipped)
+        );
+        assert_eq!(primary.workspace_root, sandbox.path());
+        assert_eq!(child.workspace_root, sandbox.path().join("child"));
+    }
+
+    #[tokio::test]
+    async fn errors_for_unknown_and_unavailable_source_runtimes() {
+        let sandbox = create_sandbox("pipeline");
+        let mocker = WorkspaceMocker::new(sandbox.path()).with_default_projects();
+        let local = Arc::new(mocker.mock_workspace_graph().await);
+        let primary = Arc::new(mocker.mock_app_context());
+        let unknown_id = SourceRootId::new("unknown").unwrap();
+        let unavailable_id = SourceRootId::new("unavailable").unwrap();
+
+        let mut unknown_pipeline = moon_action_pipeline::ActionPipeline::new(
+            Arc::clone(&primary),
+            Arc::clone(&local),
+            None,
+        );
+        unknown_pipeline.quiet = true;
+        let error = unknown_pipeline
+            .run(create_action_graph([create_setup_node(unknown_id)]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("is not registered"));
+
+        let registry = Arc::new(
+            SourceRuntimeRegistry::new(
+                Arc::clone(&primary),
+                [(
+                    unavailable_id.clone(),
+                    SourceRuntime::Unavailable("failed to initialize".into()),
+                )],
+            )
+            .unwrap(),
+        );
+        let mut unavailable_pipeline =
+            moon_action_pipeline::ActionPipeline::new(primary, Arc::clone(&local), None)
+                .with_execution_context(local, registry);
+        unavailable_pipeline.quiet = true;
+        let error = unavailable_pipeline
+            .run(create_action_graph([create_setup_node(unavailable_id)]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("failed to initialize"));
+    }
+
+    #[tokio::test]
+    async fn retains_single_source_constructor_behavior() {
+        let sandbox = create_sandbox("pipeline");
+        let mocker = WorkspaceMocker::new(sandbox.path()).with_default_projects();
+        let mut pipeline = mocker.mock_action_pipeline().await;
+        pipeline.quiet = true;
+
+        let actions = pipeline
+            .run(create_action_graph([create_setup_node(
+                SourceRootId::primary(),
+            )]))
+            .await
+            .unwrap();
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].status, ActionStatus::Skipped);
     }
 
     mod priority {

@@ -76,13 +76,14 @@ pub async fn run_action_pipeline(
     action_graph: ActionGraph,
     summary: Option<Level>,
 ) -> miette::Result<Vec<Action>> {
+    let aggregate_workspace_graph = session.get_aggregate_workspace_graph().await?;
     let mut pipeline = ActionPipeline::new(
         session.get_app_context().await?,
         session.get_workspace_graph().await?,
         session.connect_to_daemon().await?,
     )
-    .with_hashing_context(
-        Arc::clone(&session.get_aggregate_workspace_graph().await?.tasks),
+    .with_execution_context(
+        aggregate_workspace_graph,
         session.get_source_runtime_registry().await?,
     );
 

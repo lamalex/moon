@@ -39,7 +39,7 @@ pub async fn run_action(
     let result = match &*node {
         ActionNode::None => Ok(ActionStatus::Skipped),
 
-        ActionNode::SyncWorkspace => {
+        ActionNode::SyncWorkspace(_) => {
             emitter.emit(Event::WorkspaceSyncing).await?;
 
             let result =
@@ -55,7 +55,7 @@ pub async fn run_action(
         }
 
         ActionNode::SyncProject(inner) => {
-            let project = workspace_graph.get_project(&inner.project_id)?;
+            let project = workspace_graph.get_project_by_key(&inner.project_key)?;
 
             emitter
                 .emit(Event::ProjectSyncing { project: &project })
@@ -81,8 +81,8 @@ pub async fn run_action(
         }
 
         ActionNode::SetupEnvironment(inner) => {
-            let project = match &inner.project_id {
-                Some(id) => Some(workspace_graph.get_project(id)?),
+            let project = match &inner.project_key {
+                Some(key) => Some(workspace_graph.get_project_by_key(key)?),
                 None => None,
             };
 
@@ -137,8 +137,8 @@ pub async fn run_action(
         }
 
         ActionNode::InstallDependencies(inner) => {
-            let project = match &inner.project_id {
-                Some(id) => Some(workspace_graph.get_project(id)?),
+            let project = match &inner.project_key {
+                Some(key) => Some(workspace_graph.get_project_by_key(key)?),
                 None => None,
             };
 
@@ -282,18 +282,20 @@ mod tests {
         InstallDependenciesNode, RunTaskNode, SetupEnvironmentNode, SetupToolchainNode,
         SyncProjectNode,
     };
-    use moon_common::Id;
+    use moon_common::{Id, SourceRootId};
     use moon_config::UnresolvedVersionSpec;
-    use moon_task::Target;
+    use moon_task::{ProjectKey, Target};
     use moon_toolchain::{ToolchainSpec, VersionSpec};
 
     #[test]
     fn aborts_for_provisioning_failures() {
         assert!(should_abort_on_failure(&ActionNode::setup_proto(
+            SourceRootId::primary(),
             VersionSpec::parse("1.0.0").unwrap()
         )));
         assert!(should_abort_on_failure(&ActionNode::setup_toolchain(
             SetupToolchainNode {
+                source_id: SourceRootId::primary(),
                 toolchain: ToolchainSpec::new(
                     Id::raw("tc"),
                     UnresolvedVersionSpec::parse("1.0.0").unwrap()
@@ -302,16 +304,18 @@ mod tests {
         )));
         assert!(should_abort_on_failure(&ActionNode::setup_environment(
             SetupEnvironmentNode {
-                project_id: None,
+                project_key: None,
                 root: "".into(),
+                source_id: SourceRootId::primary(),
                 toolchain_id: Id::raw("tc"),
             }
         )));
         assert!(should_abort_on_failure(&ActionNode::install_dependencies(
             InstallDependenciesNode {
                 members: None,
-                project_id: None,
+                project_key: None,
                 root: "".into(),
+                source_id: SourceRootId::primary(),
                 toolchain_id: Id::raw("tc"),
             }
         )));
@@ -319,10 +323,12 @@ mod tests {
 
     #[test]
     fn doesnt_abort_for_other_failures() {
-        assert!(!should_abort_on_failure(&ActionNode::sync_workspace()));
+        assert!(!should_abort_on_failure(&ActionNode::sync_workspace(
+            SourceRootId::primary()
+        )));
         assert!(!should_abort_on_failure(&ActionNode::sync_project(
             SyncProjectNode {
-                project_id: Id::raw("project"),
+                project_key: ProjectKey::primary(Id::raw("project")).unwrap(),
             }
         )));
         assert!(!should_abort_on_failure(&ActionNode::run_task(

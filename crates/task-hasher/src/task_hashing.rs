@@ -58,16 +58,17 @@ pub async fn hash_common_task_contents(
         if let Some(context) = &hash_context {
             for dep in context.task_graph.resolved_dependencies_of(&task_key) {
                 let dep_key = &dep.task_key;
+                let invocation_key = dep.invocation_key();
 
                 if action_context.is_dependency_ignored(&task_key, dep_key) {
-                    deps.insert(dep_key.clone(), "passthrough".into());
+                    deps.insert(invocation_key, "passthrough".into());
                     continue;
                 }
 
-                if let Some(entry) = action_context.target_states.get_sync(dep_key)
-                    && let Some(value) = dep_hash_input(Some(dep.cache_strategy), entry.get())
+                if let Some(state) = action_context.get_invocation_state(&invocation_key)
+                    && let Some(value) = dep_hash_input(Some(dep.cache_strategy), &state)
                 {
-                    deps.insert(dep_key.clone(), value);
+                    deps.insert(invocation_key, value);
                 }
             }
         } else {
@@ -75,14 +76,14 @@ pub async fn hash_common_task_contents(
                 let dep_key = TaskKey::from_target(task.source_id.clone(), &dep.target)?;
 
                 if action_context.is_dependency_ignored(&task_key, &dep_key) {
-                    deps.insert(dep_key, "passthrough".into());
+                    deps.insert(dep_key.into(), "passthrough".into());
                     continue;
                 }
 
-                if let Some(entry) = action_context.target_states.get_sync(&dep_key)
-                    && let Some(value) = dep_hash_input(dep.cache_strategy, entry.get())
+                if let Some(state) = action_context.get_task_state(&dep_key)
+                    && let Some(value) = dep_hash_input(dep.cache_strategy, &state)
                 {
-                    deps.insert(dep_key, value);
+                    deps.insert(dep_key.into(), value);
                 }
             }
         }
@@ -520,6 +521,8 @@ fn apply_toolchain_dependencies_by_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moon_common::{Id, SourceRootId};
+    use moon_target::{ProjectKey, Target, TargetLocator};
 
     fn passed(hash: &str) -> TargetState {
         TargetState::Passed(hash.into())
@@ -688,6 +691,24 @@ mod tests {
                 Some("sha512-exact".into())
             );
         }
+    }
+
+    #[test]
+    fn hashing_excludes_passthrough_args_for_foreign_unqualified_targets() {
+        let key = TaskKey::new(
+            ProjectKey::new(SourceRootId::new("child").unwrap(), Id::raw("app")).unwrap(),
+            Id::raw("build"),
+        )
+        .unwrap();
+        let target = Target::new("app", "build").unwrap();
+        let mut context = ActionContext::default();
+        context.passthrough_args.push("--watch".into());
+        context.primary_targets.insert(key.clone());
+        context
+            .initial_targets
+            .insert(TargetLocator::Qualified(Target::parse(":build").unwrap()));
+
+        assert!(!context.should_inherit_args(&key, &target));
     }
 
     mod dep_hash_input {

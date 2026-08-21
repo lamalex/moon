@@ -2,7 +2,7 @@ use moon_cache::*;
 use moon_common::path::WorkspaceRelativePathBuf;
 use moon_common::{Id, SourceRootId};
 use moon_env_var::GlobalEnvBag;
-use moon_target::{ProjectKey, TaskKey};
+use moon_target::{ProjectKey, TaskInvocationKey, TaskKey};
 use starbase_sandbox::{Sandbox, create_empty_sandbox};
 
 fn create_engine(sandbox: &Sandbox) -> CacheEngine {
@@ -253,4 +253,37 @@ fn task_state_directories_are_source_qualified() {
     assert_ne!(first, second);
     assert!(first.ends_with("states/tasks/first/app/build"));
     assert!(second.ends_with("states/tasks/second/app/build"));
+}
+
+#[test]
+fn task_state_directories_are_invocation_qualified_only_for_variants() {
+    let sandbox = create_empty_sandbox();
+    let engine = create_engine(&sandbox);
+    let task_key = TaskKey::primary(Id::raw("app"), Id::raw("build")).unwrap();
+    let ordinary = TaskInvocationKey::from(task_key.clone());
+    let first = TaskInvocationKey::new(
+        task_key.clone(),
+        ["--mode=a"],
+        Vec::<(&str, Option<&str>)>::new(),
+    );
+    let second = TaskInvocationKey::new(
+        task_key.clone(),
+        ["--mode=b"],
+        Vec::<(&str, Option<&str>)>::new(),
+    );
+
+    assert_eq!(
+        engine.state.get_task_invocation_dir(&ordinary),
+        engine.state.get_task_dir(&task_key)
+    );
+    assert_ne!(
+        engine.state.get_task_invocation_dir(&first),
+        engine.state.get_task_invocation_dir(&second)
+    );
+    assert!(
+        engine
+            .state
+            .get_task_invocation_dir(&first)
+            .starts_with(engine.state.get_task_dir(&task_key).join("variants"))
+    );
 }

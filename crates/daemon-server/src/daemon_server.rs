@@ -5,7 +5,7 @@ use moon_cache_storage::{
     Manifest, ManifestFile, ManifestSource, ManifestUnpacker, StorageOptions,
 };
 use moon_common::path::WorkspaceRelativePathBuf;
-use moon_common::{SourceRootId, color, format_error_chain};
+use moon_common::{SourceRegistry, SourceRootId, color, format_error_chain};
 use moon_daemon_proto::{
     moon_daemon_server::{MoonDaemon, MoonDaemonServer},
     *,
@@ -25,7 +25,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Notify, RwLock, broadcast};
 use tokio::time::timeout;
 use tokio_util::task::TaskTracker;
 use tonic::{Request, Response, Status, transport::Server};
@@ -52,16 +52,20 @@ const TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct DaemonState {
     pub app_context: Arc<AppContext>,
+    pub sources: Arc<SourceRegistry>,
     pub source_runtime_registry: Arc<SourceRuntimeRegistry>,
+    pub topology_changed: Arc<Notify>,
     pub workspace_graph: Arc<WorkspaceGraph>,
 }
 
 impl DaemonState {
     pub fn new(app_context: Arc<AppContext>, workspace_graph: Arc<WorkspaceGraph>) -> Self {
         Self {
+            sources: Arc::new(SourceRegistry::single(app_context.workspace_root.clone())),
             source_runtime_registry: Arc::new(SourceRuntimeRegistry::single(Arc::clone(
                 &app_context,
             ))),
+            topology_changed: Arc::new(Notify::new()),
             app_context,
             workspace_graph,
         }
@@ -371,8 +375,9 @@ impl MoonDaemon for DaemonService {
     ) -> Result<Response<CleanCacheResponse>, Status> {
         self.track_activity("CleanCache");
 
-        let app_context = Arc::clone(&self.state.read().await.app_context);
         let request = request.into_inner();
+        let registry = Arc::clone(&self.state.read().await.source_runtime_registry);
+        let (_, app_context) = parse_source_runtime(&registry, &request.source_id)?;
 
         let (files_deleted, bytes_saved) = app_context
             .cache_engine
@@ -506,7 +511,8 @@ pub async fn start_daemon_server(
     watchers: Vec<BoxedFileWatcher<AtomicDaemonState>>,
 ) -> miette::Result<()> {
     let daemon_dir = state.app_context.daemon_dir.clone();
-    let workspace_root = state.app_context.workspace_root.clone();
+    let sources = Arc::clone(&state.sources);
+    let topology_changed = Arc::clone(&state.topology_changed);
     let version = state.app_context.cli_version.to_string();
     let endpoint = get_endpoint(&daemon_dir);
 
@@ -562,10 +568,11 @@ pub async fn start_daemon_server(
     // Spawn the file watcher and listener in the background
     let (event_tx, event_rx) = broadcast::channel::<FileEvent>(EVENT_CHANNEL_CAPACITY);
     let watcher_handle = tokio::spawn(start_file_watcher(
-        workspace_root.clone(),
+        Arc::clone(&sources),
         event_tx,
         shutdown_tx.subscribe(),
     ));
+    let watcher_abort_handle = watcher_handle.abort_handle();
     let listener_handle = tokio::spawn(start_file_listener(
         atomic_state.clone(),
         watchers,
@@ -580,7 +587,7 @@ pub async fn start_daemon_server(
     // Retire the daemon on its own when the workspace disappears or it goes
     // unused, so an abandoned workspace doesn't leak a daemon forever.
     let monitor_handle = tokio::spawn(monitor_lifecycle(
-        workspace_root,
+        sources,
         service.last_activity(),
         shutdown_tx.clone(),
         shutdown_tx.subscribe(),
@@ -590,6 +597,8 @@ pub async fn start_daemon_server(
     // cleans up regardless of how it is stopped
     let shutdown_signal = async move {
         tokio::select! {
+            biased;
+
             _ = shutdown_rx.recv() => {
                 info!("Shutdown requested via RPC");
             }
@@ -599,6 +608,12 @@ pub async fn start_daemon_server(
 
                 info!("Shutdown requested via OS signal");
             }
+            _ = topology_changed.notified() => {
+                let _ = shutdown_tx.send(());
+
+                info!("Daemon restarting because the source root topology changed");
+            }
+            _ = supervise_file_watcher(watcher_handle, shutdown_tx.clone()) => {}
         }
     };
 
@@ -615,7 +630,7 @@ pub async fn start_daemon_server(
     // shutdown can't hang on one that's slow to observe the signal — which
     // would strand the daemon holding its lock but no longer serving, wedging
     // the workspace and blocking every later start.
-    watcher_handle.abort();
+    watcher_abort_handle.abort();
     listener_handle.abort();
     monitor_handle.abort();
 
@@ -623,7 +638,6 @@ pub async fn start_daemon_server(
     // slow teardown (dropping a recursive OS watch over a large tree can't be
     // preempted). Past this bound we exit anyway and let the OS clean up.
     let _ = timeout(TASK_SHUTDOWN_TIMEOUT, async {
-        let _ = watcher_handle.await;
         let _ = listener_handle.await;
         let _ = monitor_handle.await;
     })
@@ -651,10 +665,33 @@ pub async fn start_daemon_server(
     serve_result
 }
 
-/// Retire the daemon on its own when its workspace is deleted or it goes unused
-/// for [`IDLE_TTL`], by triggering the shared shutdown. Runs until shutdown.
+async fn supervise_file_watcher(
+    watcher_handle: tokio::task::JoinHandle<miette::Result<()>>,
+    shutdown_tx: broadcast::Sender<()>,
+) {
+    match watcher_handle.await {
+        Ok(Ok(())) => warn!("File watcher stopped unexpectedly"),
+        Ok(Err(error)) => error!(
+            error = format_error_chain(&error),
+            "File watcher failed unexpectedly"
+        ),
+        Err(error) => error!(error = %error, "File watcher task failed unexpectedly"),
+    }
+
+    let _ = shutdown_tx.send(());
+}
+
+fn get_missing_source_root(sources: &SourceRegistry) -> Option<(SourceRootId, PathBuf)> {
+    sources
+        .iter()
+        .find(|(_, root)| !root.exists())
+        .map(|(source_id, root)| (source_id.clone(), root.to_path_buf()))
+}
+
+/// Retire the daemon when any source root is deleted or it goes unused for
+/// [`IDLE_TTL`], by triggering the shared shutdown. Runs until shutdown.
 async fn monitor_lifecycle(
-    workspace_root: PathBuf,
+    sources: Arc<SourceRegistry>,
     last_activity: Arc<AtomicU64>,
     shutdown_tx: broadcast::Sender<()>,
     mut shutdown_rx: broadcast::Receiver<()>,
@@ -671,8 +708,8 @@ async fn monitor_lifecycle(
                     .elapsed()
                     .saturating_sub(Duration::from_millis(last_activity.load(Ordering::Relaxed)));
 
-                if !workspace_root.exists() {
-                    info!("Daemon shutting down because its workspace was removed");
+                if let Some((source_id, root)) = get_missing_source_root(&sources) {
+                    info!(source = %source_id, path = ?root, "Daemon shutting down because a source root was removed");
                 } else if idle >= IDLE_TTL {
                     info!("Daemon shutting down because it has been idle too long");
                 } else {
@@ -752,4 +789,62 @@ pub async fn serve_windows(
         })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn create_source_registry() -> (PathBuf, SourceRegistry, SourceRootId) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            env::temp_dir().join(format!("moon-daemon-roots-{}-{unique}", std::process::id()));
+        let primary_root = base.join("primary");
+        let child_root = base.join("child");
+        std::fs::create_dir_all(&primary_root).unwrap();
+        std::fs::create_dir_all(&child_root).unwrap();
+
+        let child_id = SourceRootId::new("child").unwrap();
+        let mut sources = SourceRegistry::single(primary_root);
+        sources.register(child_id.clone(), child_root).unwrap();
+
+        (base, sources, child_id)
+    }
+
+    #[test]
+    fn detects_removed_child_source_root() {
+        let (base, sources, child_id) = create_source_registry();
+        std::fs::remove_dir_all(sources.get(&child_id).unwrap()).unwrap();
+
+        assert_eq!(get_missing_source_root(&sources).unwrap().0, child_id);
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn detects_renamed_child_source_root() {
+        let (base, sources, child_id) = create_source_registry();
+        std::fs::rename(sources.get(&child_id).unwrap(), base.join("renamed-child")).unwrap();
+
+        assert_eq!(get_missing_source_root(&sources).unwrap().0, child_id);
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unexpected_watcher_failure_requests_shutdown() {
+        let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+        let watcher_handle = tokio::spawn(async { Err(miette::miette!("watch failed")) });
+
+        supervise_file_watcher(watcher_handle, shutdown_tx).await;
+
+        tokio::time::timeout(Duration::from_secs(1), shutdown_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }

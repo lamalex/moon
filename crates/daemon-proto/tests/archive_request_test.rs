@@ -1,7 +1,7 @@
 use bazel_remote_apis::build::bazel::remote::execution::v2::{ActionResult, Digest, OutputFile};
 use moon_daemon_proto::{
-    ArchiveTaskOutputsRequest, HashFilesRequest, HydrateTaskOutputsRequest, ManifestDigestSource,
-    PROTOCOL_VERSION,
+    ArchiveTaskOutputsRequest, CleanCacheRequest, HashFilesRequest, HydrateTaskOutputsRequest,
+    ManifestDigestSource, PROTOCOL_VERSION,
 };
 use prost::Message;
 
@@ -140,5 +140,15 @@ fn round_trips_canonical_routing_fields_and_digest_source() {
     let hydrate = HydrateTaskOutputsRequest::decode(hydrate.encode_to_vec().as_slice()).unwrap();
     assert_eq!(hydrate.source_id, "child");
     assert_eq!(hydrate.task_key, "child::app:build");
-    assert_eq!(PROTOCOL_VERSION, 3);
+    let clean = CleanCacheRequest {
+        all: false,
+        lifetime: "7 days".into(),
+        source_id: "child".into(),
+    };
+    let clean = CleanCacheRequest::decode(clean.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(clean.source_id, "child");
+    assert_eq!(clean.lifetime, "7 days");
+    assert!(!clean.all);
+
+    assert_eq!(PROTOCOL_VERSION, 4);
 }

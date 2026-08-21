@@ -2,7 +2,9 @@ use crate::app_options::AffectedOption;
 // use crate::app_error::AppError;
 use crate::helpers::run_action_pipeline;
 use crate::prompts::select_targets;
-use crate::queries::changed_files::{QueryChangedFilesOptions, query_changed_files};
+use crate::queries::changed_files::{
+    QueryChangedFilesOptions, SourceChangedFilesQuery, query_source_changed_files,
+};
 use crate::session::{MoonSession, SessionResult};
 use ci_env::CiOutput;
 use clap::{Args, ValueEnum};
@@ -13,14 +15,14 @@ use moon_action_graph::{ActionGraph, ActionGraphBuilderOptions, RunRequirements}
 use moon_affected::{DownstreamScope, UpstreamScope};
 use moon_app_macros::{with_affected_args, with_shared_exec_args};
 use moon_cache::CacheMode;
-use moon_common::{apply_style_tags, is_ci, is_test_env, path::WorkspaceRelativePathBuf};
+use moon_common::{apply_style_tags, is_ci, is_test_env};
 use moon_console::ui::{Container, Notice, SelectOption, SelectProps, StyledText, Variant};
 use moon_console::{Console, Level};
 use moon_exec_plan::{ExecutionPlan, TargetsBlock};
 use moon_task::{Target, TargetLocator};
 use moon_vcs::ChangedStatus;
 use petgraph::graph::NodeIndex;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use starbase_utils::json;
 use std::fmt;
 use std::sync::Arc;
@@ -326,18 +328,10 @@ impl ExecWorkflow {
     }
 
     // Step 1
-    async fn load_changed_files(&mut self) -> miette::Result<FxHashSet<WorkspaceRelativePathBuf>> {
+    async fn load_changed_files(&mut self) -> miette::Result<SourceChangedFilesQuery> {
         self.print_step("Loading changed files")?;
 
-        let vcs = self.session.get_vcs_adapter().await?;
-
-        if !vcs.is_enabled() {
-            self.affected = false;
-
-            debug!("VCS not enabled, skipping changed and affected checks");
-
-            return Ok(FxHashSet::default());
-        }
+        let runtimes = self.session.get_source_runtime_registry().await?;
 
         let mut base = self.get_base();
         let mut head = self.get_head();
@@ -411,15 +405,21 @@ impl ExecWorkflow {
             options.apply_affected(by);
         }
 
-        let result = query_changed_files(&vcs, options).await?;
+        let result = query_source_changed_files(&runtimes, options).await?;
+
+        if result.legacy_affected_fallback {
+            self.affected = false;
+            debug!("VCS unavailable, disabling affected filtering for the single source");
+        }
 
         // Without this check, the newlines in the file list
         // will cause the message to break out of the tracing debug!
         if self.should_print() {
             let mut files = result
-                .files
-                .iter()
-                .map(|file| format!("\t<file>{}</file>", file.as_str()))
+                .observations
+                .values()
+                .flat_map(|observation| observation.files.files.keys())
+                .map(|file| format!("\t<file>{file}</file>"))
                 .collect::<Vec<_>>();
             files.sort();
 
@@ -427,21 +427,13 @@ impl ExecWorkflow {
             self.print(files.join("\n"))?;
         }
 
-        if result.shallow {
-            // if self.ci_env {
-            //     return Err(AppError::CiNoShallowHistory.into());
-            // } else {
-            self.affected = false;
-            // }
-        }
-
-        Ok(result.files)
+        Ok(result)
     }
 
     // Step 2
     async fn build_action_graph(
         &mut self,
-        changed_files: FxHashSet<WorkspaceRelativePathBuf>,
+        changed_files: SourceChangedFilesQuery,
     ) -> miette::Result<(ActionContext, ActionGraph)> {
         self.print_step("Building action graph")?;
 
@@ -459,7 +451,7 @@ impl ExecWorkflow {
 
         // Always pass changed files, even if not checking affected,
         // as it's required for plugins, contexts, and more
-        action_graph_builder.set_changed_files(changed_files)?;
+        action_graph_builder.set_source_changed_files(changed_files.observations)?;
 
         // Only track affected if enabled
         let upstream = self.get_upstream();
@@ -550,44 +542,64 @@ impl ExecWorkflow {
 
     // Step 3
     fn display_affected(&mut self, context: &ActionContext) -> miette::Result<()> {
-        let Some(affected) = &context.affected else {
+        if !context.is_affected() {
             return Ok(());
-        };
+        }
 
         self.print_step("Tracking affected tasks")?;
 
-        for (target, state) in &affected.tasks {
-            if !state.env.is_empty() {
-                self.print(format!(
-                    "\t<id>{target}</id> affected by environment variable <property>{}</property>",
-                    state.env.iter().next().unwrap()
-                ))?;
-            } else if !state.files.is_empty() {
-                self.print(format!(
-                    "\t<id>{target}</id> affected by file <file>{}</file>",
-                    state.files.iter().next().unwrap()
-                ))?;
-            } else if !state.projects.is_empty() {
-                self.print(format!(
-                    "\t<id>{target}</id> affected by project <id>{}</id>",
-                    state.projects.iter().next().unwrap()
-                ))?;
-            } else if !state.upstream.is_empty() {
-                if self.get_include_relations() {
+        if let Some(affected) = &context.affected {
+            for (target, state) in &affected.tasks {
+                if !state.env.is_empty() {
                     self.print(format!(
-                        "\t<id>{target}</id> affected by dependency task <label>{}</label>",
-                        state.upstream.iter().next().unwrap()
+                        "\t<id>{target}</id> affected by environment variable <property>{}</property>",
+                        state.env.iter().next().unwrap()
                     ))?;
-                }
-            } else if !state.downstream.is_empty() {
-                if self.get_include_relations() {
+                } else if !state.files.is_empty() {
                     self.print(format!(
-                        "\t<id>{target}</id> affected by dependent task <label>{}</label>",
-                        state.downstream.iter().next().unwrap()
+                        "\t<id>{target}</id> affected by file <file>{}</file>",
+                        state.files.iter().next().unwrap()
                     ))?;
+                } else if !state.projects.is_empty() {
+                    self.print(format!(
+                        "\t<id>{target}</id> affected by project <id>{}</id>",
+                        state.projects.iter().next().unwrap()
+                    ))?;
+                } else if !state.upstream.is_empty() {
+                    if self.get_include_relations() {
+                        self.print(format!(
+                            "\t<id>{target}</id> affected by dependency task <label>{}</label>",
+                            state.upstream.iter().next().unwrap()
+                        ))?;
+                    }
+                } else if !state.downstream.is_empty() {
+                    if self.get_include_relations() {
+                        self.print(format!(
+                            "\t<id>{target}</id> affected by dependent task <label>{}</label>",
+                            state.downstream.iter().next().unwrap()
+                        ))?;
+                    }
+                } else {
+                    self.print(format!("\t<id>{target}</id> affected"))?;
                 }
-            } else {
-                self.print(format!("\t<id>{target}</id> affected"))?;
+            }
+        }
+
+        if let Some(affected) = &context.aggregate_affected {
+            for (key, state) in &affected.tasks {
+                if let Some(file) = state.files.iter().next() {
+                    self.print(format!(
+                        "\t<id>{key}</id> affected by file <file>{file}</file>"
+                    ))?;
+                } else if let Some(env) = state.env.iter().next() {
+                    self.print(format!(
+                        "\t<id>{key}</id> affected by environment variable <property>{env}</property>"
+                    ))?;
+                } else if self.get_include_relations()
+                    || (state.upstream.is_empty() && state.downstream.is_empty())
+                {
+                    self.print(format!("\t<id>{key}</id> affected"))?;
+                }
             }
         }
 

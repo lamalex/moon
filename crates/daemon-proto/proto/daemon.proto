@@ -37,8 +37,9 @@ message ArchiveTaskOutputsResponse {
 }
 
 message CleanCacheRequest {
-  bool   all      = 1;
-  string lifetime = 2;
+  bool   all       = 1;
+  string lifetime  = 2;
+  string source_id = 3;
 }
 
 message CleanCacheResponse {

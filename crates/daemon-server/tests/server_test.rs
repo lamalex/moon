@@ -380,7 +380,7 @@ mod windows_rpc {
     }
 
     #[tokio::test]
-    async fn test_clean_cache_rpc_acks_without_waiting_for_clean() {
+    async fn test_clean_cache_rpc_returns_cleanup_stats() {
         let sandbox = create_empty_sandbox();
         let daemon_dir = sandbox.path().join("daemon");
         let workspace_root = sandbox.path().to_path_buf();
@@ -390,8 +390,14 @@ mod windows_rpc {
         let shutdown_tx = start_test_server(&daemon_dir, &workspace_root).await;
         let mut client = DaemonClient::connect(&daemon_dir).await.unwrap();
 
-        // The clean runs in the background, so the ack carries no stats.
-        let response = client.clean_cache("7 days".into(), false).await.unwrap();
+        let response = client
+            .clean_cache(
+                &moon_common::SourceRootId::primary(),
+                "7 days".into(),
+                false,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.files_deleted, 0);
         assert_eq!(response.bytes_saved, 0);

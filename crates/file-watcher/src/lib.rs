@@ -1,17 +1,26 @@
 use async_trait::async_trait;
-use moon_common::path::WorkspaceRelativePathBuf;
+use moon_common::{SourceRootId, path::WorkspaceRelativePathBuf};
 use std::path::PathBuf;
 
 pub use notify_types::event::*;
 
 #[derive(Clone, Debug)]
 pub struct FileEvent {
+    pub source_id: SourceRootId,
     pub path_original: PathBuf,
     pub path: WorkspaceRelativePathBuf,
     pub kind: EventKind,
 }
 
 impl FileEvent {
+    pub fn is_source_root_removed_or_renamed(&self) -> bool {
+        self.path.as_str().is_empty()
+            && matches!(
+                self.kind,
+                EventKind::Modify(ModifyKind::Name(_)) | EventKind::Remove(_)
+            )
+    }
+
     pub fn is_mutated(&self) -> bool {
         self.kind.is_modify() || self.kind.is_create() || self.kind.is_remove()
     }

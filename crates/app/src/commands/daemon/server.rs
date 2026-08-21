@@ -2,6 +2,7 @@ use crate::session::{MoonSession, SessionResult};
 use crate::watchers::WorkspaceWatcher;
 use moon_daemon::{DaemonState, start_daemon_server};
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 fn install_daemon_panic_hook() {
     let previous_hook = std::panic::take_hook();
@@ -40,7 +41,9 @@ pub async fn server(session: MoonSession) -> SessionResult {
     start_daemon_server(
         DaemonState {
             app_context: Arc::clone(source_runtime_registry.get_primary()),
+            sources: Arc::clone(&session.sources),
             source_runtime_registry,
+            topology_changed: Arc::new(Notify::new()),
             // Loaded in the background within the workspace watcher,
             // otherwise it causes this command to block for too long
             workspace_graph: Default::default(),

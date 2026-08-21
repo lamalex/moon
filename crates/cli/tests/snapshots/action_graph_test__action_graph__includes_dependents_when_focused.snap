@@ -2,6 +2,7 @@
 source: crates/cli/tests/action_graph_test.rs
 expression: assert.output()
 ---
+
 digraph {
     0 [ label="SyncWorkspace"]
     1 [ label="SyncProject(basic)"]
@@ -25,8 +26,8 @@ digraph {
     8 -> 0 [ label="required"]
     7 -> 0 [ label="required"]
     7 -> 8 [ label="required"]
-    7 -> 1 [ label="required"]
     7 -> 3 [ label="required"]
+    7 -> 1 [ label="required"]
     9 -> 7 [ label="required"]
     9 -> 5 [ label="required"]
     9 -> 2 [ label="required"]

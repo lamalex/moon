@@ -1,6 +1,11 @@
-use moon_action::{Action, ActionNode, ActionStatus, Operation, RunTaskNode};
-use moon_common::{Id, SourceRootId};
+use moon_action::{
+    Action, ActionNode, ActionStatus, InstallDependenciesNode, Operation, RunTaskNode,
+    SetupEnvironmentNode, SetupToolchainNode, SyncProjectNode,
+};
+use moon_common::{Id, SourceRootId, path::WorkspaceRelativePathBuf};
 use moon_target::{ProjectKey, Target, TaskKey};
+use moon_toolchain::{ToolchainSpec, VersionSpec};
+use rustc_hash::FxHashSet;
 
 fn task_op(exit_code: Option<i32>, status: ActionStatus) -> Operation {
     let mut op = Operation::task_execution("cmd");
@@ -33,6 +38,109 @@ fn run_task_identity_is_source_qualified() {
     assert_ne!(first, second);
     assert_ne!(first.get_id(), second.get_id());
     assert_eq!(first.label(), second.label());
+    assert_eq!(
+        first.source_id(),
+        Some(&SourceRootId::new("first").unwrap())
+    );
+    assert_eq!(
+        second.source_id(),
+        Some(&SourceRootId::new("second").unwrap())
+    );
+}
+
+#[test]
+fn run_task_variants_share_scheduler_identity_but_not_action_identity() {
+    let target = Target::parse("app:build").unwrap();
+    let key = TaskKey::primary(Id::raw("app"), Id::raw("build")).unwrap();
+    let mut first = RunTaskNode::new_with_key(key.clone(), target.clone());
+    first.args.push("--mode=a".into());
+    let mut second = RunTaskNode::new_with_key(key, target);
+    second.env.insert("MODE".into(), Some("b".into()));
+    let first = ActionNode::run_task(first);
+    let second = ActionNode::run_task(second);
+
+    assert_ne!(first, second);
+    assert_eq!(
+        FxHashSet::from_iter([first.clone(), second.clone()]).len(),
+        2
+    );
+    assert_eq!(first.get_id(), second.get_id());
+}
+
+#[test]
+fn run_task_scheduler_identity_retains_execution_semantics() {
+    let target = Target::parse("app:build").unwrap();
+    let key = TaskKey::primary(Id::raw("app"), Id::raw("build")).unwrap();
+    let standard = ActionNode::run_task(RunTaskNode::new_with_key(key.clone(), target.clone()));
+    let mut persistent = RunTaskNode::new_with_key(key.clone(), target.clone());
+    persistent.persistent = true;
+    let persistent = ActionNode::run_task(persistent);
+    let mut interactive = RunTaskNode::new_with_key(key, target);
+    interactive.interactive = true;
+    let interactive = ActionNode::run_task(interactive);
+
+    assert_ne!(standard.get_id(), persistent.get_id());
+    assert_ne!(standard.get_id(), interactive.get_id());
+    assert_ne!(persistent.get_id(), interactive.get_id());
+}
+
+fn assert_source_qualified(create: impl Fn(SourceRootId) -> ActionNode) {
+    let first_source = SourceRootId::new("first").unwrap();
+    let second_source = SourceRootId::new("second").unwrap();
+    let first = create(first_source.clone());
+    let second = create(second_source.clone());
+
+    assert_eq!(first.label(), second.label());
+    assert_eq!(first.source_id(), Some(&first_source));
+    assert_eq!(second.source_id(), Some(&second_source));
+    assert_ne!(first, second);
+    assert_eq!(FxHashSet::from_iter([first, second]).len(), 2);
+}
+
+#[test]
+fn root_sensitive_action_identity_is_source_qualified() {
+    assert_source_qualified(|source_id| {
+        ActionNode::install_dependencies(InstallDependenciesNode {
+            members: None,
+            project_key: None,
+            root: WorkspaceRelativePathBuf::new(),
+            source_id,
+            toolchain_id: Id::raw("node"),
+        })
+    });
+
+    assert_source_qualified(|source_id| {
+        ActionNode::setup_environment(SetupEnvironmentNode {
+            project_key: None,
+            root: WorkspaceRelativePathBuf::new(),
+            source_id,
+            toolchain_id: Id::raw("node"),
+        })
+    });
+
+    assert_source_qualified(|source_id| {
+        ActionNode::setup_proto(source_id, VersionSpec::parse("1.2.3").unwrap())
+    });
+
+    assert_source_qualified(|source_id| {
+        ActionNode::setup_toolchain(SetupToolchainNode {
+            source_id,
+            toolchain: ToolchainSpec::new_global(Id::raw("node")),
+        })
+    });
+
+    assert_source_qualified(|source_id| {
+        ActionNode::sync_project(SyncProjectNode {
+            project_key: ProjectKey::new(source_id, Id::raw("app")).unwrap(),
+        })
+    });
+
+    assert_source_qualified(ActionNode::sync_workspace);
+}
+
+#[test]
+fn none_has_no_source() {
+    assert_eq!(ActionNode::None.source_id(), None);
 }
 
 mod get_exit_code {

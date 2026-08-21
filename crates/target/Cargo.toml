@@ -10,6 +10,7 @@ publish = true
 
 [dependencies]
 moon_common = { version = "2.0.8", path = "../common" }
+blake3 = { workspace = true }
 compact_str = { workspace = true }
 miette = { workspace = true }
 regex = { workspace = true }

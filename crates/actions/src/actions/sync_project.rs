@@ -6,7 +6,6 @@ use moon_app_context::AppContext;
 use moon_common::{color, is_ci};
 use moon_pdk_api::SyncProjectInput;
 use moon_workspace_graph::WorkspaceGraph;
-use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use tracing::{debug, instrument, warn};
 
@@ -18,10 +17,19 @@ pub async fn sync_project(
     workspace_graph: Arc<WorkspaceGraph>,
     node: &SyncProjectNode,
 ) -> miette::Result<ActionStatus> {
-    let project_id = &node.project_id;
+    let project_key = &node.project_key;
+    let project_id = project_key.project_id();
+
+    if project_key.source_id() != &app_context.source_id {
+        return Err(miette::miette!(
+            "Sync project action for source {} cannot run in source {}.",
+            project_key.source_id(),
+            app_context.source_id
+        ));
+    }
 
     // Include tasks for snapshot!
-    let project = workspace_graph.get_project_with_tasks(project_id)?;
+    let project = workspace_graph.get_project_with_tasks_by_key(project_key)?;
 
     // Create a snapshot for tasks to reference
     app_context
@@ -50,19 +58,19 @@ pub async fn sync_project(
             .create_lock(format!("{}-{}", action.get_prefix(), project_id))?;
 
     // Collect all project dependencies so we can pass them along
-    let mut dependencies = FxHashMap::default();
     let mut dependency_fragments = vec![];
 
-    for dep_config in &project.dependencies {
-        let dep_project = workspace_graph.get_project(&dep_config.id)?;
+    for (dependency_key, dependency_scope) in workspace_graph
+        .projects
+        .direct_dependencies_with_scopes(&project.key())?
+    {
+        let dep_project = workspace_graph.get_project_by_key(&dependency_key)?;
 
         dependency_fragments.push({
             let mut fragment = dep_project.to_fragment();
-            fragment.dependency_scope = Some(dep_config.scope);
+            fragment.dependency_scope = Some(dependency_scope);
             fragment
         });
-
-        dependencies.insert(dep_config.id.to_owned(), dep_project);
     }
 
     // Sync the projects and return true if any files have been mutated

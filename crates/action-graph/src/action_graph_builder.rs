@@ -7,26 +7,29 @@ use moon_action::{
     SyncProjectNode,
 };
 use moon_action_context::{ActionContext, TargetState};
-use moon_affected::{AffectedTracker, DownstreamScope, UpstreamScope};
-use moon_app_context::AppContext;
+use moon_affected::{AffectedTracker, AggregateAffectedTracker, DownstreamScope, UpstreamScope};
+use moon_app_context::{AppContext, SourceRuntimeRegistry};
 use moon_common::path::{PathExt, WorkspaceRelativePathBuf};
-use moon_common::{Id, color, is_ci};
+use moon_common::{Id, SourcePathBuf, SourceRootId, color, is_ci};
 use moon_config::{EnvMap, PipelineActionSwitch, TaskDependencyConfig, TaskDependencyType};
 use moon_exec_plan::{ExecutionPlan, TargetsBlock};
 use moon_pdk_api::{DefineRequirementsInput, LocateDependenciesRootInput};
 use moon_project::{Project, ProjectError};
 use moon_query::{Criteria, build_query};
+use moon_target::{ProjectKey, TaskInvocationKey};
 use moon_task::{
     Target, TargetError, TargetLocator, TargetProjectScope, TargetTaskScope, Task, TaskKey,
 };
 use moon_toolchain::{DependenciesWorkspace, DependenciesWorkspaceRole, ToolchainSpec};
+use moon_vcs::{ChangedFilesObservation, ImpactCompleteness};
 use moon_workspace_graph::projects::ProjectGraphError;
-use moon_workspace_graph::tasks::TaskGraph;
 use moon_workspace_graph::{GraphConnections, WorkspaceGraph};
 use petgraph::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::mem;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, instrument, trace};
 
@@ -128,17 +131,23 @@ impl ActionGraphBuilderOptions {
 }
 
 pub struct ActionGraphBuilder<'query> {
-    aggregate_task_graph: Option<Arc<TaskGraph>>,
+    aggregate_attached: bool,
+    aggregate_workspace_graph: Arc<WorkspaceGraph>,
     all_query: Option<Criteria<'query>>,
     app_context: Arc<AppContext>,
     graph: Dag<ActionNode, TaskDependencyType>,
     nodes: FxHashMap<ActionNode, NodeIndex>,
     options: ActionGraphBuilderOptions,
+    source_runtime_registry: Arc<SourceRuntimeRegistry>,
     workspace_graph: Arc<WorkspaceGraph>,
 
     // Affected tracking
     affected: Option<AffectedTracker>,
+    aggregate_affected: Option<AggregateAffectedTracker>,
     changed_files: Option<FxHashSet<WorkspaceRelativePathBuf>>,
+    source_changed_files: BTreeMap<SourceRootId, FxHashSet<WorkspaceRelativePathBuf>>,
+    source_changed_file_observations:
+        BTreeMap<SourceRootId, ChangedFilesObservation<SourcePathBuf>>,
 
     // Target tracking
     ignored_dependencies: FxHashMap<TaskKey, FxHashSet<TaskKey>>,
@@ -146,8 +155,12 @@ pub struct ActionGraphBuilder<'query> {
     // Consumed when the task is revisited with dependents in scope, since the
     // node-exists early return would otherwise skip the expansion entirely.
     ignored_dependents: FxHashSet<TaskKey>,
-    passthrough_targets: FxHashSet<TaskKey>,
+    passthrough_targets: FxHashSet<TaskInvocationKey>,
     primary_targets: FxHashSet<TaskKey>,
+
+    // Proto and tool installs mutate manifests shared by every source using
+    // the same store, so preserve insertion order across those actions.
+    setup_tails: FxHashMap<PathBuf, (SourceRootId, NodeIndex)>,
 
     // Serial ordering edges added by `try_link_requirements`. Tracked so the
     // serial subtree walk doesn't follow them as if they were real dependency
@@ -165,39 +178,59 @@ impl<'query> ActionGraphBuilder<'query> {
         debug!("Building action graph");
         workspace_graph.ensure_execution_local()?;
 
+        let source_runtime_registry =
+            Arc::new(SourceRuntimeRegistry::single(Arc::clone(&app_context)));
+
         Ok(ActionGraphBuilder {
-            aggregate_task_graph: None,
+            aggregate_attached: false,
+            aggregate_workspace_graph: Arc::clone(&workspace_graph),
             affected: None,
+            aggregate_affected: None,
             all_query: None,
             app_context,
             graph: Dag::new(),
             nodes: FxHashMap::default(),
             options,
+            source_runtime_registry,
             ignored_dependencies: FxHashMap::default(),
             ignored_dependents: FxHashSet::default(),
             passthrough_targets: FxHashSet::default(),
             primary_targets: FxHashSet::default(),
+            setup_tails: FxHashMap::default(),
             serial_edges: FxHashSet::default(),
             changed_files: None,
+            source_changed_files: BTreeMap::new(),
+            source_changed_file_observations: BTreeMap::new(),
             workspace_graph,
         })
     }
 
-    /// Attach the read-only aggregate graph used to reject unsupported execution edges.
-    pub fn with_aggregate_task_graph(mut self, task_graph: Arc<TaskGraph>) -> Self {
-        self.aggregate_task_graph = Some(task_graph);
+    /// Attach the aggregate graph and source-local services used for execution expansion.
+    pub fn with_aggregate_workspace_graph(
+        mut self,
+        workspace_graph: Arc<WorkspaceGraph>,
+        source_runtime_registry: Arc<SourceRuntimeRegistry>,
+    ) -> Self {
+        self.aggregate_attached = true;
+        self.aggregate_workspace_graph = workspace_graph;
+        self.source_runtime_registry = source_runtime_registry;
         self
     }
 
     pub fn build(mut self) -> (ActionContext, ActionGraph) {
         let mut context = ActionContext {
             affected: self.affected.take().map(|affected| affected.build()),
+            aggregate_affected: self
+                .aggregate_affected
+                .take()
+                .map(|affected| affected.build()),
+            primary_source_id: self.app_context.source_id.clone(),
             ..ActionContext::default()
         };
 
         if !self.passthrough_targets.is_empty() {
             for target in mem::take(&mut self.passthrough_targets) {
-                context.set_task_state(target, TargetState::Passthrough);
+                context.set_invocation_state(target, TargetState::Passthrough);
             }
         }
 
@@ -213,8 +246,12 @@ impl<'query> ActionGraphBuilder<'query> {
             context.changed_files = files.to_owned();
         }
 
+        context.source_changed_files = mem::take(&mut self.source_changed_files);
+
         // Reduce unncessary edges
-        if let Some(index) = self.get_index_from_node(&ActionNode::SyncWorkspace) {
+        if let Some(index) = self.get_index_from_node(&ActionNode::sync_workspace(
+            self.app_context.source_id.clone(),
+        )) {
             self.graph.transitive_reduce(vec![index]);
         }
 
@@ -240,6 +277,17 @@ impl<'query> ActionGraphBuilder<'query> {
     }
 
     pub fn get_project_spec(&self, toolchain_id: &Id, project: &Project) -> Option<ToolchainSpec> {
+        let app_context = self.source_runtime_registry.get(&project.source_id).ok()?;
+
+        self.get_project_spec_for(app_context, toolchain_id, project)
+    }
+
+    fn get_project_spec_for(
+        &self,
+        app_context: &AppContext,
+        toolchain_id: &Id,
+        project: &Project,
+    ) -> Option<ToolchainSpec> {
         if let Some(config) = project.config.toolchains.get_plugin_config(toolchain_id) {
             if !config.is_enabled() {
                 return None;
@@ -253,12 +301,19 @@ impl<'query> ActionGraphBuilder<'query> {
             }
         }
 
-        self.get_workspace_spec(toolchain_id)
+        self.get_workspace_spec_for(app_context, toolchain_id)
     }
 
     pub fn get_workspace_spec(&self, toolchain_id: &Id) -> Option<ToolchainSpec> {
-        if let Some(config) = self
-            .app_context
+        self.get_workspace_spec_for(&self.app_context, toolchain_id)
+    }
+
+    fn get_workspace_spec_for(
+        &self,
+        app_context: &AppContext,
+        toolchain_id: &Id,
+    ) -> Option<ToolchainSpec> {
+        if let Some(config) = app_context
             .toolchains_config
             .get_plugin_config(toolchain_id)
         {
@@ -272,7 +327,12 @@ impl<'query> ActionGraphBuilder<'query> {
     }
 
     pub fn set_affected(&mut self) -> miette::Result<()> {
-        if self.affected.is_none() {
+        if self.aggregate_attached && self.aggregate_affected.is_none() {
+            self.aggregate_affected = Some(AggregateAffectedTracker::new(
+                Arc::clone(&self.aggregate_workspace_graph),
+                mem::take(&mut self.source_changed_file_observations),
+            )?);
+        } else if !self.aggregate_attached && self.affected.is_none() {
             self.affected = Some(AffectedTracker::new(
                 Arc::clone(&self.workspace_graph),
                 self.changed_files
@@ -295,7 +355,50 @@ impl<'query> ActionGraphBuilder<'query> {
         &mut self,
         changed_files: FxHashSet<WorkspaceRelativePathBuf>,
     ) -> miette::Result<()> {
+        self.source_changed_files
+            .insert(self.app_context.source_id.clone(), changed_files.clone());
+        let mut observation = ChangedFilesObservation {
+            completeness: ImpactCompleteness::Exact,
+            ..Default::default()
+        };
+        for file in &changed_files {
+            observation.files.files.insert(
+                SourcePathBuf::new(self.app_context.source_id.clone(), file.clone()),
+                vec![],
+            );
+        }
+        self.source_changed_file_observations
+            .insert(self.app_context.source_id.clone(), observation);
         self.changed_files = Some(changed_files);
+
+        Ok(())
+    }
+
+    pub fn set_source_changed_files(
+        &mut self,
+        observations: BTreeMap<SourceRootId, ChangedFilesObservation<SourcePathBuf>>,
+    ) -> miette::Result<()> {
+        self.source_changed_files = observations
+            .iter()
+            .map(|(source_id, observation)| {
+                (
+                    source_id.clone(),
+                    observation
+                        .files
+                        .files
+                        .keys()
+                        .map(|file| file.path.clone())
+                        .collect(),
+                )
+            })
+            .collect();
+        self.changed_files = Some(
+            self.source_changed_files
+                .get(&self.app_context.source_id)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        self.source_changed_file_observations = observations;
 
         Ok(())
     }
@@ -311,8 +414,8 @@ impl<'query> ActionGraphBuilder<'query> {
         if downstream != DownstreamScope::None {
             debug!("Force loading all projects and tasks to determine relationships");
 
-            self.workspace_graph.get_projects()?;
-            self.workspace_graph.get_tasks_with_internal()?;
+            self.aggregate_workspace_graph.get_projects()?;
+            self.aggregate_workspace_graph.get_tasks_with_internal()?;
         }
 
         self.set_affected()?;
@@ -337,6 +440,21 @@ impl<'query> ActionGraphBuilder<'query> {
             } else {
                 affected.track_projects()?;
             }
+        } else if let Some(affected) = self.aggregate_affected.as_mut() {
+            affected.set_ci_check(ci_check);
+            affected.set_scopes(upstream, downstream);
+
+            if self
+                .app_context
+                .workspace_config
+                .experiments
+                .async_affected_tracking
+            {
+                affected.track_projects_async().await?;
+                affected.track_tasks_async().await?;
+            } else {
+                affected.track_projects()?.track_tasks()?;
+            }
         }
 
         Ok(())
@@ -348,11 +466,16 @@ impl<'query> ActionGraphBuilder<'query> {
         spec: &ToolchainSpec,
         project: Option<&Project>,
     ) -> miette::Result<Option<NodeIndex>> {
+        let source_id = project
+            .map(|project| &project.source_id)
+            .unwrap_or(&self.app_context.source_id)
+            .clone();
+        let app_context = Arc::clone(self.source_runtime_registry.get(&source_id)?);
+
         // Explicitly disabled
         if spec.is_system()
             || !self.options.install_dependencies.is_enabled(&spec.id)
-            || self
-                .app_context
+            || app_context
                 .toolchains_config
                 .get_plugin_config(&spec.id)
                 .is_some_and(|cfg| !cfg.install_dependencies)
@@ -360,9 +483,9 @@ impl<'query> ActionGraphBuilder<'query> {
             return Ok(None);
         }
 
-        let sync_workspace_index = self.sync_workspace().await?;
+        let sync_workspace_index = self.sync_workspace_for(&source_id).await?;
         let setup_toolchain_index = self.setup_toolchain(spec, project).await?;
-        let toolchain_registry = &self.app_context.toolchain_registry;
+        let toolchain_registry = &app_context.toolchain_registry;
         let toolchain = toolchain_registry.load(&spec.id).await?;
 
         // Toolchain does not support this action, so skip and fall through
@@ -372,11 +495,13 @@ impl<'query> ActionGraphBuilder<'query> {
 
         let target_root = match project {
             Some(project) => &project.root,
-            None => &self.app_context.workspace_root,
+            None => &app_context.workspace_root,
         };
 
         // Only insert this action if a root was located
-        if let Some(deps_workspace) = self.locate_dependencies_root(spec, project).await?
+        if let Some(deps_workspace) = self
+            .locate_dependencies_root(&app_context, spec, project)
+            .await?
             && let Some(deps_role) =
                 toolchain.in_dependencies_workspace(&deps_workspace, target_root)?
         {
@@ -384,15 +509,15 @@ impl<'query> ActionGraphBuilder<'query> {
             // resolving to it collapses into the same action
             let root = deps_workspace
                 .root
-                .relative_to(&self.app_context.workspace_root)
+                .relative_to(&app_context.workspace_root)
                 .into_diagnostic()?;
 
             // Unless there's no workspace, in which case the root is the only
             // package, and the project that owns it is associated, so that
             // project-level toolchain config is passed to the plugin. The
             // root may also not be owned by a project at all
-            let project_id = match deps_role {
-                DependenciesWorkspaceRole::PackageRoot => project.map(|project| project.id.clone()),
+            let project_key = match deps_role {
+                DependenciesWorkspaceRole::PackageRoot => project.map(Project::key),
                 _ => None,
             };
 
@@ -400,7 +525,7 @@ impl<'query> ActionGraphBuilder<'query> {
                 .internal_setup_environment(
                     spec,
                     &root,
-                    project_id.as_ref().and(project),
+                    project_key.as_ref().and(project),
                     FxHashSet::default(),
                 )
                 .await?;
@@ -411,8 +536,11 @@ impl<'query> ActionGraphBuilder<'query> {
                     self,
                     ActionNode::install_dependencies(InstallDependenciesNode {
                         members: deps_workspace.members,
-                        project_id,
+                        project_key,
                         root,
+                        source_id: project
+                            .map(|project| project.source_id.clone())
+                            .unwrap_or_else(|| app_context.source_id.clone()),
                         toolchain_id: spec.id.clone(),
                     })
                 );
@@ -468,7 +596,9 @@ impl<'query> ActionGraphBuilder<'query> {
         let mut indexes = vec![];
 
         for toolchain_id in toolchains {
-            if let Some(spec) = self.get_project_spec(toolchain_id, project) {
+            let app_context = Arc::clone(self.source_runtime_registry.get(&project.source_id)?);
+
+            if let Some(spec) = self.get_project_spec_for(&app_context, toolchain_id, project) {
                 indexes.push(self.install_dependencies(&spec, project).await?);
             }
         }
@@ -481,11 +611,15 @@ impl<'query> ActionGraphBuilder<'query> {
         &mut self,
         spec: &ToolchainSpec,
     ) -> miette::Result<Option<NodeIndex>> {
+        let app_context = Arc::clone(
+            self.source_runtime_registry
+                .get(&self.app_context.source_id)?,
+        );
+
         // Explicitly disabled
         if spec.is_system()
             || !self.options.install_dependencies.is_enabled(&spec.id)
-            || self
-                .app_context
+            || app_context
                 .toolchains_config
                 .get_plugin_config(&spec.id)
                 .is_some_and(|cfg| !cfg.install_dependencies)
@@ -495,9 +629,9 @@ impl<'query> ActionGraphBuilder<'query> {
 
         // Only insert actions if the dependencies root is the workspace root
         if self
-            .locate_dependencies_root(spec, None)
+            .locate_dependencies_root(&app_context, spec, None)
             .await?
-            .is_none_or(|deps_workspace| deps_workspace.root != self.app_context.workspace_root)
+            .is_none_or(|deps_workspace| deps_workspace.root != app_context.workspace_root)
         {
             return Ok(None);
         }
@@ -507,10 +641,11 @@ impl<'query> ActionGraphBuilder<'query> {
 
     async fn locate_dependencies_root(
         &self,
+        app_context: &AppContext,
         spec: &ToolchainSpec,
         project: Option<&Project>,
     ) -> miette::Result<Option<DependenciesWorkspace>> {
-        let toolchain_registry = &self.app_context.toolchain_registry;
+        let toolchain_registry = &app_context.toolchain_registry;
         let toolchain = toolchain_registry.load(&spec.id).await?;
 
         // Toolchain does not support locating a root, so return
@@ -529,7 +664,7 @@ impl<'query> ActionGraphBuilder<'query> {
                 },
                 None => LocateDependenciesRootInput {
                     context: toolchain_registry.create_context(),
-                    starting_dir: toolchain.to_virtual_path(&self.app_context.workspace_root),
+                    starting_dir: toolchain.to_virtual_path(&app_context.workspace_root),
                     toolchain_config: toolchain_registry.create_config(&toolchain.id),
                 },
             })
@@ -773,41 +908,47 @@ impl<'query> ActionGraphBuilder<'query> {
         task: &Task,
         reqs: &RunRequirements,
         state: &RunTaskState,
-    ) -> miette::Result<Vec<Option<NodeIndex>>> {
+    ) -> miette::Result<Vec<(Option<NodeIndex>, TaskDependencyType)>> {
         let parallel = task.options.run_deps_in_parallel;
-        let mut indexes: Vec<Option<NodeIndex>> = vec![];
+        let mut indexes = vec![];
         let mut previous_target_index: Option<NodeIndex> = None;
+        let dependencies = self.resolved_dependencies_for(task);
 
-        for dep in &task.deps {
-            for dep_task in self
-                .internal_resolve_tasks_from_target(&dep.target, true)
-                .await?
+        for dependency in dependencies {
+            let dep_task = self
+                .aggregate_workspace_graph
+                .get_task_by_key(&dependency.task_key)?;
+            let dep_config = TaskDependencyConfig {
+                args: dependency.args,
+                env: dependency.env,
+                target: dep_task.target.clone(),
+                optional: Some(dependency.dependency_type == TaskDependencyType::Optional),
+                cache_strategy: Some(dependency.cache_strategy),
+            };
+            let mut dep_state = state.clone();
+            dep_state.via_dependency = true;
+
+            if let Some(dep_index) =
+                Box::pin(self.internal_run_task(&dep_task, reqs, Some(&dep_config), &mut dep_state))
+                    .await?
             {
-                let mut dep_state = state.clone();
-                dep_state.via_dependency = true;
-
-                if let Some(dep_index) =
-                    Box::pin(self.internal_run_task(&dep_task, reqs, Some(dep), &mut dep_state))
-                        .await?
-                {
-                    // When serial, this dependency's entire task subtree must
-                    // run after the previous dependency — not just the
-                    // dependency node itself. Otherwise its own transitive
-                    // dependencies (grandchildren) would run in parallel with
-                    // earlier serial dependencies. Cycle-forming edges are
-                    // skipped, which can happen when the same task node appears
-                    // in multiple serial dependency chains across parent tasks.
-                    if !parallel && let Some(prev) = previous_target_index {
-                        self.link_serial_requirements(dep_index, prev);
-                    }
-
-                    // The parent always depends on each child directly, as
-                    // serial chain edges alone can't guarantee this ordering
-                    // when a chain edge is skipped for forming a cycle
-                    indexes.push(Some(dep_index));
-
-                    previous_target_index = Some(dep_index);
+                // When serial, this dependency's entire task subtree must
+                // run after the previous dependency — not just the
+                // dependency node itself. Otherwise its own transitive
+                // dependencies (grandchildren) would run in parallel with
+                // earlier serial dependencies. Cycle-forming edges are
+                // skipped, which can happen when the same task node appears
+                // in multiple serial dependency chains across parent tasks.
+                if !parallel && let Some(prev) = previous_target_index {
+                    self.link_serial_requirements(dep_index, prev);
                 }
+
+                // The parent always depends on each child directly, as
+                // serial chain edges alone can't guarantee this ordering
+                // when a chain edge is skipped for forming a cycle
+                indexes.push((Some(dep_index), dependency.dependency_type));
+
+                previous_target_index = Some(dep_index);
             }
         }
 
@@ -823,8 +964,10 @@ impl<'query> ActionGraphBuilder<'query> {
     ) -> miette::Result<Vec<Option<NodeIndex>>> {
         let mut indexes = vec![];
 
-        for dep_key in self.workspace_graph.tasks.dependents_of(task) {
-            let dep_task = self.workspace_graph.get_task_by_key(&dep_key)?;
+        let dependent_keys = self.aggregate_workspace_graph.tasks.dependents_of(task);
+
+        for dep_key in dependent_keys {
+            let dep_task = self.aggregate_workspace_graph.get_task_by_key(&dep_key)?;
             // Dependent chains reset the marker, so that deep scopes
             // keep cascading through transitive dependents
             let mut dep_state = state.clone();
@@ -1049,19 +1192,36 @@ impl<'query> ActionGraphBuilder<'query> {
         config: Option<&TaskDependencyConfig>,
         state: &mut RunTaskState,
     ) -> miette::Result<Option<NodeIndex>> {
+        let task = if self.aggregate_attached {
+            self.aggregate_workspace_graph
+                .get_task_by_key(&task.key())?
+        } else {
+            Arc::new(task.clone())
+        };
         let task_key = task.key();
+        let invocation_key = TaskInvocationKey::new(
+            task_key.clone(),
+            config.into_iter().flat_map(|config| &config.args),
+            config
+                .into_iter()
+                .flat_map(|config| &config.env)
+                .map(|(key, value)| (key, value.as_ref())),
+        );
+        let _app_context = self
+            .source_runtime_registry
+            .get(task_key.project_key().source_id())?;
         let project = self
-            .workspace_graph
+            .aggregate_workspace_graph
             .get_project_by_key(task_key.project_key())?;
         let mut child_reqs = reqs.clone();
 
         // Abort early if not affected
-        if !self.is_task_affected(task, reqs)? {
+        if !self.is_task_affected(&task, reqs)? {
             return Ok(None);
         }
 
         // These tasks shouldn't actually run, so filter them out
-        if self.passthrough_targets.contains(&task_key) {
+        if self.passthrough_targets.contains(&invocation_key) {
             debug!(
                 task_target = task.target.as_str(),
                 "Not running task {} because it has been marked as passthrough",
@@ -1077,19 +1237,9 @@ impl<'query> ActionGraphBuilder<'query> {
             !state.via_dependency && reqs.dependents.is_in_scope(state.depth);
         state.depth += 1;
 
-        if let Some(task_graph) = &self.aggregate_task_graph
-            && let Some(dependency) = task_graph.cross_source_dependency_in_closure(&task.key())
-        {
-            return Err(ActionGraphError::UnsupportedCrossSourceTaskDependency {
-                task: task.key().to_string(),
-                dependency: dependency.to_string(),
-            }
-            .into());
-        }
-
         // Only apply CI checks when requested
         if reqs.ci_check && !task.should_run(reqs.ci) {
-            self.passthrough_targets.insert(task_key.clone());
+            self.passthrough_targets.insert(invocation_key);
 
             debug!(
                 task_target = task.target.as_str(),
@@ -1102,7 +1252,7 @@ impl<'query> ActionGraphBuilder<'query> {
             if should_run_dependents {
                 child_reqs.skip_affected = false;
 
-                Box::pin(self.run_task_dependents(task, &child_reqs, state)).await?;
+                Box::pin(self.run_task_dependents(&task, &child_reqs, state)).await?;
             }
 
             return Ok(None);
@@ -1142,65 +1292,75 @@ impl<'query> ActionGraphBuilder<'query> {
 
         // Check if the node exists to avoid all the overhead below
         if let Some(index) = self.get_index_from_node(&node) {
-            if had_ignored_dependencies && !task.deps.is_empty() {
+            if had_ignored_dependencies
+                && !self
+                    .aggregate_workspace_graph
+                    .tasks
+                    .resolved_dependencies_of(&task_key)
+                    .is_empty()
+            {
                 child_reqs.skip_affected = true;
 
-                let edges = Box::pin(self.run_task_dependencies(task, &child_reqs, state)).await?;
+                let edges = Box::pin(self.run_task_dependencies(&task, &child_reqs, state)).await?;
 
-                self.link_optional_requirements(index, edges)?;
+                self.link_task_requirements(index, edges)?;
             }
 
             if had_ignored_dependents {
                 child_reqs.skip_affected = false;
 
-                Box::pin(self.run_task_dependents(task, &child_reqs, state)).await?;
+                Box::pin(self.run_task_dependents(&task, &child_reqs, state)).await?;
             }
 
             return Ok(Some(index));
         }
 
         // Create initial edges
-        let mut edges = vec![self.sync_project(&project, reqs).await?];
+        let mut prerequisite_edges = vec![self.sync_project(&project, reqs).await?];
 
-        edges.extend(
+        prerequisite_edges.extend(
             self.install_dependencies_by_toolchains(&project, &task.toolchains)
                 .await?,
         );
 
         // If no edges created, we should at minimum sync the workspace
-        if edges.is_empty() || edges.iter().all(|edge| edge.is_none()) {
-            edges.push(self.sync_workspace().await?);
+        if prerequisite_edges.is_empty() || prerequisite_edges.iter().all(|edge| edge.is_none()) {
+            prerequisite_edges.push(self.sync_workspace_for(&project.source_id).await?);
         }
 
         // Insert and then link edges
         let index = self.insert_node(node);
 
-        if !task.deps.is_empty() {
-            if should_run_dependencies {
-                child_reqs.skip_affected = true;
+        let dependencies = self
+            .aggregate_workspace_graph
+            .tasks
+            .resolved_dependencies_of(&task_key);
+        let has_dependencies = !dependencies.is_empty();
+        let ignored_dependencies = dependencies
+            .iter()
+            .map(|dependency| dependency.task_key.clone())
+            .collect::<FxHashSet<_>>();
+        let dependency_edges = if has_dependencies && should_run_dependencies {
+            child_reqs.skip_affected = true;
 
-                edges.extend(Box::pin(self.run_task_dependencies(task, &child_reqs, state)).await?);
-            } else {
-                self.ignored_dependencies.insert(
-                    task_key.clone(),
-                    task.deps
-                        .iter()
-                        .map(|dep| {
-                            TaskKey::from_target(task.source_id.clone(), &dep.target)
-                                .expect("Task dependencies must be project and task qualified")
-                        })
-                        .collect(),
-                );
-            }
+            Box::pin(self.run_task_dependencies(&task, &child_reqs, state)).await?
+        } else {
+            vec![]
+        };
+
+        if has_dependencies && !should_run_dependencies {
+            self.ignored_dependencies
+                .insert(task_key.clone(), ignored_dependencies);
         }
 
-        self.link_optional_requirements(index, edges)?;
+        self.link_optional_requirements(index, prerequisite_edges)?;
+        self.link_task_requirements(index, dependency_edges)?;
 
         // And possibly dependents
         if should_run_dependents {
             child_reqs.skip_affected = false;
 
-            Box::pin(self.run_task_dependents(task, &child_reqs, state)).await?;
+            Box::pin(self.run_task_dependents(&task, &child_reqs, state)).await?;
         } else {
             self.ignored_dependents.insert(task_key);
         }
@@ -1216,6 +1376,12 @@ impl<'query> ActionGraphBuilder<'query> {
         project: Option<&Project>,
         mut cycle: FxHashSet<&Id>,
     ) -> miette::Result<Option<NodeIndex>> {
+        let source_id = project
+            .map(|project| &project.source_id)
+            .unwrap_or(&self.app_context.source_id)
+            .clone();
+        let app_context = Arc::clone(self.source_runtime_registry.get(&source_id)?);
+
         // Explicitly disabled
         if !self.options.setup_environment.is_enabled(&spec.id)
             || spec.is_system()
@@ -1224,7 +1390,7 @@ impl<'query> ActionGraphBuilder<'query> {
             return Ok(None);
         }
 
-        let toolchain_registry = &self.app_context.toolchain_registry;
+        let toolchain_registry = &app_context.toolchain_registry;
         let toolchain = toolchain_registry.load(&spec.id).await?;
         let mut edges = vec![];
 
@@ -1253,7 +1419,14 @@ impl<'query> ActionGraphBuilder<'query> {
                         continue;
                     }
 
-                    if let Some(require_spec) = self.get_spec(&require_id, project) {
+                    let require_spec = match project {
+                        Some(project) => {
+                            self.get_project_spec_for(&app_context, &require_id, project)
+                        }
+                        None => self.get_workspace_spec_for(&app_context, &require_id),
+                    };
+
+                    if let Some(require_spec) = require_spec {
                         // Requires the toolchain to be setup, not the environment!
                         edges.push(Box::pin(self.setup_toolchain(&require_spec, project)).await?);
                     } else {
@@ -1272,14 +1445,17 @@ impl<'query> ActionGraphBuilder<'query> {
             return Ok(None);
         }
 
-        edges.push(self.sync_workspace().await?);
+        edges.push(self.sync_workspace_for(&source_id).await?);
         edges.push(self.setup_toolchain(spec, project).await?);
 
         let index = insert_node_or_exit!(
             self,
             ActionNode::setup_environment(SetupEnvironmentNode {
-                project_id: project.map(|p| p.id.clone()),
+                project_key: project.map(Project::key),
                 root: root.clone(),
+                source_id: project
+                    .map(|project| project.source_id.clone())
+                    .unwrap_or_else(|| app_context.source_id.clone()),
                 toolchain_id: spec.id.clone(),
             })
         );
@@ -1308,6 +1484,11 @@ impl<'query> ActionGraphBuilder<'query> {
         &mut self,
         spec: &ToolchainSpec,
     ) -> miette::Result<Option<NodeIndex>> {
+        let app_context = Arc::clone(
+            self.source_runtime_registry
+                .get(&self.app_context.source_id)?,
+        );
+
         // Explicitly disabled
         if !self.options.setup_environment.is_enabled(&spec.id) || spec.is_system() {
             return Ok(None);
@@ -1315,9 +1496,9 @@ impl<'query> ActionGraphBuilder<'query> {
 
         // Only insert actions if the dependencies root is the workspace root
         if self
-            .locate_dependencies_root(spec, None)
+            .locate_dependencies_root(&app_context, spec, None)
             .await?
-            .is_none_or(|deps_workspace| deps_workspace.root != self.app_context.workspace_root)
+            .is_none_or(|deps_workspace| deps_workspace.root != app_context.workspace_root)
         {
             return Ok(None);
         }
@@ -1333,10 +1514,24 @@ impl<'query> ActionGraphBuilder<'query> {
 
     #[instrument(skip(self))]
     pub async fn setup_proto(&mut self) -> miette::Result<Option<NodeIndex>> {
+        let source_id = self.app_context.source_id.clone();
+        self.setup_proto_for(&source_id).await
+    }
+
+    async fn setup_proto_for(
+        &mut self,
+        source_id: &moon_common::SourceRootId,
+    ) -> miette::Result<Option<NodeIndex>> {
+        let app_context = Arc::clone(self.source_runtime_registry.get(source_id)?);
         let index = insert_node_or_exit!(
             self,
-            ActionNode::setup_proto(self.app_context.toolchains_config.proto.version.clone())
+            ActionNode::setup_proto(
+                source_id.clone(),
+                app_context.toolchains_config.proto.version.clone(),
+            )
         );
+
+        self.order_shared_setup(index, &app_context)?;
 
         Ok(Some(index))
     }
@@ -1356,6 +1551,12 @@ impl<'query> ActionGraphBuilder<'query> {
         project: Option<&Project>,
         mut cycle: FxHashSet<&Id>,
     ) -> miette::Result<Option<NodeIndex>> {
+        let source_id = project
+            .map(|project| &project.source_id)
+            .unwrap_or(&self.app_context.source_id)
+            .clone();
+        let app_context = Arc::clone(self.source_runtime_registry.get(&source_id)?);
+
         // Explicitly disabled
         if !self.options.setup_toolchains.is_enabled(&spec.id)
             || spec.is_system()
@@ -1364,7 +1565,7 @@ impl<'query> ActionGraphBuilder<'query> {
             return Ok(None);
         }
 
-        let toolchain_registry = &self.app_context.toolchain_registry;
+        let toolchain_registry = &app_context.toolchain_registry;
         let toolchain = toolchain_registry.load(&spec.id).await?;
         let mut edges = vec![];
 
@@ -1393,7 +1594,14 @@ impl<'query> ActionGraphBuilder<'query> {
                         continue;
                     }
 
-                    if let Some(require_spec) = self.get_spec(&require_id, project) {
+                    let require_spec = match project {
+                        Some(project) => {
+                            self.get_project_spec_for(&app_context, &require_id, project)
+                        }
+                        None => self.get_workspace_spec_for(&app_context, &require_id),
+                    };
+
+                    if let Some(require_spec) = require_spec {
                         edges.push(
                             Box::pin(self.internal_setup_toolchain(
                                 &require_spec,
@@ -1418,20 +1626,28 @@ impl<'query> ActionGraphBuilder<'query> {
             return Ok(None);
         }
 
-        edges.push(self.sync_workspace().await?);
+        edges.push(self.sync_workspace_for(&source_id).await?);
 
-        if spec.req.is_some() || self.app_context.toolchains_config.requires_proto() {
-            edges.push(self.setup_proto().await?);
+        if spec.req.is_some() || app_context.toolchains_config.requires_proto() {
+            edges.push(self.setup_proto_for(&source_id).await?);
         }
 
-        let index = insert_node_if_missing!(
-            self,
-            ActionNode::setup_toolchain(SetupToolchainNode {
-                toolchain: spec.to_owned(),
-            })
-        );
+        let node = ActionNode::setup_toolchain(SetupToolchainNode {
+            source_id: project
+                .map(|project| project.source_id.clone())
+                .unwrap_or_else(|| app_context.source_id.clone()),
+            toolchain: spec.to_owned(),
+        });
+        let (index, inserted) = match self.get_index_from_node(&node) {
+            Some(index) => (index, false),
+            None => (self.insert_node(node), true),
+        };
 
         self.link_optional_requirements(index, edges)?;
+
+        if inserted {
+            self.order_shared_setup(index, &app_context)?;
+        }
 
         Ok(Some(index))
     }
@@ -1449,12 +1665,16 @@ impl<'query> ActionGraphBuilder<'query> {
         &mut self,
         project: &Project,
         reqs: &RunRequirements,
-        mut cycle: FxHashSet<&Id>,
+        mut cycle: FxHashSet<ProjectKey>,
     ) -> miette::Result<Option<NodeIndex>> {
+        let project_key = project.key();
+
         // Explicitly disabled
-        if !self.options.sync_projects.is_enabled(&project.id) || cycle.contains(&project.id) {
+        if !self.options.sync_projects.is_enabled(&project.id) || cycle.contains(&project_key) {
             return Ok(None);
         }
+
+        self.source_runtime_registry.get(&project.source_id)?;
 
         // Return early if not affected
         if !self.is_project_affected(project, reqs)? {
@@ -1464,27 +1684,31 @@ impl<'query> ActionGraphBuilder<'query> {
         // Insert the node and edges
         let mut edges = vec![];
 
-        cycle.insert(&project.id);
+        cycle.insert(project_key.clone());
 
-        if let Some(sync_workspace_index) = self.sync_workspace().await? {
+        if let Some(sync_workspace_index) = self.sync_workspace_for(&project.source_id).await? {
             edges.push(sync_workspace_index);
         }
 
         let index = insert_node_or_exit!(
             self,
-            ActionNode::sync_project(SyncProjectNode {
-                project_id: project.id.clone(),
-            })
+            ActionNode::sync_project(SyncProjectNode { project_key })
         );
 
         // We should also depend on other projects
         if self.options.sync_project_dependencies {
-            for dependency_key in self.workspace_graph.projects.dependencies_of(project) {
-                if cycle.contains(dependency_key.project_id()) {
+            for dependency_key in self
+                .aggregate_workspace_graph
+                .projects
+                .dependencies_of(project)
+            {
+                if cycle.contains(&dependency_key) {
                     continue;
                 }
 
-                let dep_project = self.workspace_graph.projects.get_by_key(&dependency_key)?;
+                let dep_project = self
+                    .aggregate_workspace_graph
+                    .get_project_by_key(&dependency_key)?;
 
                 if let Some(dep_project_index) =
                     Box::pin(self.internal_sync_project(&dep_project, reqs, cycle.clone())).await?
@@ -1504,11 +1728,21 @@ impl<'query> ActionGraphBuilder<'query> {
 
     #[instrument(skip(self))]
     pub async fn sync_workspace(&mut self) -> miette::Result<Option<NodeIndex>> {
+        let source_id = self.app_context.source_id.clone();
+        self.sync_workspace_for(&source_id).await
+    }
+
+    async fn sync_workspace_for(
+        &mut self,
+        source_id: &moon_common::SourceRootId,
+    ) -> miette::Result<Option<NodeIndex>> {
         if !self.options.sync_workspace {
             return Ok(None);
         }
 
-        let index = insert_node_or_exit!(self, ActionNode::sync_workspace());
+        self.source_runtime_registry.get(source_id)?;
+
+        let index = insert_node_or_exit!(self, ActionNode::sync_workspace(source_id.clone()));
 
         Ok(Some(index))
     }
@@ -1517,6 +1751,37 @@ impl<'query> ActionGraphBuilder<'query> {
 
     fn get_index_from_node(&self, node: &ActionNode) -> Option<NodeIndex> {
         self.nodes.get(node).cloned()
+    }
+
+    fn order_shared_setup(
+        &mut self,
+        index: NodeIndex,
+        app_context: &AppContext,
+    ) -> miette::Result<()> {
+        let store = app_context.proto_env.store.dir.clone();
+
+        if let Some((previous_source, previous)) = self
+            .setup_tails
+            .insert(store, (app_context.source_id.clone(), index))
+            && previous_source != app_context.source_id
+        {
+            self.link_requirements(index, vec![previous])?;
+        }
+
+        Ok(())
+    }
+
+    fn resolved_dependencies_for(
+        &self,
+        task: &Task,
+    ) -> Vec<moon_workspace_graph::tasks::ResolvedTaskDependency> {
+        let mut resolved = self
+            .aggregate_workspace_graph
+            .tasks
+            .resolved_dependencies_of(&task.key())
+            .to_vec();
+        resolved.sort_by_key(|dependency| dependency.declaration_ordinal);
+        resolved
     }
 
     fn link_first_requirement(
@@ -1537,6 +1802,29 @@ impl<'query> ActionGraphBuilder<'query> {
         edges: Vec<Option<NodeIndex>>,
     ) -> miette::Result<()> {
         self.link_requirements(index, edges.into_iter().flatten().collect())
+    }
+
+    fn link_task_requirements(
+        &mut self,
+        index: NodeIndex,
+        edges: Vec<(Option<NodeIndex>, TaskDependencyType)>,
+    ) -> miette::Result<()> {
+        for (edge, dependency_type) in edges {
+            let Some(edge) = edge else {
+                continue;
+            };
+
+            if self.graph.find_edge(index, edge).is_none() {
+                self.graph
+                    .add_edge(index, edge, dependency_type)
+                    .map_err(|_| ActionGraphError::WouldCycle {
+                        source_action: self.graph.node_weight(index).unwrap().label(),
+                        target_action: self.graph.node_weight(edge).unwrap().label(),
+                    })?;
+            }
+        }
+
+        Ok(())
     }
 
     fn link_requirements(&mut self, index: NodeIndex, edges: Vec<NodeIndex>) -> miette::Result<()> {
@@ -1663,6 +1951,20 @@ impl<'query> ActionGraphBuilder<'query> {
         project: &Project,
         reqs: &RunRequirements,
     ) -> miette::Result<bool> {
+        if let Some(affected) = &self.aggregate_affected
+            && !reqs.skip_affected
+        {
+            let key = project.key();
+
+            return Ok(if reqs.include_relations {
+                affected.build_ref().is_project_affected(&key)
+            } else {
+                affected
+                    .build_ref()
+                    .is_project_affected_ignoring_relations(&key)
+            });
+        }
+
         if let Some(affected) = &mut self.affected
             && !reqs.skip_affected
         {
@@ -1692,6 +1994,20 @@ impl<'query> ActionGraphBuilder<'query> {
     }
 
     fn is_task_affected(&mut self, task: &Task, reqs: &RunRequirements) -> miette::Result<bool> {
+        if let Some(affected) = &self.aggregate_affected
+            && !reqs.skip_affected
+        {
+            let key = task.key();
+
+            return Ok(if reqs.include_relations {
+                affected.build_ref().is_task_affected(&key)
+            } else {
+                affected
+                    .build_ref()
+                    .is_task_affected_ignoring_relations(&key)
+            });
+        }
+
         if let Some(affected) = &mut self.affected
             && !reqs.skip_affected
         {
@@ -1740,9 +2056,16 @@ impl ActionGraphBuilder<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moon_app_context::SourceRuntime;
+    use moon_common::{SourceRegistry, SourceRootId};
+    use moon_config::{DependencyScope, ProjectDependencyConfig, TaskDependencyCacheStrategy};
     use moon_test_utils::WorkspaceMocker;
+    use moon_workspace_graph::GraphExpanderContext;
+    use moon_workspace_graph::projects::{ProjectGraph, ProjectNode};
+    use moon_workspace_graph::tasks::{TaskGraph, TaskNode};
     use starbase_sandbox::create_sandbox;
     use std::fs;
+    use std::path::PathBuf;
 
     fn create_toolchain_spec(id: &str) -> ToolchainSpec {
         ToolchainSpec::new(
@@ -1767,93 +2090,432 @@ mod tests {
         .unwrap()
     }
 
-    #[tokio::test]
-    async fn rejects_aggregate_workspace_graphs() {
-        let sandbox = create_sandbox("projects");
-        let mocker = WorkspaceMocker::new(sandbox.path()).with_default_projects();
-        let local = Arc::new(mocker.mock_workspace_graph().await);
+    fn graph_context(source_id: SourceRootId, root: PathBuf) -> GraphExpanderContext {
+        GraphExpanderContext {
+            sources: Arc::new(SourceRegistry::new(source_id, root.clone())),
+            working_dir: root.clone(),
+            workspace_root: root,
+            ..Default::default()
+        }
+    }
 
-        assert!(
-            ActionGraphBuilder::new(
-                Arc::new(mocker.mock_app_context()),
-                Arc::clone(&local),
-                Default::default(),
-            )
-            .is_ok()
-        );
+    fn local_project_graph(context: GraphExpanderContext, project: Project) -> Arc<ProjectGraph> {
+        let mut projects = ProjectGraph::new(context);
+        let mut graph = DiGraph::new();
+        let index = graph.add_node(NodeIndex::new(0));
+        let key = project.key();
+        projects.indexes.insert(index, key.clone());
+        projects.nodes.insert(key, ProjectNode { index, project });
+        projects.set_graph(graph).unwrap();
+        Arc::new(projects)
+    }
 
-        let aggregate = Arc::new(
-            WorkspaceGraph::new_aggregate(
-                Arc::clone(&local.projects),
-                Arc::clone(&local.sources),
-                [Arc::clone(&local.tasks)],
-            )
-            .unwrap(),
-        );
+    fn local_task_graph(
+        context: GraphExpanderContext,
+        projects: Arc<ProjectGraph>,
+        tasks: Vec<Task>,
+        edges: &[(usize, usize, TaskDependencyType)],
+    ) -> Arc<TaskGraph> {
+        let mut task_graph = TaskGraph::new(context, projects);
 
-        assert!(
-            ActionGraphBuilder::new(
-                Arc::new(mocker.mock_app_context()),
-                aggregate,
-                Default::default(),
-            )
-            .is_err()
-        );
+        for task in tasks {
+            let index = task_graph
+                .graph
+                .add_node(NodeIndex::new(task_graph.graph.node_count()));
+            let key = task.key();
+            task_graph.indexes.insert(index, key.clone());
+            task_graph.nodes.insert(key, TaskNode { index, task });
+        }
+
+        for (owner, dependency, dependency_type) in edges {
+            task_graph
+                .graph
+                .add_edge(
+                    NodeIndex::new(*owner),
+                    NodeIndex::new(*dependency),
+                    *dependency_type,
+                )
+                .unwrap();
+        }
+
+        task_graph.resolve_source_local_dependencies().unwrap();
+        Arc::new(task_graph)
     }
 
     #[tokio::test]
-    async fn rejects_tasks_with_cross_source_dependencies() {
+    async fn serializes_shared_setup_across_sources() {
         let sandbox = create_sandbox("projects");
         let mut builder = create_builder(sandbox.path()).await;
-        let project = builder.workspace_graph.projects.get_all().unwrap()[0].clone();
-        let task = Task {
-            id: Id::raw("build"),
-            source_id: project.source_id.clone(),
-            target: Target::new(&project.id, "build").unwrap(),
-            ..Task::default()
+        let primary_id = SourceRootId::primary();
+        let child_id = SourceRootId::new("child").unwrap();
+        let primary = Arc::clone(&builder.app_context);
+        let mut child = (*primary).clone();
+        child.source_id = child_id.clone();
+        Arc::make_mut(&mut child.toolchains_config).proto.version =
+            moon_toolchain::VersionSpec::parse("9.8.7").unwrap();
+        let child = Arc::new(child);
+        builder.source_runtime_registry = Arc::new(
+            SourceRuntimeRegistry::new(
+                Arc::clone(&primary),
+                [(
+                    child_id.clone(),
+                    SourceRuntime::Available(Arc::clone(&child)),
+                )],
+            )
+            .unwrap(),
+        );
+        let spec = create_toolchain_spec("tc-tier3");
+        let child_project = Project {
+            source_id: child_id.clone(),
+            ..Project::default()
         };
-        let mut dependency = task.clone();
-        dependency.source_id = moon_common::SourceRootId::new("child").unwrap();
 
-        let mut aggregate_tasks = TaskGraph::new(
-            builder.workspace_graph.tasks.context.clone(),
-            Arc::clone(&builder.workspace_graph.projects),
-        );
-        let task_index = aggregate_tasks.graph.add_node(NodeIndex::new(0));
-        let dependency_index = aggregate_tasks.graph.add_node(NodeIndex::new(1));
-        aggregate_tasks.indexes.insert(task_index, task.key());
-        aggregate_tasks
-            .indexes
-            .insert(dependency_index, dependency.key());
-        aggregate_tasks.nodes.insert(
-            task.key(),
-            moon_workspace_graph::tasks::TaskNode {
-                index: task_index,
-                task: task.clone(),
-            },
-        );
-        aggregate_tasks.nodes.insert(
-            dependency.key(),
-            moon_workspace_graph::tasks::TaskNode {
-                index: dependency_index,
-                task: dependency.clone(),
-            },
-        );
-        aggregate_tasks
-            .graph
-            .add_edge(task_index, dependency_index, TaskDependencyType::Required)
+        builder.setup_toolchain(&spec, None).await.unwrap();
+        builder
+            .setup_toolchain(&spec, Some(&child_project))
+            .await
             .unwrap();
 
-        builder.aggregate_task_graph = Some(Arc::new(aggregate_tasks));
-        let error = builder
-            .run_task(&task, &RunRequirements::default())
+        let (_, graph) = builder.build();
+        let primary_toolchain = find_node_index(
+            &graph,
+            |node| matches!(node, ActionNode::SetupToolchain(node) if node.source_id == primary_id),
+        );
+        let child_proto = find_node_index(
+            &graph,
+            |node| matches!(node, ActionNode::SetupProto(node) if node.source_id == child_id),
+        );
+        assert!(
+            graph
+                .get_inner_graph()
+                .find_edge(child_proto, primary_toolchain)
+                .is_some()
+        );
+
+        let ordered = graph
+            .sort_topological()
+            .unwrap()
+            .into_iter()
+            .filter_map(|index| match graph.get_node_from_index(&index).unwrap() {
+                ActionNode::SetupProto(node) => {
+                    Some(("proto", node.source_id.clone(), node.version.to_string()))
+                }
+                ActionNode::SetupToolchain(node) => Some((
+                    "toolchain",
+                    node.source_id.clone(),
+                    node.toolchain.req.as_ref().unwrap().to_string(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ordered,
+            [
+                (
+                    "proto",
+                    primary_id.clone(),
+                    primary.toolchains_config.proto.version.to_string(),
+                ),
+                ("toolchain", primary_id, "1.2.3".into()),
+                ("proto", child_id.clone(), "9.8.7".into()),
+                ("toolchain", child_id, "1.2.3".into()),
+            ]
+        );
+        assert_eq!(primary.proto_env.store.dir, child.proto_env.store.dir);
+    }
+
+    #[tokio::test]
+    async fn builds_cross_source_dependencies_from_canonical_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "moon-action-graph-cross-source-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let child_root = root.join("child-source");
+        let primary_id = SourceRootId::primary();
+        let child_id = SourceRootId::new("child").unwrap();
+        let primary_context = graph_context(primary_id.clone(), root.clone());
+        let child_context = graph_context(child_id.clone(), child_root.clone());
+        let mut primary_project = Project {
+            id: Id::raw("app"),
+            source_id: primary_id.clone(),
+            ..Project::default()
+        };
+        primary_project
+            .cross_source_dependencies
+            .push(ProjectDependencyConfig {
+                id: Id::raw("app"),
+                scope: DependencyScope::Build,
+                source_root: Some(child_id.clone()),
+                ..Default::default()
+            });
+        let child_project = Project {
+            id: Id::raw("app"),
+            source_id: child_id.clone(),
+            ..Project::default()
+        };
+        let primary_projects = local_project_graph(primary_context.clone(), primary_project);
+        let child_projects = local_project_graph(child_context.clone(), child_project);
+        let required_local = TaskDependencyConfig {
+            args: vec!["--local".into()],
+            target: Target::new("app", "build").unwrap(),
+            cache_strategy: Some(TaskDependencyCacheStrategy::Hash),
+            ..Default::default()
+        };
+        let required_cross = TaskDependencyConfig {
+            args: vec!["--cross".into()],
+            env: EnvMap::from_iter([("CROSS".into(), Some("1".into()))]),
+            target: Target::parse("^:build").unwrap(),
+            cache_strategy: Some(TaskDependencyCacheStrategy::Outputs),
+            ..Default::default()
+        };
+        let optional_cross = TaskDependencyConfig {
+            target: Target::parse("^:lint").unwrap(),
+            optional: Some(true),
+            cache_strategy: Some(TaskDependencyCacheStrategy::Ignored),
+            ..Default::default()
+        };
+        let mut root_task = Task {
+            id: Id::raw("root"),
+            source_id: primary_id.clone(),
+            target: Target::new("app", "root").unwrap(),
+            deps: vec![required_local.clone()],
+            configured_deps: vec![required_cross, optional_cross],
+            ..Task::default()
+        };
+        root_task.options.run_deps_in_parallel = false;
+        let primary_build = Task {
+            id: Id::raw("build"),
+            source_id: primary_id.clone(),
+            target: Target::new("app", "build").unwrap(),
+            ..Task::default()
+        };
+        let mut child_build = Task {
+            id: Id::raw("build"),
+            source_id: child_id.clone(),
+            target: Target::new("app", "build").unwrap(),
+            ..Task::default()
+        };
+        child_build
+            .input_files
+            .insert("changed.txt".into(), moon_task::TaskFileInput::default());
+        let child_build_for_run = child_build.clone();
+        let child_lint = Task {
+            id: Id::raw("lint"),
+            source_id: child_id.clone(),
+            target: Target::new("app", "lint").unwrap(),
+            ..Task::default()
+        };
+        let primary_tasks = local_task_graph(
+            primary_context,
+            Arc::clone(&primary_projects),
+            vec![root_task.clone(), primary_build],
+            &[(0, 1, TaskDependencyType::Required)],
+        );
+        let child_tasks = local_task_graph(
+            child_context,
+            Arc::clone(&child_projects),
+            vec![child_build, child_lint],
+            &[],
+        );
+        let mut sources = SourceRegistry::new(primary_id.clone(), root.clone());
+        sources.register(child_id.clone(), child_root).unwrap();
+        let sources = Arc::new(sources);
+        let aggregate_projects = Arc::new(
+            ProjectGraph::compose(
+                Arc::clone(&sources),
+                &FxHashMap::default(),
+                [Arc::clone(&primary_projects), child_projects],
+            )
+            .unwrap(),
+        );
+        let aggregate = Arc::new(
+            WorkspaceGraph::new_aggregate(
+                aggregate_projects,
+                Arc::clone(&sources),
+                [Arc::clone(&primary_tasks), child_tasks],
+            )
+            .unwrap(),
+        );
+        let resolved = aggregate.tasks.resolved_dependencies_of(&root_task.key());
+        assert!(resolved.iter().any(|dependency| {
+            dependency.task_key.project_key().source_id() == &child_id
+                && dependency.cache_strategy == TaskDependencyCacheStrategy::Outputs
+        }));
+        assert!(resolved.iter().any(|dependency| {
+            dependency.task_key.project_key().source_id() == &child_id
+                && dependency.cache_strategy == TaskDependencyCacheStrategy::Ignored
+        }));
+        let local = Arc::new(WorkspaceGraph::new_with_sources(
+            primary_projects,
+            primary_tasks,
+            Arc::new(SourceRegistry::single(root.clone())),
+        ));
+        let mocker = WorkspaceMocker::new(&root);
+        let primary_app = Arc::new(mocker.mock_app_context());
+        let mut child_app = mocker.mock_app_context();
+        child_app.source_id = child_id.clone();
+        child_app.workspace_root = root.join("child-source");
+        let runtimes = Arc::new(
+            SourceRuntimeRegistry::new(
+                Arc::clone(&primary_app),
+                [(
+                    child_id.clone(),
+                    SourceRuntime::Available(Arc::new(child_app)),
+                )],
+            )
+            .unwrap(),
+        );
+        let unavailable_runtimes = Arc::new(
+            SourceRuntimeRegistry::new(
+                Arc::clone(&primary_app),
+                [(
+                    child_id.clone(),
+                    SourceRuntime::Unavailable("offline".into()),
+                )],
+            )
+            .unwrap(),
+        );
+        let mut unavailable_builder = ActionGraphBuilder::new(
+            Arc::clone(&primary_app),
+            Arc::clone(&local),
+            ActionGraphBuilderOptions::new(false),
+        )
+        .unwrap()
+        .with_aggregate_workspace_graph(Arc::clone(&aggregate), unavailable_runtimes);
+        let error = unavailable_builder
+            .run_task_by_target(&root_task.target, &RunRequirements::default())
             .await
             .unwrap_err()
             .to_string();
+        assert!(error.contains("child") && error.contains("offline"));
 
-        assert!(error.contains(&task.key().to_string()));
-        assert!(error.contains(&dependency.key().to_string()));
-        assert!(error.contains("another source root"));
+        let mut affected_builder = ActionGraphBuilder::new(
+            Arc::clone(&primary_app),
+            Arc::clone(&local),
+            ActionGraphBuilderOptions::new(false),
+        )
+        .unwrap()
+        .with_aggregate_workspace_graph(Arc::clone(&aggregate), Arc::clone(&runtimes));
+        let mut child_observation = ChangedFilesObservation {
+            completeness: ImpactCompleteness::Exact,
+            ..Default::default()
+        };
+        child_observation
+            .files
+            .files
+            .insert(SourcePathBuf::new(child_id.clone(), "changed.txt"), vec![]);
+        affected_builder
+            .set_source_changed_files(BTreeMap::from([
+                (primary_id.clone(), ChangedFilesObservation::default()),
+                (child_id.clone(), child_observation),
+            ]))
+            .unwrap();
+        affected_builder
+            .track_affected(UpstreamScope::None, DownstreamScope::Direct, false)
+            .await
+            .unwrap();
+        affected_builder
+            .run_task_by_target(
+                &root_task.target,
+                &RunRequirements {
+                    include_relations: true,
+                    ..RunRequirements::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (affected_context, affected_graph) = affected_builder.build();
+        assert!(
+            affected_context
+                .aggregate_affected
+                .as_ref()
+                .unwrap()
+                .is_task_affected(&root_task.key())
+        );
+        find_node_index(
+            &affected_graph,
+            |node| matches!(node, ActionNode::RunTask(inner) if inner.key == root_task.key()),
+        );
+        find_node_index(
+            &affected_graph,
+            |node| matches!(node, ActionNode::RunTask(inner) if inner.key == child_build_for_run.key()),
+        );
+
+        let mut dependent_builder = ActionGraphBuilder::new(
+            Arc::clone(&primary_app),
+            Arc::clone(&local),
+            ActionGraphBuilderOptions::new(false),
+        )
+        .unwrap()
+        .with_aggregate_workspace_graph(Arc::clone(&aggregate), Arc::clone(&runtimes));
+        dependent_builder
+            .run_task(
+                &child_build_for_run,
+                &RunRequirements {
+                    dependencies: UpstreamScope::None,
+                    dependents: DownstreamScope::Direct,
+                    ..RunRequirements::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (_, dependent_graph) = dependent_builder.build();
+        find_node_index(
+            &dependent_graph,
+            |node| matches!(node, ActionNode::RunTask(inner) if inner.target.as_str() == "app:root"),
+        );
+
+        let mut builder =
+            ActionGraphBuilder::new(primary_app, local, ActionGraphBuilderOptions::new(false))
+                .unwrap()
+                .with_aggregate_workspace_graph(aggregate, runtimes);
+
+        builder
+            .run_task_by_target(&root_task.target, &RunRequirements::default())
+            .await
+            .unwrap();
+
+        let (_, graph) = builder.build();
+        let inner = graph.get_inner_graph();
+        let nodes = graph.get_inner_nodes();
+        let mut builds = inner
+            .graph()
+            .node_indices()
+            .filter(|index| {
+                matches!(nodes[index], ActionNode::RunTask(ref node) if node.target.as_str() == "app:build")
+            })
+            .collect::<Vec<_>>();
+        builds.sort_by_key(|index| index.index());
+        assert_eq!(builds.len(), 2);
+        assert_ne!(nodes[&builds[0]].source_id(), nodes[&builds[1]].source_id());
+
+        let root_index = find_node_index(
+            &graph,
+            |node| matches!(node, ActionNode::RunTask(inner) if inner.target.as_str() == "app:root"),
+        );
+        let lint_index = find_node_index(
+            &graph,
+            |node| matches!(node, ActionNode::RunTask(inner) if inner.target.as_str() == "app:lint"),
+        );
+        assert_eq!(
+            inner.edge_weight(inner.find_edge(root_index, lint_index).unwrap()),
+            Some(&TaskDependencyType::Optional)
+        );
+        assert!(builds.iter().all(|index| {
+            inner
+                .find_edge(root_index, *index)
+                .and_then(|edge| inner.edge_weight(edge))
+                == Some(&TaskDependencyType::Required)
+        }));
+        assert!(
+            inner.find_edge(builds[1], builds[0]).is_some()
+                || inner.find_edge(builds[0], builds[1]).is_some()
+        );
+        assert!(nodes.values().any(|node| {
+            matches!(node, ActionNode::RunTask(inner) if inner.args == ["--cross"] && inner.env.get("CROSS") == Some(&Some("1".into())))
+        }));
     }
 
     fn find_node_index(
@@ -1939,8 +2601,10 @@ mod tests {
             Default::default(),
         )
         .unwrap();
-        let id = Id::raw("root");
-        let cycle = FxHashSet::from_iter([&id]);
+        let cycle =
+            FxHashSet::from_iter([
+                ProjectKey::new(SourceRootId::primary(), Id::raw("root")).unwrap()
+            ]);
 
         builder
             .internal_sync_project(
@@ -1965,14 +2629,14 @@ mod tests {
             matches!(
                 node,
                 ActionNode::SyncProject(inner)
-                    if inner.project_id.as_str() == "qux"
+                    if inner.project_key.project_id().as_str() == "qux"
             )
         });
         let baz_index = find_node_index(&graph, |node| {
             matches!(
                 node,
                 ActionNode::SyncProject(inner)
-                    if inner.project_id.as_str() == "baz"
+                    if inner.project_key.project_id().as_str() == "baz"
             )
         });
 

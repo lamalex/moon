@@ -32,6 +32,14 @@ pub async fn setup_environment(
     workspace_graph: Arc<WorkspaceGraph>,
     node: &SetupEnvironmentNode,
 ) -> miette::Result<ActionStatus> {
+    if node.source_id != app_context.source_id {
+        return Err(miette::miette!(
+            "Setup environment action for source {} cannot run in source {}.",
+            node.source_id,
+            app_context.source_id
+        ));
+    }
+
     // Skip this action if requested by the user
     if let Some(value) =
         should_skip_action_matching("MOON_SKIP_SETUP_ENVIRONMENT", &node.toolchain_id)
@@ -73,9 +81,9 @@ pub async fn setup_environment(
         toolchain_config: toolchain_registry.create_config(&toolchain.id),
     };
 
-    let project = match &node.project_id {
-        Some(project_id) => {
-            let project = workspace_graph.get_project(project_id)?;
+    let project = match &node.project_key {
+        Some(project_key) => {
+            let project = workspace_graph.get_project_by_key(project_key)?;
 
             input.project = Some(project.to_fragment());
             input.toolchain_config =

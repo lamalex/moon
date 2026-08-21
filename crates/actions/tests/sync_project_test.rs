@@ -3,6 +3,7 @@ use moon_action_context::ActionContext;
 use moon_actions::actions::sync_project;
 use moon_common::{Id, is_ci};
 use moon_env_var::GlobalEnvBag;
+use moon_target::ProjectKey;
 use moon_test_utils::WorkspaceMocker;
 use starbase_sandbox::{Sandbox, create_sandbox};
 
@@ -11,6 +12,10 @@ fn create_workspace() -> (Sandbox, WorkspaceMocker) {
     let mocker = WorkspaceMocker::new(sandbox.path()).with_default_projects();
 
     (sandbox, mocker)
+}
+
+fn project_key(id: &str) -> ProjectKey {
+    ProjectKey::primary(Id::raw(id)).unwrap()
 }
 
 mod sync_project {
@@ -31,7 +36,7 @@ mod sync_project {
             ws.mock_app_context().into(),
             ws.mock_workspace_graph().await.into(),
             &SyncProjectNode {
-                project_id: Id::raw("a"),
+                project_key: project_key("a"),
             },
         )
         .await
@@ -57,7 +62,7 @@ mod sync_project {
             ws.mock_app_context().into(),
             ws.mock_workspace_graph().await.into(),
             &SyncProjectNode {
-                project_id: Id::raw("a"),
+                project_key: project_key("a"),
             },
         )
         .await
@@ -83,7 +88,7 @@ mod sync_project {
             ws.mock_app_context().into(),
             ws.mock_workspace_graph().await.into(),
             &SyncProjectNode {
-                project_id: Id::raw("a"),
+                project_key: project_key("a"),
             },
         )
         .await
@@ -109,7 +114,7 @@ mod sync_project {
             ws.mock_app_context().into(),
             ws.mock_workspace_graph().await.into(),
             &SyncProjectNode {
-                project_id: Id::raw("a"),
+                project_key: project_key("a"),
             },
         )
         .await
@@ -137,7 +142,7 @@ mod sync_project {
             ws.mock_app_context().into(),
             ws.mock_workspace_graph().await.into(),
             &SyncProjectNode {
-                project_id: Id::raw("a"),
+                project_key: project_key("a"),
             },
         )
         .await
@@ -167,7 +172,7 @@ mod sync_project {
                 ws.mock_app_context().into(),
                 ws.mock_workspace_graph().await.into(),
                 &SyncProjectNode {
-                    project_id: Id::raw("b"),
+                    project_key: project_key("b"),
                 },
             )
             .await
@@ -231,7 +236,7 @@ mod sync_project {
                 ws.mock_app_context().into(),
                 ws.mock_workspace_graph().await.into(),
                 &SyncProjectNode {
-                    project_id: Id::raw("a"),
+                    project_key: project_key("a"),
                 },
             )
             .await
@@ -261,7 +266,7 @@ mod sync_project {
                 ws.mock_app_context().into(),
                 ws.mock_workspace_graph().await.into(),
                 &SyncProjectNode {
-                    project_id: Id::raw("c"),
+                    project_key: project_key("c"),
                 },
             )
             .await
@@ -291,7 +296,7 @@ mod sync_project {
                 ws.mock_app_context().into(),
                 ws.mock_workspace_graph().await.into(),
                 &SyncProjectNode {
-                    project_id: Id::raw("b"),
+                    project_key: project_key("b"),
                 },
             )
             .await

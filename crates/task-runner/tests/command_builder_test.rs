@@ -5,13 +5,14 @@ mod utils;
 use moon_action::ActionNode;
 use moon_action_context::ActionContext;
 use moon_affected::Affected;
-use moon_common::{Id, is_ci};
+use moon_common::{Id, SourceRootId, is_ci};
 use moon_config::*;
 use moon_env_var::GlobalEnvBag;
 use moon_process::{Command, CommandExecutable, Env};
-use moon_task::{Target, TargetLocator, TaskKey, TaskOptionAffectedFiles};
+use moon_task::{ProjectKey, Target, TargetLocator, TaskKey, TaskOptionAffectedFiles};
 use std::env;
 use std::ffi::OsString;
+use std::sync::Arc;
 use utils::*;
 
 fn get_env<'a>(command: &'a Command, key: &str) -> Option<&'a str> {
@@ -23,6 +24,14 @@ fn get_env<'a>(command: &'a Command, key: &str) -> Option<&'a str> {
 
 fn key(project: &str, task: &str) -> TaskKey {
     TaskKey::primary(Id::raw(project), Id::raw(task)).unwrap()
+}
+
+fn source_key(source: &str, project: &str, task: &str) -> TaskKey {
+    TaskKey::new(
+        ProjectKey::new(SourceRootId::new(source).unwrap(), Id::raw(project)).unwrap(),
+        Id::raw(task),
+    )
+    .unwrap()
 }
 
 fn get_args(command: &Command) -> Vec<&str> {
@@ -158,6 +167,7 @@ mod command_builder {
 
             let mut context = ActionContext::default();
             context.passthrough_args.push("--passthrough".into());
+            context.primary_targets.insert(key("project", "base"));
             context
                 .initial_targets
                 .insert(TargetLocator::Qualified(Target::parse(":base").unwrap()));
@@ -165,6 +175,26 @@ mod command_builder {
             let command = container.create_command(context).await;
 
             assert_eq!(get_args(&command), vec!["arg", "--opt", "--passthrough"]);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn unqualified_passthrough_args_do_not_leak_into_foreign_tasks() {
+            let container = TaskRunnerContainer::new("builder", "base").await;
+            let foreign_key = source_key("child", "project", "base");
+            let mut context = ActionContext::default();
+            context.passthrough_args.push("--passthrough".into());
+            context.primary_targets.insert(foreign_key);
+            context
+                .initial_targets
+                .insert(TargetLocator::Qualified(Target::parse(":base").unwrap()));
+
+            let command = container
+                .create_command_with_config(context, |task, _| {
+                    task.source_id = SourceRootId::new("child").unwrap();
+                })
+                .await;
+
+            assert_eq!(get_args(&command), vec!["arg", "--opt"]);
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -807,6 +837,34 @@ mod command_builder {
         }
 
         #[tokio::test(flavor = "multi_thread")]
+        async fn only_includes_changed_files_from_the_tasks_source() {
+            let container = TaskRunnerContainer::new("builder", "base").await;
+            let child_id = SourceRootId::new("child").unwrap();
+            let mut context = ActionContext::default();
+            context.aggregate_affected = Some(Default::default());
+            context.source_changed_files.insert(
+                SourceRootId::primary(),
+                ["project/primary.txt".into()].into_iter().collect(),
+            );
+            context.source_changed_files.insert(
+                child_id.clone(),
+                ["project/file.txt".into()].into_iter().collect(),
+            );
+
+            let command = container
+                .create_command_with_config(context, |task, _| {
+                    task.source_id = child_id.clone();
+                    task.options.affected_files = Some(TaskOptionAffectedFiles {
+                        pass: TaskOptionAffectedFilesPattern::Args,
+                        ..Default::default()
+                    });
+                })
+                .await;
+
+            assert_eq!(get_args(&command), vec!["arg", "--opt", "./file.txt"]);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
         async fn includes_changed_in_args_run_from_workspace_root() {
             let container = TaskRunnerContainer::new("builder", "base").await;
 
@@ -1186,10 +1244,42 @@ mod command_builder {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn inherits_proto_env_vars() {
-            let container = TaskRunnerContainer::new("toolchain", "base").await;
-            let command = container.create_command(ActionContext::default()).await;
+            let mut container = TaskRunnerContainer::new("toolchain", "base").await;
+            let first_version = "1.2.3";
+            Arc::make_mut(
+                &mut Arc::get_mut(&mut container.app_context)
+                    .unwrap()
+                    .toolchains_config,
+            )
+            .proto
+            .version = VersionSpec::parse(first_version).unwrap();
+            let first = container.create_command(ActionContext::default()).await;
 
-            assert_eq!(get_env(&command, "PROTO_AUTO_INSTALL").unwrap(), "false");
+            Arc::make_mut(
+                &mut Arc::get_mut(&mut container.app_context)
+                    .unwrap()
+                    .toolchains_config,
+            )
+            .proto
+            .version = VersionSpec::parse("9.8.7").unwrap();
+            Arc::get_mut(&mut container.app_context).unwrap().source_id =
+                SourceRootId::new("child").unwrap();
+            let child = container.create_command(ActionContext::default()).await;
+
+            assert_eq!(get_env(&first, "PROTO_AUTO_INSTALL").unwrap(), "false");
+            assert_eq!(get_env(&first, "PROTO_VERSION").unwrap(), first_version);
+            assert!(
+                get_env(&first, "PROTO_LOOKUP_DIR")
+                    .unwrap()
+                    .ends_with(first_version)
+            );
+            assert_eq!(get_env(&child, "PROTO_VERSION").unwrap(), "9.8.7");
+            assert!(
+                get_env(&child, "PROTO_LOOKUP_DIR")
+                    .unwrap()
+                    .ends_with("9.8.7")
+            );
+            assert_eq!(get_env(&child, "PROTO_VERSION_CHECK").unwrap(), "false");
         }
 
         // Note: These require a real proto tool to function correctly,

@@ -5,6 +5,7 @@ use moon_app_context::AppContext;
 use moon_cache::{Manifest, ManifestSource, ManifestUnpacker, StorageOptions};
 use moon_common::{color, path::WorkspaceRelativePath};
 use moon_daemon_client::{DaemonClient, DaemonTaskRouting};
+use moon_target::TaskInvocationKey;
 use moon_task::Task;
 use starbase_archive::Archiver;
 use starbase_utils::{fs, glob::GlobSet};
@@ -41,6 +42,7 @@ pub enum HydrateOutcome {
 pub struct OutputHydrater<'task> {
     app_context: &'task Arc<AppContext>,
     task: &'task Arc<Task>,
+    invocation_key: TaskInvocationKey,
     task_output_globset: GlobSet<'static>,
     daemon_client: Option<DaemonClient>,
 }
@@ -51,6 +53,23 @@ impl OutputHydrater<'_> {
         task: &'task Arc<Task>,
         daemon_client: Option<DaemonClient>,
     ) -> miette::Result<OutputHydrater<'task>> {
+        Self::new_for_invocation(app_context, task, task.key().into(), daemon_client)
+    }
+
+    pub fn new_for_invocation<'task>(
+        app_context: &'task Arc<AppContext>,
+        task: &'task Arc<Task>,
+        invocation_key: TaskInvocationKey,
+        daemon_client: Option<DaemonClient>,
+    ) -> miette::Result<OutputHydrater<'task>> {
+        if invocation_key.task_key() != &task.key() {
+            return Err(TaskRunnerError::InvocationMismatch {
+                invocation_key: invocation_key.task_key().clone(),
+                task_key: task.key(),
+            }
+            .into());
+        }
+
         if task.source_id != app_context.source_id {
             return Err(TaskRunnerError::SourceMismatch {
                 task_source: task.source_id.clone(),
@@ -62,9 +81,17 @@ impl OutputHydrater<'_> {
         Ok(OutputHydrater {
             task_output_globset: GlobSet::new_owned(task.output_globs.keys())?,
             task,
+            invocation_key,
             app_context,
             daemon_client,
         })
+    }
+
+    pub(crate) fn state_dir(&self) -> std::path::PathBuf {
+        self.app_context
+            .cache_engine
+            .state
+            .get_task_invocation_dir(&self.invocation_key)
     }
 
     #[instrument(skip(self, state))]

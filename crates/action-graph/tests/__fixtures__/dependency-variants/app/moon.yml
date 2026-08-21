@@ -1,0 +1,33 @@
+tasks:
+  base: {}
+  consumer:
+    deps:
+      - base
+      - target: base
+        args: [a, b, c]
+      - target: base
+        env:
+          TEST_VAR: value
+      - target: base
+        args: [x, y, z]
+        env:
+          TEST_VAR: value
+      - target: base
+        args: [a, b, c]
+
+  serial-consumer:
+    options:
+      runDepsInParallel: false
+    deps:
+      - base
+      - target: base
+        args: [a, b, c]
+      - target: base
+        env:
+          TEST_VAR: value
+      - target: base
+        args: [x, y, z]
+        env:
+          TEST_VAR: value
+      - target: base
+        args: [a, b, c]

@@ -9,11 +9,13 @@ use moon_action::{ActionNode, ActionStatus, Operation, OperationList, OperationM
 use moon_action_context::{ActionContext, TargetState};
 use moon_app_context::{AppContext, SourceRuntimeRegistry};
 use moon_cache::{CacheItem, StorageOptions};
+use moon_common::is_ci_env;
 use moon_console::TaskReportItem;
 use moon_daemon_client::DaemonClient;
 use moon_hash::{ContentHash, ContentHasher};
 use moon_process::ProcessError;
 use moon_project::Project;
+use moon_target::TaskInvocationKey;
 use moon_task::{Task, TaskCheck, TaskCheckFingerprint, TaskCheckType, TaskKey};
 use moon_task_graph::TaskGraph;
 use moon_task_hasher::*;
@@ -33,6 +35,7 @@ pub struct TaskRunner<'task> {
     app_context: &'task Arc<AppContext>,
     project: &'task Arc<Project>,
     pub task: &'task Arc<Task>,
+    invocation_key: TaskInvocationKey,
     source_runtime_registry: Option<Arc<SourceRuntimeRegistry>>,
     task_graph: Option<Arc<TaskGraph>>,
 
@@ -53,6 +56,24 @@ impl<'task> TaskRunner<'task> {
         task: &'task Arc<Task>,
         daemon_client: Option<DaemonClient>,
     ) -> miette::Result<Self> {
+        Self::new_for_invocation(app_context, project, task, task.key().into(), daemon_client)
+    }
+
+    pub fn new_for_invocation(
+        app_context: &'task Arc<AppContext>,
+        project: &'task Arc<Project>,
+        task: &'task Arc<Task>,
+        invocation_key: TaskInvocationKey,
+        daemon_client: Option<DaemonClient>,
+    ) -> miette::Result<Self> {
+        if invocation_key.task_key() != &task.key() {
+            return Err(TaskRunnerError::InvocationMismatch {
+                invocation_key: invocation_key.task_key().clone(),
+                task_key: task.key(),
+            }
+            .into());
+        }
+
         debug!(
             task_target = task.target.as_str(),
             "Creating a task runner for target"
@@ -61,7 +82,7 @@ impl<'task> TaskRunner<'task> {
         let mut cache = app_context
             .cache_engine
             .state
-            .load_task_state::<TaskRunCacheState>(&task.key())?;
+            .load_task_invocation_state::<TaskRunCacheState>(&invocation_key)?;
 
         if cache.data.task_key.is_none() {
             cache.data.task_key = Some(task.key());
@@ -70,14 +91,25 @@ impl<'task> TaskRunner<'task> {
         Ok(Self {
             state: TaskRunState::new(app_context, task),
             cache,
-            archiver: OutputArchiver::new(app_context, task, daemon_client.clone())?,
-            hydrater: OutputHydrater::new(app_context, task, daemon_client)?,
+            archiver: OutputArchiver::new_for_invocation(
+                app_context,
+                task,
+                invocation_key.clone(),
+                daemon_client.clone(),
+            )?,
+            hydrater: OutputHydrater::new_for_invocation(
+                app_context,
+                task,
+                invocation_key.clone(),
+                daemon_client,
+            )?,
             project,
             report: TaskReportItem {
                 output_style: task.options.output_style,
                 ..Default::default()
             },
             task,
+            invocation_key,
             source_runtime_registry: None,
             task_graph: None,
             app_context,
@@ -93,7 +125,28 @@ impl<'task> TaskRunner<'task> {
         task_graph: Arc<TaskGraph>,
         source_runtime_registry: Arc<SourceRuntimeRegistry>,
     ) -> miette::Result<Self> {
-        let mut runner = Self::new(app_context, project, task, daemon_client)?;
+        Self::new_with_hashing_context_for_invocation(
+            app_context,
+            project,
+            task,
+            task.key().into(),
+            daemon_client,
+            task_graph,
+            source_runtime_registry,
+        )
+    }
+
+    pub fn new_with_hashing_context_for_invocation(
+        app_context: &'task Arc<AppContext>,
+        project: &'task Arc<Project>,
+        task: &'task Arc<Task>,
+        invocation_key: TaskInvocationKey,
+        daemon_client: Option<DaemonClient>,
+        task_graph: Arc<TaskGraph>,
+        source_runtime_registry: Arc<SourceRuntimeRegistry>,
+    ) -> miette::Result<Self> {
+        let mut runner =
+            Self::new_for_invocation(app_context, project, task, invocation_key, daemon_client)?;
         runner.task_graph = Some(task_graph);
         runner.source_runtime_registry = Some(source_runtime_registry);
         Ok(runner)
@@ -155,6 +208,10 @@ impl<'task> TaskRunner<'task> {
         self.report.output_prefix = Some(context.get_target_prefix(&self.task.target));
         self.report.primary = is_primary;
 
+        if is_primary && !is_ci_env() {
+            self.report.output_style = None;
+        }
+
         let result = self.internal_run(context, node).await;
 
         self.cache.data.last_run_time = now_millis();
@@ -162,8 +219,8 @@ impl<'task> TaskRunner<'task> {
 
         match result {
             Ok(maybe_hash) => {
-                context.set_task_state(
-                    task_key.clone(),
+                context.set_invocation_state(
+                    self.invocation_key.clone(),
                     self.state.target.take().unwrap_or(TargetState::Passthrough),
                 );
 
@@ -183,8 +240,8 @@ impl<'task> TaskRunner<'task> {
                 })
             }
             Err(error) => {
-                context.set_task_state(
-                    task_key,
+                context.set_invocation_state(
+                    self.invocation_key.clone(),
                     self.state.target.take().unwrap_or(TargetState::Failed),
                 );
 
@@ -357,7 +414,40 @@ impl<'task> TaskRunner<'task> {
 
     #[instrument(skip_all)]
     pub fn is_dependencies_complete(&self, context: &ActionContext) -> miette::Result<bool> {
-        if self.task.deps.is_empty() {
+        if let Some(task_graph) = &self.task_graph {
+            for dependency in task_graph.resolved_dependencies_of(&self.task.key()) {
+                if dependency.dependency_type != moon_config::TaskDependencyType::Required {
+                    continue;
+                }
+
+                let dep_key = &dependency.task_key;
+
+                if context.is_dependency_ignored(&self.task.key(), dep_key) {
+                    continue;
+                }
+
+                if let Some(dep_state) = context.get_invocation_state(&dependency.invocation_key())
+                {
+                    if dep_state.is_complete() {
+                        continue;
+                    }
+
+                    debug!(
+                        task_target = self.task.target.as_str(),
+                        dependency_target = %dep_key,
+                        "Task dependency has failed or has been skipped, skipping this task",
+                    );
+
+                    return Ok(false);
+                } else {
+                    return Err(TaskRunnerError::MissingDependencyHash {
+                        dep_target: task_graph.get_by_key(dep_key)?.target.clone(),
+                        target: self.task.target.clone(),
+                    }
+                    .into());
+                }
+            }
+
             return Ok(true);
         }
 
@@ -368,8 +458,8 @@ impl<'task> TaskRunner<'task> {
                 continue;
             }
 
-            if let Some(dep_state) = context.target_states.get_sync(&dep_key) {
-                if dep_state.get().is_complete() {
+            if let Some(dep_state) = context.get_task_state(&dep_key) {
+                if dep_state.is_complete() {
                     continue;
                 }
 
@@ -856,11 +946,7 @@ impl<'task> TaskRunner<'task> {
                     output.command = Some(self.task.get_command_line());
                     output.exit_code = Some(self.cache.data.exit_code);
 
-                    let state_dir = self
-                        .app_context
-                        .cache_engine
-                        .state
-                        .get_task_dir(&self.task.key());
+                    let state_dir = self.hydrater.state_dir();
                     let err_path = state_dir.join("stderr.log");
                     let out_path = state_dir.join("stdout.log");
 
@@ -959,11 +1045,7 @@ impl<'task> TaskRunner<'task> {
     fn persist_state(&mut self, operation: &Operation) -> miette::Result<()> {
         self.state.operation = operation.to_owned();
 
-        let state_dir = self
-            .app_context
-            .cache_engine
-            .state
-            .get_task_dir(&self.task.key());
+        let state_dir = self.state_dir();
         let err_path = state_dir.join("stderr.log");
         let out_path = state_dir.join("stdout.log");
 
@@ -994,5 +1076,12 @@ impl<'task> TaskRunner<'task> {
         }
 
         Ok(())
+    }
+
+    fn state_dir(&self) -> std::path::PathBuf {
+        self.app_context
+            .cache_engine
+            .state
+            .get_task_invocation_dir(&self.invocation_key)
     }
 }

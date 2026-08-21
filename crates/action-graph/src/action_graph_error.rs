@@ -11,17 +11,6 @@ pub enum ActionGraphError {
     CycleDetected(String),
 
     #[diagnostic(
-        code(action_graph::unsupported_cross_source_task_dependency),
-        help = "Cross-source task execution will be enabled when action dispatch is implemented in Milestone 7."
-    )]
-    #[error(
-        "Task {} cannot be executed because its dependency {} belongs to another source root.",
-        .task.style(Style::Id),
-        .dependency.style(Style::Id),
-    )]
-    UnsupportedCrossSourceTaskDependency { task: String, dependency: String },
-
-    #[diagnostic(
         code(action_graph::jobs::invalid_index),
         help = "Indexes are zero-based."
     )]

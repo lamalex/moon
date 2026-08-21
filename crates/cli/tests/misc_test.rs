@@ -56,9 +56,11 @@ mod cli {
             )
             .unwrap();
 
+            let workspace_root = sandbox.path().to_owned();
+
             let assert = sandbox
                 .run_bin(|cmd| {
-                    cmd.arg("sync");
+                    cmd.arg("sync").env("MOON_WORKSPACE_ROOT", &workspace_root);
                 })
                 .failure();
 

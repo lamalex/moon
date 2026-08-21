@@ -1,7 +1,7 @@
 use moon_app_context::AppContext;
 use moon_codeowners::{CodeownersFingerprint, CodeownersGenerator};
 use moon_config::CodeownersOrderBy;
-use moon_workspace_graph::WorkspaceGraph;
+use moon_workspace_graph::{GraphConnections, WorkspaceGraph};
 use std::path::PathBuf;
 use tracing::instrument;
 
@@ -17,7 +17,13 @@ pub async fn sync_codeowners(
     )?;
 
     // Sort the projects based on config
-    let mut projects = workspace_graph.get_projects_unexpanded();
+    let mut projects = workspace_graph
+        .projects
+        .get_node_keys()
+        .into_iter()
+        .filter(|key| key.source_id() == &app_context.source_id)
+        .map(|key| workspace_graph.projects.get_unexpanded_by_key(&key))
+        .collect::<miette::Result<Vec<_>>>()?;
     let order_by = app_context.workspace_config.codeowners.order_by;
 
     projects.sort_by(|a, d| match order_by {

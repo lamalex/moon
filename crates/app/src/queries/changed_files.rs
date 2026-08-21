@@ -56,6 +56,7 @@ pub struct SourceChangedFilesQuery {
     pub observations: BTreeMap<SourceRootId, ChangedFilesObservation<SourcePathBuf>>,
     pub completeness: ImpactCompleteness,
     pub diagnostics: Vec<String>,
+    pub legacy_affected_fallback: bool,
 }
 
 // If we're in a shallow checkout, many diff commands will fail
@@ -290,28 +291,68 @@ pub async fn query_source_changed_files_for_affected(
         options.apply_affected(by);
     }
 
-    let stdin_result = read_changed_files_from_stdin()?;
+    query_source_changed_files(runtimes, options).await
+}
+
+pub async fn query_source_changed_files(
+    runtimes: &SourceRuntimeRegistry,
+    options: QueryChangedFilesOptions,
+) -> miette::Result<SourceChangedFilesQuery> {
+    let stdin_result = if options.stdin {
+        read_changed_files_from_stdin()?
+    } else {
+        None
+    };
+
     let primary_id = runtimes.get_primary().source_id.clone();
     let mut result = SourceChangedFilesQuery::default();
 
     for (source_id, runtime) in runtimes.iter() {
-        let observation = if let Some(stdin_result) = &stdin_result {
-            changed_files_observation_from_stdin(source_id, &primary_id, stdin_result)
+        let (observation, legacy_affected_fallback) = if let Some(stdin_result) = &stdin_result {
+            (
+                changed_files_observation_from_stdin(source_id, &primary_id, stdin_result),
+                false,
+            )
         } else {
             match runtime {
                 SourceRuntime::Available(context) => {
-                    match query_changed_files_observation(context.vcs.as_ref().as_ref(), &options)
+                    if context.vcs.is_enabled() {
+                        match query_changed_files_observation(
+                            context.vcs.as_ref().as_ref(),
+                            &options,
+                        )
                         .await
-                    {
-                        Ok(observation) => observation,
-                        Err(error) => ChangedFilesObservation::unavailable(error.to_string()),
+                        {
+                            Ok(result) => result,
+                            Err(error) => (
+                                ChangedFilesObservation::unavailable(error.to_string()),
+                                false,
+                            ),
+                        }
+                    } else {
+                        (
+                            ChangedFilesObservation::unavailable(
+                                "Source control is not enabled for this source.",
+                            ),
+                            true,
+                        )
                     }
                 }
-                SourceRuntime::Unavailable(reason) => {
-                    ChangedFilesObservation::unavailable(reason.to_string())
-                }
+                SourceRuntime::Unavailable(reason) => (
+                    ChangedFilesObservation::unavailable(reason.to_string()),
+                    false,
+                ),
             }
         };
+
+        if should_use_legacy_affected_fallback(
+            runtimes.len(),
+            source_id,
+            &primary_id,
+            legacy_affected_fallback,
+        ) {
+            result.legacy_affected_fallback = true;
+        }
 
         let qualified = qualify_changed_files_observation(source_id, observation);
 
@@ -329,6 +370,15 @@ pub async fn query_source_changed_files_for_affected(
     result.diagnostics.dedup();
 
     Ok(result)
+}
+
+fn should_use_legacy_affected_fallback(
+    source_count: usize,
+    source_id: &SourceRootId,
+    primary_id: &SourceRootId,
+    vcs_unavailable: bool,
+) -> bool {
+    source_count == 1 && source_id == primary_id && vcs_unavailable
 }
 
 fn changed_files_observation_from_stdin(
@@ -374,7 +424,7 @@ fn qualify_changed_files_observation(
 async fn query_changed_files_observation(
     vcs: &(dyn Vcs + Send + Sync),
     options: &QueryChangedFilesOptions,
-) -> miette::Result<ChangedFilesObservation> {
+) -> miette::Result<(ChangedFilesObservation, bool)> {
     let bag = GlobalEnvBag::instance();
     let default_branch = vcs.get_default_branch().await?;
     let current_branch = vcs.get_local_branch().await?;
@@ -396,8 +446,11 @@ async fn query_changed_files_observation(
         && options.default_branch;
 
     if base_value.is_none() && vcs.is_shallow_checkout().await? {
-        return Ok(ChangedFilesObservation::unavailable(
-            "A full source-control history is required to determine affected files.",
+        return Ok((
+            ChangedFilesObservation::unavailable(
+                "A full source-control history is required to determine affected files.",
+            ),
+            true,
         ));
     }
 
@@ -439,7 +492,7 @@ async fn query_changed_files_observation(
         })
         .collect();
 
-    Ok(observation)
+    Ok((observation, false))
 }
 
 #[cfg(test)]
@@ -488,5 +541,23 @@ mod tests {
         assert!(observation.files.files.is_empty());
         assert_eq!(observation.diagnostics.len(), 1);
         assert!(observation.diagnostics[0].contains("scoped to the primary source"));
+    }
+
+    #[test]
+    fn unavailable_vcs_only_disables_affected_for_single_source_queries() {
+        let primary_id = SourceRootId::new("workspace").unwrap();
+
+        assert!(should_use_legacy_affected_fallback(
+            1,
+            &primary_id,
+            &primary_id,
+            true
+        ));
+        assert!(!should_use_legacy_affected_fallback(
+            2,
+            &primary_id,
+            &primary_id,
+            true
+        ));
     }
 }

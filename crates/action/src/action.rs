@@ -176,7 +176,7 @@ impl Action {
             ActionNode::SetupProto(_) => "setup-proto",
             ActionNode::SetupToolchain(_) => "setup-toolchain",
             ActionNode::SyncProject(_) => "sync-project",
-            ActionNode::SyncWorkspace => "sync-workspace",
+            ActionNode::SyncWorkspace(_) => "sync-workspace",
         }
     }
 

@@ -382,73 +382,82 @@ pub async fn load_source_contexts(
             continue;
         }
 
-        let loader = config_loader.for_workspace_root(&source.root);
-        let moon_env = detect_moon_environment(&source.root, &source.root)?;
-        let proto_env = detect_proto_environment(&source.root, &source.root)?;
-        let (tasks_result, extensions_result, toolchains_result) = tokio::join!(
-            load_tasks_configs(loader.clone(), &source.root),
-            load_extensions_config(loader.clone(), &source.root),
-            load_toolchains_config(
-                loader.clone(),
-                Arc::clone(&proto_env),
-                &source.root,
-                &source.root,
-            ),
-        );
-        let mut failures = Vec::new();
-        let tasks_config = match tasks_result {
-            Ok(config) => config,
-            Err(error) if retain_failures => {
-                failures.push(SourceLoadFailure {
-                    message: error.to_string(),
-                    stage: "tasks-config".into(),
-                });
-                Arc::new(InheritedTasksManager::default())
-            }
-            Err(error) => return Err(error),
-        };
-        let extensions_config = match extensions_result {
-            Ok(config) => config,
-            Err(error) if retain_failures => {
-                failures.push(SourceLoadFailure {
-                    message: error.to_string(),
-                    stage: "extensions-config".into(),
-                });
-                Arc::new(ExtensionsConfig::default())
-            }
-            Err(error) => return Err(error),
-        };
-        let toolchains_config = match toolchains_result {
-            Ok(config) => config,
-            Err(error) if retain_failures => {
-                failures.push(SourceLoadFailure {
-                    message: error.to_string(),
-                    stage: "toolchains-config".into(),
-                });
-                Arc::new(ToolchainsConfig::default())
-            }
-            Err(error) => return Err(error),
-        };
-
         contexts.insert(
             source.id.clone(),
-            SourceContext::new(
-                source.id.clone(),
-                source.root.clone(),
-                source.root.clone(),
-                loader,
-                moon_env,
-                proto_env,
-                Arc::clone(&source.workspace_config),
-                tasks_config,
-                extensions_config,
-                toolchains_config,
-                failures,
-            ),
+            load_source_context(config_loader, source, retain_failures).await?,
         );
     }
 
     Ok(contexts)
+}
+
+/// Reload source-local configuration and service state for one workspace.
+pub async fn load_source_context(
+    config_loader: &ConfigLoader,
+    source: &DiscoveredWorkspace,
+    retain_failures: bool,
+) -> miette::Result<SourceContext> {
+    let loader = config_loader.for_workspace_root(&source.root);
+    let moon_env = detect_moon_environment(&source.root, &source.root)?;
+    let proto_env = detect_proto_environment(&source.root, &source.root)?;
+    let (tasks_result, extensions_result, toolchains_result) = tokio::join!(
+        load_tasks_configs(loader.clone(), &source.root),
+        load_extensions_config(loader.clone(), &source.root),
+        load_toolchains_config(
+            loader.clone(),
+            Arc::clone(&proto_env),
+            &source.root,
+            &source.root,
+        ),
+    );
+    let mut failures = Vec::new();
+    let tasks_config = match tasks_result {
+        Ok(config) => config,
+        Err(error) if retain_failures => {
+            failures.push(SourceLoadFailure {
+                message: error.to_string(),
+                stage: "tasks-config".into(),
+            });
+            Arc::new(InheritedTasksManager::default())
+        }
+        Err(error) => return Err(error),
+    };
+    let extensions_config = match extensions_result {
+        Ok(config) => config,
+        Err(error) if retain_failures => {
+            failures.push(SourceLoadFailure {
+                message: error.to_string(),
+                stage: "extensions-config".into(),
+            });
+            Arc::new(ExtensionsConfig::default())
+        }
+        Err(error) => return Err(error),
+    };
+    let toolchains_config = match toolchains_result {
+        Ok(config) => config,
+        Err(error) if retain_failures => {
+            failures.push(SourceLoadFailure {
+                message: error.to_string(),
+                stage: "toolchains-config".into(),
+            });
+            Arc::new(ToolchainsConfig::default())
+        }
+        Err(error) => return Err(error),
+    };
+
+    Ok(SourceContext::new(
+        source.id.clone(),
+        source.root.clone(),
+        source.root.clone(),
+        loader,
+        moon_env,
+        proto_env,
+        Arc::clone(&source.workspace_config),
+        tasks_config,
+        extensions_config,
+        toolchains_config,
+        failures,
+    ))
 }
 
 /// Load the toolchain configuration file from the `.moon` directory if it exists.
@@ -867,5 +876,66 @@ child-extension:
         let direct_hashes = first_cache.hash_files(&web.root, &[file]).await.unwrap();
         assert_eq!(hashes, direct_hashes);
         assert_eq!(hashes.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replacing_one_source_context_preserves_unchanged_runtime_identity() {
+        let sandbox = create_empty_sandbox();
+        let primary_root = sandbox.path().join("platform");
+
+        sandbox.create_file(
+            "platform/.moon/workspace.yml",
+            r"
+id: acme/platform
+workspaces:
+  frontend:
+    path: ../web
+  docs:
+    path: ../docs
+",
+        );
+        sandbox.create_file("web/.moon/workspace.yml", "id: acme/web");
+        sandbox.create_file("docs/.moon/workspace.yml", "id: acme/docs");
+
+        let mut loader = ConfigLoader::default();
+        loader.locate_dir(&primary_root);
+        let config = load_workspace_config(loader.clone(), &primary_root)
+            .await
+            .unwrap();
+        let discovery = discover_workspaces(&loader, &primary_root, config)
+            .await
+            .unwrap();
+        let mut contexts = load_source_contexts(&loader, &discovery, false)
+            .await
+            .unwrap();
+        let web_id = SourceRootId::new("acme/web").unwrap();
+        let docs_id = SourceRootId::new("acme/docs").unwrap();
+        let console = Arc::new(Console::new(true));
+        let version = Version::parse("1.0.0").unwrap();
+        let web_runtime = contexts[&web_id]
+            .get_app_context(version.clone(), Arc::clone(&console))
+            .await
+            .unwrap();
+        let docs_runtime = contexts[&docs_id]
+            .get_app_context(version.clone(), Arc::clone(&console))
+            .await
+            .unwrap();
+
+        let replacement = load_source_context(&loader, &discovery.workspaces[&web_id], false)
+            .await
+            .unwrap();
+        contexts.insert(web_id.clone(), replacement);
+
+        let replaced_web_runtime = contexts[&web_id]
+            .get_app_context(version.clone(), Arc::clone(&console))
+            .await
+            .unwrap();
+        let unchanged_docs_runtime = contexts[&docs_id]
+            .get_app_context(version, console)
+            .await
+            .unwrap();
+
+        assert!(!Arc::ptr_eq(&web_runtime, &replaced_web_runtime));
+        assert!(Arc::ptr_eq(&docs_runtime, &unchanged_docs_runtime));
     }
 }

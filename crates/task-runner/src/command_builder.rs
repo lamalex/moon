@@ -349,9 +349,12 @@ impl<'task> CommandBuilder<'task> {
         };
 
         // Only get files when `--affected` is passed
-        let mut abs_files = if context.affected.is_some() {
+        let mut abs_files = if context.is_affected() {
             self.task
-                .get_affected_files(&self.app.workspace_root, &context.changed_files)?
+                .get_affected_files(
+                    &self.app.workspace_root,
+                    context.changed_files_for_source(&self.task.source_id),
+                )?
                 .into_iter()
                 .filter(filter_files)
                 .collect::<Vec<_>>()

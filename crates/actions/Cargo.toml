@@ -26,6 +26,7 @@ moon_process_augment = { path = "../process-augment" }
 moon_project = { path = "../project" }
 moon_task_runner = { path = "../task-runner" }
 moon_task_graph = { path = "../task-graph" }
+moon_target = { path = "../target" }
 moon_time = { path = "../time" }
 moon_toolchain = { path = "../toolchain" }
 moon_toolchain_plugin = { path = "../toolchain-plugin" }
@@ -43,6 +44,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+moon_affected = { path = "../affected" }
 moon_test_utils = { path = "../test-utils" }
 serial_test = { workspace = true }
 starbase_sandbox = { workspace = true }

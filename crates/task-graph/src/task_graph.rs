@@ -6,7 +6,7 @@ use moon_config::{
 use moon_graph_utils::*;
 use moon_project::ProjectError;
 use moon_project_graph::ProjectGraph;
-use moon_target::{Target, TaskKey};
+use moon_target::{Target, TaskInvocationKey, TaskKey};
 use moon_task::{
     TargetDependencyScope, TargetProjectScope, TargetTaskScope, Task,
     TaskDependencyValidationError, validate_task_dependency,
@@ -36,6 +36,17 @@ pub struct ResolvedTaskDependency {
     pub dependency_type: TaskDependencyType,
     pub args: Vec<String>,
     pub env: EnvMap,
+    pub declaration_ordinal: usize,
+}
+
+impl ResolvedTaskDependency {
+    pub fn invocation_key(&self) -> TaskInvocationKey {
+        TaskInvocationKey::new(
+            self.task_key.clone(),
+            &self.args,
+            self.env.iter().map(|(key, value)| (key, value.as_ref())),
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -165,7 +176,7 @@ impl TaskGraph {
         for source_key in source_keys {
             let task = &self.nodes[&source_key].task;
 
-            for dep_config in &task.configured_deps {
+            for (declaration_ordinal, dep_config) in task.configured_deps.iter().enumerate() {
                 let (project_scope, _) = dep_config.target.get_project_scope();
                 let required_scope = match project_scope {
                     TargetProjectScope::Deps => None,
@@ -249,16 +260,23 @@ impl TaskGraph {
                         target_key,
                         dependency_type,
                         dep_config.clone(),
+                        declaration_ordinal,
                     ));
                 }
             }
         }
 
-        edges.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        edges.sort_by(|a, b| (&a.0, a.4, &a.1).cmp(&(&b.0, b.4, &b.1)));
 
-        for (source_key, target_key, dependency_type, config) in edges {
+        for (source_key, target_key, dependency_type, config, declaration_ordinal) in edges {
             self.add_edge(&source_key, &target_key, dependency_type)?;
-            self.add_resolved_dependency(&source_key, &target_key, dependency_type, &config);
+            self.add_resolved_dependency(
+                &source_key,
+                &target_key,
+                dependency_type,
+                &config,
+                declaration_ordinal,
+            );
         }
 
         Ok(())
@@ -308,6 +326,7 @@ impl TaskGraph {
         dependency: &TaskKey,
         dependency_type: TaskDependencyType,
         config: &TaskDependencyConfig,
+        declaration_ordinal: usize,
     ) {
         let cache_strategy = config.cache_strategy.unwrap_or_else(|| {
             if self.nodes[dependency].task.has_outputs() {
@@ -322,13 +341,17 @@ impl TaskGraph {
             dependency_type,
             args: config.args.clone(),
             env: config.env.clone(),
+            declaration_ordinal,
         };
         let dependencies = self.resolved_dependencies.entry(owner.clone()).or_default();
 
         if let Some(current) = dependencies
             .iter_mut()
-            .find(|current| current.task_key == *dependency)
+            .find(|current| current.invocation_key() == resolved.invocation_key())
         {
+            let earliest_ordinal = current
+                .declaration_ordinal
+                .min(resolved.declaration_ordinal);
             let current_required = current.dependency_type == TaskDependencyType::Required;
             let incoming_required = dependency_type == TaskDependencyType::Required;
             let replace = incoming_required && !current_required
@@ -340,11 +363,12 @@ impl TaskGraph {
             } else if incoming_required {
                 current.dependency_type = TaskDependencyType::Required;
             }
+            current.declaration_ordinal = earliest_ordinal;
         } else {
             dependencies.push(resolved);
         }
 
-        dependencies.sort_by(|a, b| a.task_key.cmp(&b.task_key));
+        dependencies.sort_by(resolved_dependency_variant_cmp);
     }
 
     /// Populate canonical metadata for already-resolved source-local dependencies.
@@ -355,7 +379,7 @@ impl TaskGraph {
         for owner in owners {
             let configs = self.nodes[&owner].task.deps.clone();
 
-            for config in configs {
+            for (expanded_ordinal, config) in configs.into_iter().enumerate() {
                 let dependency =
                     TaskKey::from_target(owner.project_key().source_id().clone(), &config.target)?;
 
@@ -368,11 +392,96 @@ impl TaskGraph {
                 } else {
                     TaskDependencyType::Required
                 };
-                self.add_resolved_dependency(&owner, &dependency, dependency_type, &config);
+                let declaration_ordinal = self.nodes[&owner]
+                    .task
+                    .configured_deps
+                    .iter()
+                    .enumerate()
+                    .find_map(|(ordinal, configured)| {
+                        (configured.args == config.args
+                            && resolved_env_cmp(&configured.env, &config.env) == Ordering::Equal
+                            && self.config_selects_dependency(&owner, &dependency, configured))
+                        .then_some(ordinal)
+                    })
+                    .unwrap_or(expanded_ordinal);
+                self.add_resolved_dependency(
+                    &owner,
+                    &dependency,
+                    dependency_type,
+                    &config,
+                    declaration_ordinal,
+                );
             }
         }
 
         Ok(())
+    }
+
+    fn config_selects_dependency(
+        &self,
+        owner: &TaskKey,
+        dependency: &TaskKey,
+        config: &TaskDependencyConfig,
+    ) -> bool {
+        let (task_scope, task_value) = config.target.get_task_scope();
+        let dependency_task = &self.nodes[dependency].task;
+        let task_matches = match task_scope {
+            TargetTaskScope::Id => dependency.task_id().as_str() == task_value,
+            TargetTaskScope::Tag => dependency_task
+                .tags
+                .iter()
+                .any(|tag| tag.as_str() == task_value),
+        };
+
+        if !task_matches {
+            return false;
+        }
+
+        let (project_scope, project_value) = config.target.get_project_scope();
+        match project_scope {
+            TargetProjectScope::OwnSelf => owner.project_key() == dependency.project_key(),
+            TargetProjectScope::Id => {
+                dependency.project_key().project_id().as_str() == project_value
+            }
+            TargetProjectScope::Deps | TargetProjectScope::DepsOf(_) => {
+                let required_scope = match project_scope {
+                    TargetProjectScope::Deps => None,
+                    TargetProjectScope::DepsOf(TargetDependencyScope::Build) => {
+                        Some(DependencyScope::Build)
+                    }
+                    TargetProjectScope::DepsOf(TargetDependencyScope::Development) => {
+                        Some(DependencyScope::Development)
+                    }
+                    TargetProjectScope::DepsOf(TargetDependencyScope::Peer) => {
+                        Some(DependencyScope::Peer)
+                    }
+                    TargetProjectScope::DepsOf(TargetDependencyScope::Production) => {
+                        Some(DependencyScope::Production)
+                    }
+                    _ => unreachable!(),
+                };
+
+                self.project_graph
+                    .direct_dependencies_with_scopes(owner.project_key())
+                    .is_ok_and(|dependencies| {
+                        dependencies.into_iter().any(|(project, scope)| {
+                            project == *dependency.project_key()
+                                && required_scope.is_none_or(|required| required == scope)
+                        })
+                    })
+            }
+            TargetProjectScope::Tag => self
+                .project_graph
+                .get_unexpanded_by_key(dependency.project_key())
+                .is_ok_and(|project| {
+                    project
+                        .config
+                        .tags
+                        .iter()
+                        .any(|tag| tag.as_str() == project_value)
+                }),
+            TargetProjectScope::All => false,
+        }
     }
 
     /// Return canonical resolved dependency metadata for an owning task.
@@ -637,15 +746,25 @@ fn resolved_dependency_cmp(a: &ResolvedTaskDependency, b: &ResolvedTaskDependenc
         TaskDependencyCacheStrategy::Ignored => 1,
         TaskDependencyCacheStrategy::Outputs => 2,
     };
-    let mut a_env = a.env.iter().collect::<Vec<_>>();
-    let mut b_env = b.env.iter().collect::<Vec<_>>();
-    a_env.sort();
-    b_env.sort();
-
     strategy_rank(a.cache_strategy)
         .cmp(&strategy_rank(b.cache_strategy))
         .then_with(|| a.args.cmp(&b.args))
-        .then_with(|| a_env.cmp(&b_env))
+        .then_with(|| resolved_env_cmp(&a.env, &b.env))
+}
+
+fn resolved_dependency_variant_cmp(
+    a: &ResolvedTaskDependency,
+    b: &ResolvedTaskDependency,
+) -> Ordering {
+    a.declaration_ordinal.cmp(&b.declaration_ordinal)
+}
+
+fn resolved_env_cmp(a: &EnvMap, b: &EnvMap) -> Ordering {
+    let mut a = a.iter().collect::<Vec<_>>();
+    let mut b = b.iter().collect::<Vec<_>>();
+    a.sort();
+    b.sort();
+    a.cmp(&b)
 }
 
 impl TaskLookup for TaskGraph {
@@ -989,6 +1108,125 @@ mod tests {
             forward[0].cache_strategy,
             TaskDependencyCacheStrategy::Ignored
         );
+    }
+
+    #[test]
+    fn preserves_distinct_dependency_variants_in_aggregate_and_focused_graphs() {
+        let (projects, primary_project, child_project) =
+            projects(&[(0, 1, DependencyScope::Build)]);
+        let target = moon_target::Target::new("^", "build").unwrap();
+        let mut env_config = TaskDependencyConfig::new(target.clone());
+        env_config.env.insert("MODE".into(), Some("ci".into()));
+        let mut combined_config = TaskDependencyConfig {
+            args: vec!["--release".into()],
+            ..TaskDependencyConfig::new(target.clone())
+        };
+        combined_config.env.insert("MODE".into(), Some("ci".into()));
+        let primary = tasks(
+            context(primary_project.source_id().clone(), "/primary"),
+            Arc::clone(&projects),
+            &primary_project,
+            &[(
+                "build",
+                vec![
+                    TaskDependencyConfig::new(target.clone()),
+                    TaskDependencyConfig {
+                        args: vec!["--release".into()],
+                        ..TaskDependencyConfig::new(target)
+                    },
+                    env_config,
+                    combined_config.clone(),
+                    TaskDependencyConfig {
+                        optional: Some(true),
+                        cache_strategy: Some(TaskDependencyCacheStrategy::Outputs),
+                        ..combined_config
+                    },
+                ],
+            )],
+        );
+        let child = tasks(
+            context(child_project.source_id().clone(), "/child"),
+            Arc::clone(&projects),
+            &child_project,
+            &[("build", vec![])],
+        );
+        let graph = TaskGraph::compose(projects, [primary, child]).unwrap();
+        let owner = TaskKey::new(primary_project, Id::raw("build")).unwrap();
+        let focused = graph.focus_for_key(&owner, false).unwrap();
+
+        for dependencies in [
+            graph.resolved_dependencies_of(&owner),
+            focused.resolved_dependencies_of(&owner),
+        ] {
+            assert_eq!(dependencies.len(), 4);
+            assert_eq!(dependencies[0].args, Vec::<String>::new());
+            assert_eq!(dependencies[0].declaration_ordinal, 0);
+            assert!(dependencies[0].env.is_empty());
+            assert_eq!(dependencies[1].args, ["--release"]);
+            assert_eq!(dependencies[1].declaration_ordinal, 1);
+            assert!(dependencies[1].env.is_empty());
+            assert_eq!(dependencies[2].args, Vec::<String>::new());
+            assert_eq!(dependencies[2].declaration_ordinal, 2);
+            assert_eq!(dependencies[2].env["MODE"], Some("ci".into()));
+            assert_eq!(dependencies[3].args, ["--release"]);
+            assert_eq!(dependencies[3].declaration_ordinal, 3);
+            assert_eq!(dependencies[3].env["MODE"], Some("ci".into()));
+            assert_eq!(
+                dependencies[3].dependency_type,
+                TaskDependencyType::Required
+            );
+            assert_eq!(
+                dependencies[3].cache_strategy,
+                TaskDependencyCacheStrategy::Ignored
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_declaration_order_across_local_and_composed_dependencies() {
+        let (projects, primary_project, child_project) =
+            projects(&[(0, 1, DependencyScope::Build)]);
+        let local_before = TaskDependencyConfig::new(
+            moon_target::Target::new(primary_project.project_id(), "before").unwrap(),
+        );
+        let cross = TaskDependencyConfig::new(moon_target::Target::new("^", "build").unwrap());
+        let local_after = TaskDependencyConfig::new(
+            moon_target::Target::new(primary_project.project_id(), "after").unwrap(),
+        );
+        let mut primary = tasks(
+            context(primary_project.source_id().clone(), "/primary"),
+            Arc::clone(&projects),
+            &primary_project,
+            &[
+                (
+                    "consume",
+                    vec![local_before.clone(), cross, local_after.clone()],
+                ),
+                ("before", vec![]),
+                ("after", vec![]),
+            ],
+        );
+        let owner = TaskKey::new(primary_project, Id::raw("consume")).unwrap();
+        let primary = Arc::get_mut(&mut primary).unwrap();
+        primary.nodes.get_mut(&owner).unwrap().task.deps = vec![local_before, local_after];
+        primary.resolve_source_local_dependencies().unwrap();
+        let child = tasks(
+            context(child_project.source_id().clone(), "/child"),
+            Arc::clone(&projects),
+            &child_project,
+            &[("build", vec![])],
+        );
+        let graph =
+            TaskGraph::compose(projects, [Arc::new(std::mem::take(primary)), child]).unwrap();
+        let dependencies = graph.resolved_dependencies_of(&owner);
+
+        assert_eq!(dependencies.len(), 3);
+        assert_eq!(dependencies[0].task_key.task_id().as_str(), "before");
+        assert_eq!(dependencies[0].declaration_ordinal, 0);
+        assert_eq!(dependencies[1].task_key.task_id().as_str(), "build");
+        assert_eq!(dependencies[1].declaration_ordinal, 1);
+        assert_eq!(dependencies[2].task_key.task_id().as_str(), "after");
+        assert_eq!(dependencies[2].declaration_ordinal, 2);
     }
 
     #[test]

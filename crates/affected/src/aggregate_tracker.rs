@@ -5,12 +5,12 @@ use moon_target::{ProjectKey, TaskKey};
 use moon_task::TaskOptionRunInCI;
 use moon_vcs::{ChangedFilesObservation, ImpactCompleteness};
 use moon_workspace_graph::{GraphConnections, WorkspaceGraph};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use starbase_utils::fs;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AggregateAffectedProjectState {
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
@@ -24,7 +24,7 @@ pub struct AggregateAffectedProjectState {
     pub other: bool,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AggregateAffectedTaskState {
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
@@ -40,7 +40,7 @@ pub struct AggregateAffectedTaskState {
     pub other: bool,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AggregateAffected {
     pub completeness: ImpactCompleteness,
@@ -59,8 +59,25 @@ impl AggregateAffected {
         self.should_check && self.projects.contains_key(key)
     }
 
+    pub fn is_project_affected_ignoring_relations(&self, key: &ProjectKey) -> bool {
+        self.should_check
+            && self.projects.get(key).is_some_and(|state| {
+                state.other || !state.files.is_empty() || !state.tasks.is_empty()
+            })
+    }
+
     pub fn is_task_affected(&self, key: &TaskKey) -> bool {
         self.should_check && self.tasks.contains_key(key)
+    }
+
+    pub fn is_task_affected_ignoring_relations(&self, key: &TaskKey) -> bool {
+        self.should_check
+            && self.tasks.get(key).is_some_and(|state| {
+                state.other
+                    || !state.env.is_empty()
+                    || !state.files.is_empty()
+                    || !state.projects.is_empty()
+            })
     }
 }
 
@@ -108,6 +125,10 @@ impl AggregateAffectedTracker {
             .map(|observation| observation.completeness)
             .max()
             .unwrap_or_default();
+        let should_check = observations.values().any(|observation| {
+            observation.completeness != ImpactCompleteness::Exact
+                || !observation.files.files.is_empty()
+        });
         let mut diagnostics = observations
             .iter()
             .flat_map(|(source, observation)| {
@@ -127,6 +148,7 @@ impl AggregateAffectedTracker {
             affected: AggregateAffected {
                 completeness,
                 diagnostics,
+                should_check,
                 ..Default::default()
             },
             project_downstream: DownstreamScope::None,
@@ -142,6 +164,10 @@ impl AggregateAffectedTracker {
                 || !observation.files.files.is_empty()
         });
         self.affected
+    }
+
+    pub fn build_ref(&self) -> &AggregateAffected {
+        &self.affected
     }
 
     pub fn set_ci_check(&mut self, ci: bool) -> &mut Self {
@@ -225,9 +251,7 @@ impl AggregateAffectedTracker {
             let Some(observation) = self.observations.get(key.project_key().source_id()) else {
                 continue;
             };
-            let cause = if observation.completeness == ImpactCompleteness::Unavailable
-                || self.ci && matches!(task.options.run_in_ci, TaskOptionRunInCI::Always)
-            {
+            let cause = if observation.completeness == ImpactCompleteness::Unavailable {
                 Some(TaskCause::Unavailable)
             } else if matches!(
                 (self.ci, &task.options.run_in_ci),
@@ -238,6 +262,8 @@ impl AggregateAffectedTracker {
             ) || task.state.empty_inputs
             {
                 None
+            } else if self.ci && matches!(task.options.run_in_ci, TaskOptionRunInCI::Always) {
+                Some(TaskCause::Unavailable)
             } else if let Some(name) = task.input_env.iter().find(|name| {
                 GlobalEnvBag::instance()
                     .get(name)
@@ -457,12 +483,13 @@ mod tests {
         projects.set_graph(project_graph).unwrap();
         let projects = Arc::new(projects);
 
-        let task = Task {
+        let mut task = Task {
             id: Id::raw("build"),
             source_id,
             target: Target::new("app", "build").unwrap(),
             ..Task::default()
         };
+        task.state.empty_inputs = true;
         let task_key = task.key();
         let mut tasks = TaskGraph::new(context, Arc::clone(&projects));
         let task_index = tasks.graph.add_node(Default::default());
@@ -550,7 +577,44 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_marks_only_its_duplicate_canonical_identities() {
+    fn identical_changed_paths_retain_both_source_identities() {
+        let graph = aggregate_graph();
+        let primary = SourceRootId::new("primary").unwrap();
+        let child = SourceRootId::new("child").unwrap();
+        let path = "packages/app/file.rs";
+        let mut tracker = AggregateAffectedTracker::new(
+            graph,
+            BTreeMap::from([
+                (
+                    primary.clone(),
+                    observation(primary.clone(), ImpactCompleteness::Exact, Some(path)),
+                ),
+                (
+                    child.clone(),
+                    observation(child.clone(), ImpactCompleteness::Exact, Some(path)),
+                ),
+            ]),
+        )
+        .unwrap();
+        tracker.track_projects().unwrap();
+        let affected = tracker.build();
+        let primary_state =
+            &affected.projects[&ProjectKey::new(primary.clone(), Id::raw("app")).unwrap()];
+        let child_state =
+            &affected.projects[&ProjectKey::new(child.clone(), Id::raw("app")).unwrap()];
+
+        assert_eq!(
+            primary_state.files,
+            BTreeSet::from([SourcePathBuf::new(primary, path)])
+        );
+        assert_eq!(
+            child_state.files,
+            BTreeSet::from([SourcePathBuf::new(child, path)])
+        );
+    }
+
+    #[test]
+    fn unavailable_marks_all_source_tasks_including_empty_inputs() {
         let graph = aggregate_graph();
         let primary = SourceRootId::new("primary").unwrap();
         let child = SourceRootId::new("child").unwrap();

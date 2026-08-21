@@ -87,7 +87,11 @@ impl TestDaemon {
         let service = DaemonService::new(
             Arc::new(RwLock::new(DaemonState {
                 app_context: Arc::clone(&app_context),
+                sources: Arc::new(moon_common::SourceRegistry::single(
+                    app_context.workspace_root.clone(),
+                )),
                 source_runtime_registry,
+                topology_changed: Arc::new(tokio::sync::Notify::new()),
                 workspace_graph: Arc::new(WorkspaceGraph::default()),
             })),
             endpoint.clone(),
@@ -551,6 +555,69 @@ mod source_routing {
             .unwrap();
 
         assert_ne!(primary_hashes[&file], child_hashes[&file]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cleans_primary_and_child_caches_by_source() {
+        let daemon = TestDaemon::start_with_child(true).await;
+        let child = daemon.child_context.as_ref().unwrap();
+        let primary_file = daemon
+            .app_context
+            .cache_engine
+            .hash
+            .hashes_dir
+            .join("stale.json");
+        let child_file = child.cache_engine.hash.hashes_dir.join("stale.json");
+        std::fs::write(&primary_file, "primary").unwrap();
+        std::fs::write(&child_file, "child").unwrap();
+
+        daemon
+            .client
+            .clone()
+            .clean_cache(&SourceRootId::primary(), "0 seconds".into(), false)
+            .await
+            .unwrap();
+
+        assert!(!primary_file.exists());
+        assert!(child_file.exists());
+
+        daemon
+            .client
+            .clone()
+            .clean_cache(&child.source_id, "0 seconds".into(), false)
+            .await
+            .unwrap();
+
+        assert!(!child_file.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_unknown_and_unavailable_cleanup_sources() {
+        let daemon = TestDaemon::start_with_child(true).await;
+
+        let unknown = daemon
+            .client
+            .clone()
+            .clean_cache(
+                &SourceRootId::new("unknown").unwrap(),
+                "7 days".into(),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(unknown.to_string().contains("not registered"));
+
+        let unavailable = daemon
+            .client
+            .clone()
+            .clean_cache(
+                &SourceRootId::new("unavailable").unwrap(),
+                "7 days".into(),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(unavailable.to_string().contains("source failed to load"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

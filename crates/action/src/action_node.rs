@@ -1,7 +1,7 @@
 use indexmap::IndexMap;
 use moon_common::path::WorkspaceRelativePathBuf;
-use moon_common::{Id, is_test_env};
-use moon_target::{Target, TaskKey};
+use moon_common::{Id, SourceRootId, is_test_env};
+use moon_target::{ProjectKey, Target, TaskInvocationKey, TaskKey};
 use moon_toolchain::{ToolchainSpec, VersionSpec};
 use rustc_hash::FxHasher;
 use serde::Serialize;
@@ -15,9 +15,11 @@ pub struct InstallDependenciesNode {
     pub members: Option<Vec<String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<Id>,
+    pub project_key: Option<ProjectKey>,
 
     pub root: WorkspaceRelativePathBuf,
+
+    pub source_id: SourceRootId,
 
     pub toolchain_id: Id,
 }
@@ -26,27 +28,39 @@ pub struct InstallDependenciesNode {
 #[serde(rename_all = "camelCase")]
 pub struct SetupEnvironmentNode {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<Id>,
+    pub project_key: Option<ProjectKey>,
 
     pub root: WorkspaceRelativePathBuf,
+
+    pub source_id: SourceRootId,
 
     pub toolchain_id: Id,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SetupProtoNode {
+    pub source_id: SourceRootId,
     pub version: VersionSpec,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SetupToolchainNode {
+    pub source_id: SourceRootId,
     pub toolchain: ToolchainSpec,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncProjectNode {
-    pub project_id: Id,
+    pub project_key: ProjectKey,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncWorkspaceNode {
+    pub source_id: SourceRootId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -83,13 +97,17 @@ impl RunTaskNode {
         }
     }
 
+    pub fn invocation_key(&self) -> TaskInvocationKey {
+        TaskInvocationKey::new(
+            self.key.clone(),
+            &self.args,
+            self.env.iter().map(|(key, value)| (key, value.as_ref())),
+        )
+    }
+
     fn calculate_id(&mut self) {
         let mut hasher = FxHasher::default();
-        hasher.write(self.target.as_str().as_bytes());
-
-        if self.key.project_key().source_id() != &Default::default() {
-            hasher.write(self.key.project_key().source_id().as_str().as_bytes());
-        }
+        self.key.hash(&mut hasher);
 
         if self.persistent {
             hasher.write_u8(100);
@@ -128,7 +146,7 @@ pub enum ActionNode {
     SyncProject(Box<SyncProjectNode>),
 
     /// Sync the entire moon workspace and install system dependencies.
-    SyncWorkspace,
+    SyncWorkspace(Box<SyncWorkspaceNode>),
 }
 
 impl ActionNode {
@@ -146,8 +164,8 @@ impl ActionNode {
         Self::SetupEnvironment(Box::new(node))
     }
 
-    pub fn setup_proto(version: VersionSpec) -> Self {
-        Self::SetupProto(Box::new(SetupProtoNode { version }))
+    pub fn setup_proto(source_id: SourceRootId, version: VersionSpec) -> Self {
+        Self::SetupProto(Box::new(SetupProtoNode { source_id, version }))
     }
 
     pub fn setup_toolchain(node: SetupToolchainNode) -> Self {
@@ -158,8 +176,21 @@ impl ActionNode {
         Self::SyncProject(Box::new(node))
     }
 
-    pub fn sync_workspace() -> Self {
-        Self::SyncWorkspace
+    pub fn sync_workspace(source_id: SourceRootId) -> Self {
+        Self::SyncWorkspace(Box::new(SyncWorkspaceNode { source_id }))
+    }
+
+    pub fn source_id(&self) -> Option<&SourceRootId> {
+        match self {
+            Self::None => None,
+            Self::InstallDependencies(inner) => Some(&inner.source_id),
+            Self::RunTask(inner) => Some(inner.key.project_key().source_id()),
+            Self::SetupEnvironment(inner) => Some(&inner.source_id),
+            Self::SetupProto(inner) => Some(&inner.source_id),
+            Self::SetupToolchain(inner) => Some(&inner.source_id),
+            Self::SyncProject(inner) => Some(inner.project_key.source_id()),
+            Self::SyncWorkspace(inner) => Some(&inner.source_id),
+        }
     }
 
     pub fn get_id(&self) -> u64 {
@@ -250,9 +281,9 @@ impl ActionNode {
                 format!("SetupToolchain({})", inner.toolchain.target())
             }
             Self::SyncProject(inner) => {
-                format!("SyncProject({})", inner.project_id)
+                format!("SyncProject({})", inner.project_key.project_id())
             }
-            Self::SyncWorkspace => "SyncWorkspace".into(),
+            Self::SyncWorkspace(_) => "SyncWorkspace".into(),
             Self::None => "None".into(),
         }
     }
@@ -269,30 +300,50 @@ impl Hash for ActionNode {
         state.write(self.label().as_bytes());
 
         match self {
-            Self::InstallDependencies(inner) => inner.hash(state),
-            Self::SetupEnvironment(inner) => inner.hash(state),
-            Self::SetupToolchain(inner) => inner.hash(state),
-            Self::SyncProject(inner) => inner.hash(state),
+            Self::InstallDependencies(inner) => {
+                hash_source(&inner.source_id, state);
+                inner.members.hash(state);
+                inner
+                    .project_key
+                    .as_ref()
+                    .map(ProjectKey::project_id)
+                    .hash(state);
+                inner.root.hash(state);
+                inner.toolchain_id.hash(state);
+            }
+            Self::SetupEnvironment(inner) => {
+                hash_source(&inner.source_id, state);
+                inner
+                    .project_key
+                    .as_ref()
+                    .map(ProjectKey::project_id)
+                    .hash(state);
+                inner.root.hash(state);
+                inner.toolchain_id.hash(state);
+            }
+            Self::SetupProto(inner) => hash_source(&inner.source_id, state),
+            Self::SetupToolchain(inner) => {
+                hash_source(&inner.source_id, state);
+                inner.toolchain.hash(state);
+            }
+            Self::SyncProject(inner) => {
+                hash_source(inner.project_key.source_id(), state);
+                inner.project_key.project_id().hash(state);
+            }
+            Self::SyncWorkspace(inner) => hash_source(&inner.source_id, state),
 
             // For tasks with passthrough arguments and environment variables,
             // we need to ensure the hash is more unique in the graph
             Self::RunTask(inner) => {
-                if inner.key.project_key().source_id() != &Default::default() {
-                    inner.key.project_key().source_id().hash(state);
-                }
-
-                for arg in &inner.args {
-                    state.write(arg.as_bytes());
-                }
-
-                for (key, value) in &inner.env {
-                    state.write(key.as_bytes());
-                    if let Some(value) = &value {
-                        state.write(value.as_bytes());
-                    }
-                }
+                inner.invocation_key().hash(state);
             }
             _ => {}
         };
+    }
+}
+
+fn hash_source<H: Hasher>(source_id: &SourceRootId, state: &mut H) {
+    if source_id != &Default::default() {
+        source_id.hash(state);
     }
 }

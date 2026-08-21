@@ -7,6 +7,7 @@ use moon_common::{SourcePathBuf, color};
 use moon_config::{HasherConfig, HasherWalkStrategy};
 use moon_env_var::GlobalEnvBag;
 use moon_project::Project;
+use moon_target::TaskInvocationKey;
 use moon_task::{Task, TaskKey};
 use moon_task_graph::TaskGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -55,7 +56,7 @@ impl<'task> TaskHasher<'task> {
         }
     }
 
-    pub fn hash_deps(&mut self, deps: impl IntoIterator<Item = (TaskKey, String)>) {
+    pub fn hash_deps(&mut self, deps: impl IntoIterator<Item = (TaskInvocationKey, String)>) {
         self.fingerprint.deps.extend(deps);
     }
 

@@ -27,15 +27,9 @@ pub async fn setup_proto(
         .inventory_dir
         .join("proto")
         .join(&proto_version);
+    let _store_lock = crate::utils::lock_proto_store(&app_context).await;
 
     debug!(proto = ?install_dir.join(&bin_name), "Checking if proto is installed");
-
-    // Set the version so that proto lookup paths take it into account
-    let bag = GlobalEnvBag::instance();
-    bag.set("PROTO_VERSION", &proto_version);
-    bag.set("PROTO_IGNORE_MIGRATE_WARNING", "true");
-    bag.set("PROTO_VERSION_CHECK", "false");
-    bag.set("PROTO_LOOKUP_DIR", &install_dir);
 
     // This causes a ton of issues when running the test suite,
     // so just avoid it and assume proto exists!
@@ -45,7 +39,7 @@ pub async fn setup_proto(
         return Ok(ActionStatus::Skipped);
     }
 
-    if !requires_proto(bag, &app_context.toolchains_config) {
+    if !requires_proto(GlobalEnvBag::instance(), &app_context.toolchains_config) {
         debug!("Skipping proto install as the toolchain has been disabled or is not necessary");
 
         return Ok(ActionStatus::Skipped);

@@ -1,7 +1,7 @@
 use moon_action::*;
 use moon_action_pipeline::reports::estimate::{Estimate, TaskEstimate};
-use moon_common::Id;
 use moon_common::path::WorkspaceRelativePathBuf;
+use moon_common::{Id, SourceRootId};
 use moon_toolchain::ToolchainSpec;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -121,6 +121,7 @@ mod estimate {
                 Action {
                     duration: Some(Duration::new(10, 0)),
                     node: Arc::new(ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: SourceRootId::primary(),
                         toolchain: ToolchainSpec::system(),
                     })),
                     ..Action::default()
@@ -128,8 +129,9 @@ mod estimate {
                 Action {
                     duration: Some(Duration::new(25, 0)),
                     node: Arc::new(ActionNode::install_dependencies(InstallDependenciesNode {
+                        source_id: SourceRootId::primary(),
                         members: None,
-                        project_id: None,
+                        project_key: None,
                         root: WorkspaceRelativePathBuf::default(),
                         toolchain_id: Id::raw("system"),
                     })),
@@ -196,6 +198,7 @@ mod estimate {
                 Action {
                     duration: Some(Duration::new(10, 0)),
                     node: Arc::new(ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: SourceRootId::primary(),
                         toolchain: ToolchainSpec::system(),
                     })),
                     ..Action::default()
@@ -203,8 +206,9 @@ mod estimate {
                 Action {
                     duration: Some(Duration::new(25, 0)),
                     node: Arc::new(ActionNode::install_dependencies(InstallDependenciesNode {
+                        source_id: SourceRootId::primary(),
                         members: None,
-                        project_id: None,
+                        project_key: None,
                         root: WorkspaceRelativePathBuf::default(),
                         toolchain_id: Id::raw("system"),
                     })),
@@ -272,6 +276,7 @@ mod estimate {
                 Action {
                     duration: Some(Duration::new(10, 0)),
                     node: Arc::new(ActionNode::setup_toolchain(SetupToolchainNode {
+                        source_id: SourceRootId::primary(),
                         toolchain: ToolchainSpec::system(),
                     })),
                     ..Action::default()
@@ -279,8 +284,9 @@ mod estimate {
                 Action {
                     duration: Some(Duration::new(25, 0)),
                     node: Arc::new(ActionNode::install_dependencies(InstallDependenciesNode {
+                        source_id: SourceRootId::primary(),
                         members: None,
-                        project_id: None,
+                        project_key: None,
                         root: WorkspaceRelativePathBuf::default(),
                         toolchain_id: Id::raw("system"),
                     })),

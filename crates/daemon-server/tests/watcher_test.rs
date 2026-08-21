@@ -1,6 +1,7 @@
 // Tests for the file listener that dispatches events to registered watchers.
 
 use async_trait::async_trait;
+use moon_common::SourceRootId;
 use moon_daemon_server::start_file_listener;
 use moon_file_watcher::*;
 use std::path::PathBuf;
@@ -72,6 +73,7 @@ impl FileWatcher<TestState> for SecondRecordingWatcher {
 
 fn make_event(path: &str) -> FileEvent {
     FileEvent {
+        source_id: SourceRootId::primary(),
         path_original: PathBuf::from(path),
         path: path.into(),
         kind: EventKind::Any,

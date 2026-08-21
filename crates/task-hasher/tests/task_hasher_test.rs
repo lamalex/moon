@@ -9,6 +9,7 @@ use moon_config::{
 use moon_hash::ContentHasher;
 use moon_project::Project;
 use moon_project_graph::{ProjectGraph, ProjectNode};
+use moon_target::TaskInvocationKey;
 use moon_task::{ProjectKey, Task, TaskKey};
 use moon_task_graph::{GraphExpanderContext, TaskGraph, TaskNode};
 use moon_task_hasher::{TaskFingerprint, TaskHasher};
@@ -373,6 +374,25 @@ mod task_hasher {
 
         let config = HasherConfig::default();
         let mut hasher_a = TaskHasher::new(&app_a, &project_a, &task_a, &config);
+        let dependency_key = task_a.key();
+        hasher_a.hash_deps([
+            (
+                TaskInvocationKey::new(
+                    dependency_key.clone(),
+                    ["--mode=a"],
+                    Vec::<(&str, Option<&str>)>::new(),
+                ),
+                "a".into(),
+            ),
+            (
+                TaskInvocationKey::new(
+                    dependency_key,
+                    ["--mode=b"],
+                    Vec::<(&str, Option<&str>)>::new(),
+                ),
+                "b".into(),
+            ),
+        ]);
         hasher_a.hash_inputs().await.unwrap();
         let fingerprint_a = hasher_a.hash();
 
@@ -394,7 +414,8 @@ mod task_hasher {
                 .map(|(input, hash)| (&input.path, hash))
                 .collect::<Vec<_>>()
         );
-        assert_eq!(fingerprint_a.version, "4");
+        assert_eq!(fingerprint_a.version, "5");
+        assert_eq!(fingerprint_a.deps.len(), 2);
         assert_eq!(
             fingerprint_a.project_deps,
             [

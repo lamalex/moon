@@ -1,6 +1,7 @@
 mod utils;
 
 use moon_test_utils::{create_empty_moon_sandbox, predicates::prelude::*};
+use std::{fs, path::Path};
 
 mod sources {
     use super::*;
@@ -29,28 +30,141 @@ projects:
         sandbox.create_file(
             "apps/app/moon.yml",
             r"
+owners:
+  defaultOwner: '@primary-owner'
+  paths:
+    - '**/*'
+
 dependsOn:
   - id: lib
     sourceRoot: frontend
 
 tasks:
   build:
-    command: echo primary
+    command: bash
+    args: primary-build.sh
+    deps:
+      - target: ^:build
+        cacheStrategy: outputs
+    inputs:
+      - primary-build.sh
+    outputs:
+      - dist/app.txt
 ",
+        );
+        sandbox.create_file(
+            "apps/app/primary-build.sh",
+            r#"set -eu
+test -f ../../web/apps/lib/dist/lib.txt
+mkdir -p dist
+cp ../../web/apps/lib/dist/lib.txt dist/app.txt
+printf 'primary\n' >> ../../execution.log
+"#,
         );
         sandbox.create_file(
             "web/apps/app/moon.yml",
             r"
+owners:
+  defaultOwner: '@child-owner'
+  paths:
+    - '**/*'
+
 tasks:
   build:
-    command: echo child
+    command: bash
+    args: child-build.sh
     inputs:
+      - child-build.sh
       - file: changed.txt
         content: child
+    outputs:
+      - dist/child-app.txt
 ",
         );
-        sandbox.create_file("web/apps/lib/moon.yml", "{}");
+        sandbox.create_file(
+            "web/apps/app/child-build.sh",
+            r#"set -eu
+mkdir -p dist
+printf 'duplicate child app\n' > dist/child-app.txt
+printf 'child-app\n' >> ../../../execution.log
+"#,
+        );
+        sandbox.create_file(
+            "web/apps/lib/moon.yml",
+            r"
+tasks:
+  build:
+    command: bash
+    args: build.sh
+    inputs:
+      - build.sh
+      - input.txt
+    outputs:
+      - dist/lib.txt
+      - dist/cwd.txt
+",
+        );
+        sandbox.create_file(
+            "web/apps/lib/build.sh",
+            r#"set -eu
+mkdir -p dist
+cp input.txt dist/lib.txt
+pwd > dist/cwd.txt
+printf 'child-lib\n' >> ../../../execution.log
+"#,
+        );
+        sandbox.create_file("web/apps/lib/input.txt", "child v1\n");
         sandbox
+    }
+
+    fn create_codeowners_sources_sandbox() -> moon_test_utils::MoonSandbox {
+        let sandbox = create_sources_sandbox();
+        sandbox.create_file(
+            ".moon/workspace.yml",
+            r"
+id: acme/platform
+projects:
+  - apps/*
+workspaces:
+  frontend:
+    path: web
+codeowners:
+  sync: true
+",
+        );
+        sandbox.create_file(
+            "web/.moon/workspace.yml",
+            r"
+id: acme/web
+projects:
+  - apps/*
+codeowners:
+  sync: true
+",
+        );
+        sandbox
+    }
+
+    fn read(path: impl AsRef<Path>) -> String {
+        fs::read_to_string(path).unwrap()
+    }
+
+    fn read_task_hash(path: impl AsRef<Path>) -> String {
+        let state = read(path);
+        let hash = state
+            .split_once("\"hash\"")
+            .unwrap()
+            .1
+            .split_once(':')
+            .unwrap()
+            .1
+            .trim_start();
+
+        hash.trim_start_matches('"')
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned()
     }
 
     #[test]
@@ -79,6 +193,38 @@ tasks:
             .success()
             .stdout(predicate::str::contains("\"sourceId\": \"acme/platform\""))
             .stdout(predicate::str::contains("\"sourceId\": \"acme/web\""));
+    }
+
+    #[test]
+    fn primary_codeowners_only_include_primary_source_projects() {
+        let sandbox = create_codeowners_sources_sandbox();
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("run").arg("app:build");
+            })
+            .success();
+
+        let codeowners = read(sandbox.path().join(".github/CODEOWNERS"));
+
+        assert!(codeowners.contains("@primary-owner"));
+        assert!(!codeowners.contains("@child-owner"));
+    }
+
+    #[test]
+    fn child_codeowners_only_include_child_source_projects() {
+        let sandbox = create_codeowners_sources_sandbox();
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("run").arg("app:build");
+            })
+            .success();
+
+        let codeowners = read(sandbox.path().join("web/.github/CODEOWNERS"));
+
+        assert!(codeowners.contains("@child-owner"));
+        assert!(!codeowners.contains("@primary-owner"));
     }
 
     #[test]
@@ -121,8 +267,8 @@ tasks:
                 cmd.arg("tasks").arg("app").arg("--json");
             })
             .success()
-            .stdout(predicate::str::contains("\"primary\""))
-            .stdout(predicate::str::contains("\"child\"").not());
+            .stdout(predicate::str::contains("primary-build.sh"))
+            .stdout(predicate::str::contains("child-build.sh").not());
     }
 
     #[test]
@@ -147,8 +293,9 @@ tasks:
     }
 
     #[test]
-    fn resolves_cross_source_dependencies_without_enabling_cross_source_execution() {
+    fn resolves_and_executes_cross_source_dependencies() {
         let sandbox = create_sources_sandbox();
+        sandbox.enable_git();
 
         sandbox
             .run_bin(|cmd| {
@@ -181,8 +328,134 @@ tasks:
             .run_bin(|cmd| {
                 cmd.arg("run").arg("app:build");
             })
-            .success()
-            .stdout(predicate::str::contains("primary"));
+            .success();
+
+        let root = sandbox.path();
+        let primary_output = root.join("apps/app/dist/app.txt");
+        let child_output = root.join("web/apps/lib/dist/lib.txt");
+        let child_cwd = root.join("web/apps/lib/dist/cwd.txt");
+        let primary_state =
+            root.join(".moon/cache/states/tasks/acme-platform/app/build/lastRun.json");
+        let child_state = root.join("web/.moon/cache/states/tasks/acme-web/lib/build/lastRun.json");
+
+        assert_eq!(read(root.join("execution.log")), "child-lib\nprimary\n");
+        assert_eq!(read(&primary_output), "child v1\n");
+        assert_eq!(read(&child_output), "child v1\n");
+        assert_eq!(
+            fs::canonicalize(read(&child_cwd).trim()).unwrap(),
+            fs::canonicalize(root.join("web/apps/lib")).unwrap()
+        );
+        assert!(!root.join("web/apps/app/dist/child-app.txt").exists());
+        assert!(primary_state.exists());
+        assert!(child_state.exists());
+        assert_ne!(primary_state, child_state);
+
+        let primary_hash = read_task_hash(&primary_state);
+        let child_hash = read_task_hash(&child_state);
+        let primary_cache = root.join(format!(".moon/cache/outputs/{primary_hash}.tar.gz"));
+        let child_cache = root.join(format!("web/.moon/cache/outputs/{child_hash}.tar.gz"));
+
+        assert!(primary_cache.exists());
+        assert!(child_cache.exists());
+        assert_ne!(primary_cache, child_cache);
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("run").arg("app:build");
+            })
+            .success();
+
+        assert_eq!(read(root.join("execution.log")), "child-lib\nprimary\n");
+        assert_eq!(read_task_hash(&primary_state), primary_hash);
+        assert_eq!(read_task_hash(&child_state), child_hash);
+
+        fs::remove_file(&child_output).unwrap();
+        assert!(!child_output.exists());
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("run").arg("app:build");
+            })
+            .success();
+
+        assert_eq!(read(&child_output), "child v1\n");
+        assert_eq!(read(root.join("execution.log")), "child-lib\nprimary\n");
+        assert_eq!(read_task_hash(&primary_state), primary_hash);
+        assert_eq!(read_task_hash(&child_state), child_hash);
+    }
+
+    #[test]
+    fn runs_affected_primary_dependent_and_cross_source_dependency() {
+        let sandbox = create_sources_sandbox();
+        sandbox.enable_git();
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("run").arg("app:build");
+            })
+            .success();
+
+        fs::write(sandbox.path().join("execution.log"), "").unwrap();
+        sandbox.create_file("web/apps/lib/input.txt", "child v2\n");
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("run")
+                    .arg("app:build")
+                    .arg("--affected")
+                    .arg("--include-relations")
+                    .args(["--dependents", "deep"]);
+            })
+            .success();
+
+        assert_eq!(
+            read(sandbox.path().join("execution.log")),
+            "child-lib\nprimary\n"
+        );
+        assert_eq!(
+            read(sandbox.path().join("apps/app/dist/app.txt")),
+            "child v2\n"
+        );
+        assert!(
+            !sandbox
+                .path()
+                .join("web/apps/app/dist/child-app.txt")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn cross_source_dependency_outputs_invalidate_primary_hash() {
+        let sandbox = create_sources_sandbox();
+        sandbox.enable_git();
+        let primary_state = sandbox
+            .path()
+            .join(".moon/cache/states/tasks/acme-platform/app/build/lastRun.json");
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("run").arg("app:build");
+            })
+            .success();
+
+        let initial_hash = read_task_hash(&primary_state);
+        sandbox.create_file("web/apps/lib/input.txt", "child v2\n");
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("run").arg("app:build");
+            })
+            .success();
+
+        assert_ne!(read_task_hash(primary_state), initial_hash);
+        assert_eq!(
+            read(sandbox.path().join("apps/app/dist/app.txt")),
+            "child v2\n"
+        );
+        assert_eq!(
+            read(sandbox.path().join("execution.log")),
+            "child-lib\nprimary\nchild-lib\nprimary\n"
+        );
     }
 
     #[test]
