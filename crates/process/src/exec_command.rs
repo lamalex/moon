@@ -77,7 +77,7 @@ impl Command {
             })?
         };
 
-        let shared_child = registry.add_running(child).await;
+        let shared_child = registry.add_running_group(child).await;
 
         self.pre_log_command(&shared_child);
 
@@ -115,7 +115,7 @@ impl Command {
             error: Box::new(error),
         })?;
 
-        let shared_child = registry.add_running(child).await;
+        let shared_child = registry.add_running_group(child).await;
         let stdin = shared_child.take_stdin().await;
         let stdout = shared_child.take_stdout().await;
         let stderr = shared_child.take_stderr().await;
@@ -210,7 +210,7 @@ impl Command {
             })?
         };
 
-        let shared_child = registry.add_running(child).await;
+        let shared_child = registry.add_running_group(child).await;
 
         self.pre_log_command(&shared_child);
 
@@ -266,7 +266,7 @@ impl Command {
             self.write_input_to_child(&mut child).await?;
         }
 
-        let shared_child = registry.add_running(child).await;
+        let shared_child = registry.add_running_group(child).await;
 
         self.pre_log_command(&shared_child);
 
@@ -379,7 +379,7 @@ impl Command {
             self.write_input_to_child(&mut child).await?;
         }
 
-        let shared_child = registry.add_running(child).await;
+        let shared_child = registry.add_running_group(child).await;
 
         self.pre_log_command(&shared_child);
 
@@ -523,7 +523,15 @@ impl Command {
     }
 
     fn create_async_command(&self) -> miette::Result<TokioCommand> {
-        Ok(TokioCommand::from(self.create_sync_command()?))
+        let mut command = self.create_sync_command()?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
+        Ok(TokioCommand::from(command))
     }
 
     pub(crate) fn handle_nonzero_status(

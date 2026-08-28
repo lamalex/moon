@@ -1,5 +1,5 @@
 use crate::lookup::*;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use mimalloc::MiMalloc;
 use moon_app::commands::daemon::DaemonCommands;
 use moon_app::commands::debug::DebugCommands;
@@ -23,6 +23,13 @@ use tracing::debug;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+const VERSION_OUTPUT: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("MOON_BUILD_REVISION"),
+    ")"
+);
 
 /// The conventional exit code for a process killed by SIGPIPE (128 + 13).
 /// Rust ignores SIGPIPE by default, so a closed consumer surfaces as
@@ -130,7 +137,10 @@ pub async fn run_cli(args: Vec<OsString>) -> MainResult {
     let version = get_version();
 
     // Create the CLI
-    let cli = Cli::parse_from(&args);
+    let matches = Cli::command()
+        .version(VERSION_OUTPUT)
+        .get_matches_from(&args);
+    let cli = Cli::from_arg_matches(&matches).expect("valid CLI arguments");
     cli.setup_env_vars();
 
     // Setup diagnostics and tracing

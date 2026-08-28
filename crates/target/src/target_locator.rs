@@ -1,7 +1,7 @@
 use crate::target::Target;
 use crate::target_error::TargetError;
 use crate::target_scope::TargetProjectScope;
-use moon_common::Id;
+use moon_common::{Id, SourceRootId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::str::FromStr;
 
@@ -18,6 +18,14 @@ pub enum TargetLocator {
         task_glob: String,
     },
 
+    // ::task, source::task, source::project:task
+    SourceQualified {
+        original: String,
+        source: Option<SourceRootId>,
+        project: Option<Id>,
+        task: Id,
+    },
+
     // scope:task_id
     Qualified(Target),
 }
@@ -30,13 +38,16 @@ impl TargetLocator {
     pub fn is_fully_qualified(&self) -> bool {
         match self {
             Self::Qualified(target) => target.is_fully_qualified(),
+            Self::SourceQualified { project, .. } => project.is_some(),
             _ => false,
         }
     }
 
     #[tracing::instrument(name = "parse_target_locator")]
     pub fn parse(value: &str) -> miette::Result<TargetLocator> {
-        if value.contains(':') {
+        if value.contains("::") {
+            Self::parse_source_qualified(value)
+        } else if value.contains(':') {
             if value.contains(['*', '?', '[', ']', '{', '}', '!']) || value.contains("...") {
                 let (base_project, base_task) = value.split_once(':').unwrap();
 
@@ -49,6 +60,41 @@ impl TargetLocator {
         } else {
             Ok(TargetLocator::DefaultProject(Id::new(value)?))
         }
+    }
+
+    fn parse_source_qualified(value: &str) -> miette::Result<TargetLocator> {
+        let Some((source, target)) = value.split_once("::") else {
+            unreachable!();
+        };
+        let invalid = || TargetError::InvalidFormat(value.to_owned());
+
+        if target.is_empty() || target.contains("::") {
+            return Err(invalid().into());
+        }
+
+        let (project, task) = if let Some((project, task)) = target.split_once(':') {
+            if source.is_empty() || project.is_empty() || task.is_empty() || task.contains(':') {
+                return Err(invalid().into());
+            }
+
+            (
+                Some(Id::new(project).map_err(|_| invalid())?),
+                Id::new(task).map_err(|_| invalid())?,
+            )
+        } else {
+            (None, Id::new(target).map_err(|_| invalid())?)
+        };
+
+        Ok(Self::SourceQualified {
+            original: value.to_owned(),
+            source: if source.is_empty() {
+                None
+            } else {
+                Some(SourceRootId::new(source).map_err(|_| invalid())?)
+            },
+            project,
+            task,
+        })
     }
 
     fn parse_glob(
@@ -92,6 +138,7 @@ impl AsRef<str> for TargetLocator {
             Self::DefaultProject(id) => id.as_str(),
             Self::GlobMatch { original, .. } => original.as_str(),
             Self::Qualified(target) => target.as_str(),
+            Self::SourceQualified { original, .. } => original.as_str(),
         }
     }
 }

@@ -73,12 +73,37 @@ These scopes are only available on the command line when running tasks with `moo
 ### All projects
 
 For situations where you want to run a specific target in _all_ projects, for example `lint`ing, you
-can utilize the all projects scope by omitting the project name from the target: `:lint`.
+can utilize the all projects scope by omitting the project name from the target: `:lint`. This scope
+only selects projects in the current workspace.
 
 ```shell
 # Run `lint` in all projects
 $ moon run :lint
 ```
+
+### All workspaces
+
+When the current workspace has discovered additional workspaces, use `::task` to select matching
+tasks from every project in the composed graph.
+
+```shell
+# Run `lint` in all projects across all discovered workspaces
+$ moon run ::lint
+```
+
+To select one discovered workspace, prefix the target with its local alias or canonical ID. A
+source-qualified project may also be provided.
+
+```shell
+# Run `lint` in all projects in the `frontend` workspace
+$ moon run frontend::lint
+
+# Run `lint` in the `app` project in the `frontend` workspace
+$ moon run frontend::app:lint
+```
+
+Source-qualified targets are command locators only and cannot be used in task dependency
+configuration. Dependencies cross workspace boundaries through a project's `sourceRoot`.
 
 ### Closest project `~`<VersionLabel version="1.33.0" />
 

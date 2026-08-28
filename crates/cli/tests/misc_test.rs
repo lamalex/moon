@@ -6,6 +6,22 @@ mod cli {
     use super::*;
 
     #[test]
+    fn prints_build_revision_in_version() {
+        let sandbox = create_empty_moon_sandbox();
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("--version");
+            })
+            .success()
+            .stdout(predicate::str::starts_with(format!(
+                "moon {} (",
+                env!("CARGO_PKG_VERSION")
+            )))
+            .stdout(predicate::str::ends_with(")\n"));
+    }
+
+    #[test]
     fn fails_on_version_constraint() {
         let sandbox = create_empty_moon_sandbox();
 

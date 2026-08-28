@@ -191,7 +191,7 @@ impl ActionPipeline {
         let signal_handle = self.monitor_signals(cancel_token.clone());
 
         // Dispatch jobs from the graph to run actions
-        let queue_handle = self.dispatch_jobs(action_graph, job_context.clone())?;
+        let mut queue_handle = self.dispatch_jobs(action_graph, job_context.clone())?;
 
         // Wait and receive all results coming through
         debug!("Waiting for jobs to return results");
@@ -200,9 +200,19 @@ impl ActionPipeline {
         let mut actions = vec![];
         let mut error = None;
 
-        while let Some(mut action) = receiver.recv().await {
+        loop {
+            let Some(mut action) = (tokio::select! {
+                action = receiver.recv() => action,
+                _ = cancel_token.cancelled() => {
+                    debug!("Cancelling pipeline (because a signal)");
+                    receiver.close();
+                    None
+                }
+            }) else {
+                break;
+            };
+
             if job_context.should_abort(&action) {
-                process_registry.terminate_running();
                 abort_token.cancel();
             }
 
@@ -212,21 +222,18 @@ impl ActionPipeline {
             // are typically fallout from running in the already-broken state.
             // Jobs that were aborted because a sibling failed carry no error
             // of their own, and may arrive before the failing sibling
-            if action.should_abort() && action.has_error() && error.is_none() {
+            if job_context.should_abort(&action) && action.has_error() && error.is_none() {
                 error = Some(action.get_error());
             }
 
             actions.push(action);
 
-            if abort_token.is_cancelled() {
+            // Wait for the originating failure instead of allowing an aborted
+            // sibling to close the channel before the error is received.
+            if abort_token.is_cancelled() && error.is_some() {
                 debug!("Aborting pipeline (because something failed)");
 
                 self.status = ActionPipelineStatus::Aborted;
-                receiver.close();
-            } else if cancel_token.is_cancelled() {
-                debug!("Cancelling pipeline (because a signal)");
-
-                self.status = ActionPipelineStatus::Interrupted;
                 receiver.close();
             } else if actions.len() == total_actions {
                 debug!("Finished pipeline, received all results");
@@ -249,13 +256,18 @@ impl ActionPipeline {
             signal_handle.abort();
         }
 
-        // Wait for running child processes to exit
-        process_registry.wait_for_running_to_shutdown().await;
-
-        // Abort any running actions in progress
+        // Stop action futures before terminating processes so that no new child
+        // can be spawned after the registry takes its shutdown snapshot.
         if !matches!(self.status, ActionPipelineStatus::Completed) {
             if self.bail {
                 queue_handle.abort();
+
+                if tokio::time::timeout(Duration::from_secs(1), &mut queue_handle)
+                    .await
+                    .is_err()
+                {
+                    warn!("Timed out waiting for the aborted action dispatcher");
+                }
             } else {
                 let mut job_handles = queue_handle.await.into_diagnostic()?;
 
@@ -265,7 +277,16 @@ impl ActionPipeline {
                     job_handles.shutdown().await;
                 }
             }
+
+            // Internal failure shutdown must not use the OS signal channel, as
+            // doing so consumes the one-shot Ctrl-C listeners.
+            process_registry
+                .shutdown_running(SignalType::Terminate)
+                .await;
         }
+
+        // Wait for running child processes to exit
+        process_registry.wait_for_running_to_shutdown().await;
 
         self.actions = actions;
         self.duration = Some(start.elapsed());

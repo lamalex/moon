@@ -251,6 +251,174 @@ codeowners:
     }
 
     #[test]
+    fn local_all_scope_only_selects_primary_source_tasks() {
+        let sandbox = create_sources_sandbox();
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("run").arg(":build");
+            })
+            .success();
+
+        assert_eq!(
+            read(sandbox.path().join("execution.log")),
+            "child-lib\nprimary\n"
+        );
+        assert!(sandbox.path().join("apps/app/dist/app.txt").exists());
+        assert!(sandbox.path().join("web/apps/lib/dist/lib.txt").exists());
+        assert!(
+            !sandbox
+                .path()
+                .join("web/apps/app/dist/child-app.txt")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn aggregate_all_scope_selects_primary_and_child_source_tasks() {
+        let sandbox = create_sources_sandbox();
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("run").arg("::build");
+            })
+            .success();
+
+        let lines = read(sandbox.path().join("execution.log"))
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.iter().filter(|line| *line == "primary").count(), 1);
+        assert_eq!(lines.iter().filter(|line| *line == "child-app").count(), 1);
+        assert_eq!(lines.iter().filter(|line| *line == "child-lib").count(), 1);
+        assert!(
+            lines.iter().position(|line| line == "child-lib")
+                < lines.iter().position(|line| line == "primary")
+        );
+        assert!(sandbox.path().join("apps/app/dist/app.txt").exists());
+        assert!(
+            sandbox
+                .path()
+                .join("web/apps/app/dist/child-app.txt")
+                .exists()
+        );
+        assert!(sandbox.path().join("web/apps/lib/dist/lib.txt").exists());
+    }
+
+    #[test]
+    fn source_alias_scope_selects_only_child_source_tasks() {
+        let sandbox = create_sources_sandbox();
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("run").arg("frontend::build");
+            })
+            .success();
+
+        let mut lines = read(sandbox.path().join("execution.log"))
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        lines.sort();
+
+        assert_eq!(lines, ["child-app", "child-lib"]);
+        assert!(!sandbox.path().join("apps/app/dist/app.txt").exists());
+    }
+
+    #[test]
+    fn canonical_source_and_project_scope_selects_exact_child_task() {
+        let sandbox = create_sources_sandbox();
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("run").arg("acme/web::app:build");
+            })
+            .success();
+
+        assert_eq!(read(sandbox.path().join("execution.log")), "child-app\n");
+        assert!(
+            sandbox
+                .path()
+                .join("web/apps/app/dist/child-app.txt")
+                .exists()
+        );
+        assert!(!sandbox.path().join("apps/app/dist/app.txt").exists());
+        assert!(!sandbox.path().join("web/apps/lib/dist/lib.txt").exists());
+    }
+
+    #[test]
+    fn aggregate_affected_execution_preserves_source_identity() {
+        let sandbox = create_sources_sandbox();
+        sandbox.enable_git();
+        sandbox.create_file("web/apps/app/changed.txt", "child change");
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("run").arg("::build").arg("--affected");
+            })
+            .success();
+
+        assert_eq!(read(sandbox.path().join("execution.log")), "child-app\n");
+        assert!(
+            sandbox
+                .path()
+                .join("web/apps/app/dist/child-app.txt")
+                .exists()
+        );
+        assert!(!sandbox.path().join("apps/app/dist/app.txt").exists());
+        assert!(!sandbox.path().join("web/apps/lib/dist/lib.txt").exists());
+    }
+
+    #[test]
+    fn aggregate_failure_terminates_running_sibling_tasks() {
+        let sandbox = create_sources_sandbox();
+        sandbox.create_file("apps/app/primary-build.sh", "set -eu\nexit 1\n");
+        sandbox.create_file(
+            "web/apps/app/child-build.sh",
+            "set -eu\nsleep 30\nprintf 'child-app\\n' >> ../../../execution.log\n",
+        );
+        let start = std::time::Instant::now();
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("run").arg("::build");
+            })
+            .failure();
+
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "aggregate failure did not terminate running sibling tasks"
+        );
+    }
+
+    #[test]
+    fn aggregate_failure_returns_after_other_tasks_are_cached() {
+        let sandbox = create_sources_sandbox();
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("run").arg("::build");
+            })
+            .success();
+
+        sandbox.create_file("web/apps/app/child-build.sh", "set -eu\nexit 1\n");
+        let start = std::time::Instant::now();
+
+        sandbox
+            .run_bin(|cmd| {
+                cmd.arg("run").arg("::build");
+            })
+            .failure();
+
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "aggregate failure did not return after cached sibling tasks"
+        );
+    }
+
+    #[test]
     fn aggregates_duplicate_tasks_without_changing_positional_resolution() {
         let sandbox = create_sources_sandbox();
 

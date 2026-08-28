@@ -454,16 +454,14 @@ source-local synchronization from genuinely process-global setup.
 
 ## Open Questions
 
-1. What syntax qualifies a project or target with a canonical source ID or local alias?
-2. Should all-source execution require a flag, a target scope, or both?
-3. How are source IDs and ambiguous project IDs rendered in existing JSON and DOT graph output?
-4. When should recursive discovery be enabled, and how is it explicitly opted into?
-5. How are plugin registries and toolchain configuration shared or isolated between sources?
-6. Which setup actions are source-local, and which remain process-global?
-7. How should graph cache composition work when only one source changes?
-8. How should watchers and the daemon invalidate one source without rebuilding unrelated sources?
-9. What explicit migration experience is provided when a durable source ID is renamed?
-10. Should two checked-out versions of the same canonical workspace ever coexist in one graph?
+1. How are source IDs and ambiguous project IDs rendered in existing JSON and DOT graph output?
+2. When should recursive discovery be enabled, and how is it explicitly opted into?
+3. How are plugin registries and toolchain configuration shared or isolated between sources?
+4. Which setup actions are source-local, and which remain process-global?
+5. How should graph cache composition work when only one source changes?
+6. How should watchers and the daemon invalidate one source without rebuilding unrelated sources?
+7. What explicit migration experience is provided when a durable source ID is renamed?
+8. Should two checked-out versions of the same canonical workspace ever coexist in one graph?
 
 ## Success Criteria
 
@@ -476,3 +474,5 @@ Manymoons is complete when:
   source context.
 - Single-source workspaces retain existing command and configuration semantics.
 - Adding a source does not broaden an unqualified command without explicit user intent.
+- `::task` explicitly selects matching tasks across all composed sources, while `source::task` and
+  `source::project:task` constrain selection to a source alias or canonical source ID.

@@ -54,7 +54,15 @@ mod unix {
     }
 
     pub fn kill(pid: u32, signal: SignalType) -> io::Result<()> {
-        let result = unsafe { libc::kill(pid as i32, signal.get_code()) };
+        kill_id(pid as i32, signal)
+    }
+
+    pub fn kill_process_group(pid: u32, signal: SignalType) -> io::Result<()> {
+        kill_id(-(pid as i32), signal)
+    }
+
+    fn kill_id(id: i32, signal: SignalType) -> io::Result<()> {
+        let result = unsafe { libc::kill(id, signal.get_code()) };
 
         if result != 0 {
             let error = io::Error::last_os_error();

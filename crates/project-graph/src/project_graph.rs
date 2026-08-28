@@ -79,6 +79,9 @@ pub struct ProjectGraph {
     /// Map of source-qualified aliases to canonical project keys.
     pub aliases: FxHashMap<(SourceRootId, String), ProjectKey>,
 
+    /// Map of coordinator-local source aliases to canonical source IDs.
+    source_aliases: FxHashMap<SourceAlias, SourceRootId>,
+
     /// Canonical key of the default project.
     pub default_key: Option<ProjectKey>,
 
@@ -149,6 +152,7 @@ impl ProjectGraph {
         let mut aggregate = Self::new(context);
         aggregate.contexts.clear();
         aggregate.default_key = primary.default_key.clone();
+        aggregate.source_aliases = source_aliases.clone();
 
         let mut graph = DiGraph::new();
         let mut indexes_by_key = FxHashMap::default();
@@ -904,6 +908,31 @@ impl ProjectGraph {
         self.resolve_key(self.context.sources.primary_id(), id_or_alias)
             .map(|key| key.project_id().clone())
             .unwrap_or_else(|_| Id::raw(id_or_alias))
+    }
+
+    /// Resolve a canonical source ID or coordinator-local source alias.
+    pub fn resolve_source_id(&self, id_or_alias: &str) -> miette::Result<SourceRootId> {
+        let candidate = SourceRootId::new(id_or_alias)?;
+
+        if candidate == SourceRootId::primary() {
+            return Ok(self.context.sources.primary_id().clone());
+        }
+
+        if self.context.sources.get(&candidate).is_ok() {
+            return Ok(candidate);
+        }
+
+        if let Some((_, source_id)) = self
+            .source_aliases
+            .iter()
+            .find(|(alias, _)| alias.as_str() == id_or_alias)
+        {
+            return Ok(source_id.clone());
+        }
+
+        self.context.sources.get(&candidate)?;
+
+        unreachable!()
     }
 
     /// Resolve an ID or alias within a source to its canonical key.

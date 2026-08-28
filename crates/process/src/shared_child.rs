@@ -20,6 +20,8 @@ pub struct SharedChild {
     inner: Arc<Mutex<Child>>,
     signal: Arc<OnceLock<SignalType>>,
     pid: u32,
+    #[cfg(unix)]
+    process_group: bool,
     #[cfg(windows)]
     handle: RawHandle,
 }
@@ -30,6 +32,17 @@ impl SharedChild {
         Self {
             pid: child.id().unwrap(),
             inner: Arc::new(Mutex::new(child)),
+            process_group: false,
+            signal: Arc::new(OnceLock::new()),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn new_grouped(child: Child) -> Self {
+        Self {
+            pid: child.id().unwrap(),
+            inner: Arc::new(Mutex::new(child)),
+            process_group: true,
             signal: Arc::new(OnceLock::new()),
         }
     }
@@ -71,9 +84,22 @@ impl SharedChild {
     pub async fn kill_with_signal(&self, signal: SignalType) -> io::Result<ChildExit> {
         self.signal.get_or_init(|| signal);
 
+        self.send_signal(signal)?;
+
+        // Acquire the child _after_ the kill command, otherwise it waits for
+        // the command to finish running before killing, because the lock is
+        // currently owned by `wait` or `wait_with_output`!
+        self.wait().await
+    }
+
+    pub(crate) fn send_signal(&self, signal: SignalType) -> io::Result<()> {
         #[cfg(unix)]
         {
-            kill(self.pid, signal)?;
+            if self.process_group {
+                kill_process_group(self.pid, signal)?;
+            } else {
+                kill(self.pid, signal)?;
+            }
         }
 
         #[cfg(windows)]
@@ -81,10 +107,7 @@ impl SharedChild {
             kill(self.pid, self.handle.clone(), signal)?;
         }
 
-        // Acquire the child _after_ the kill command, otherwise it waits for
-        // the command to finish running before killing, because the lock is
-        // currently owned by `wait` or `wait_with_output`!
-        self.wait().await
+        Ok(())
     }
 
     pub(crate) async fn wait(&self) -> io::Result<ChildExit> {

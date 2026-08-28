@@ -1,4 +1,4 @@
-use moon_common::Id;
+use moon_common::{Id, SourceRootId};
 use moon_target::*;
 
 mod target_locator {
@@ -28,6 +28,53 @@ mod target_locator {
                     task_glob: String::from("build"),
                 }
             );
+        }
+
+        #[test]
+        fn all_sources_scope() {
+            assert_eq!(
+                TargetLocator::parse("::build").unwrap(),
+                TargetLocator::SourceQualified {
+                    original: String::from("::build"),
+                    source: None,
+                    project: None,
+                    task: Id::raw("build"),
+                }
+            );
+        }
+
+        #[test]
+        fn source_scope() {
+            assert_eq!(
+                TargetLocator::parse("frontend::build").unwrap(),
+                TargetLocator::SourceQualified {
+                    original: String::from("frontend::build"),
+                    source: Some(SourceRootId::new("frontend").unwrap()),
+                    project: None,
+                    task: Id::raw("build"),
+                }
+            );
+        }
+
+        #[test]
+        fn source_and_project_scope() {
+            let locator = TargetLocator::parse("acme/web::app:build").unwrap();
+
+            assert_eq!(
+                locator,
+                TargetLocator::SourceQualified {
+                    original: String::from("acme/web::app:build"),
+                    source: Some(SourceRootId::new("acme/web").unwrap()),
+                    project: Some(Id::raw("app")),
+                    task: Id::raw("build"),
+                }
+            );
+            assert!(locator.is_fully_qualified());
+        }
+
+        #[test]
+        fn rejects_project_without_source() {
+            assert!(TargetLocator::parse("::app:build").is_err());
         }
 
         #[test]

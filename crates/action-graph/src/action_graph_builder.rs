@@ -1166,6 +1166,77 @@ impl<'query> ActionGraphBuilder<'query> {
                         .await?,
                 );
             }
+            TargetLocator::SourceQualified {
+                source,
+                project,
+                task,
+                ..
+            } => {
+                let graph = &self.aggregate_workspace_graph;
+                let source_id = source
+                    .as_ref()
+                    .map(|source| graph.projects.resolve_source_id(source.as_str()))
+                    .transpose()?;
+
+                if let Some(project_id) = project {
+                    let source_id = source_id
+                        .as_ref()
+                        .expect("Source-qualified projects require a source.");
+                    let project_key = graph.projects.resolve_key(source_id, project_id.as_str())?;
+
+                    // Validate the project independently so an unknown project does not
+                    // surface as an unknown task.
+                    graph.get_project_by_key(&project_key)?;
+
+                    let task_key = TaskKey::new(project_key, task.clone())?;
+                    let project_task = graph.get_task_by_key(&task_key)?;
+
+                    if !allow_internal && project_task.is_internal() {
+                        return Err(ProjectError::UnknownTask {
+                            task_id: task.to_string(),
+                            project_id: project_id.to_string(),
+                        }
+                        .into());
+                    }
+
+                    tasks.push(project_task);
+                } else {
+                    let queried_projects = if let Some(all_query) = &self.all_query {
+                        Some(
+                            graph
+                                .query_projects_with_keys(all_query)?
+                                .into_iter()
+                                .map(|(key, _)| key)
+                                .collect::<FxHashSet<_>>(),
+                        )
+                    } else {
+                        None
+                    };
+
+                    for (task_key, project_task) in graph.get_all_tasks_with_keys()? {
+                        if task_key.task_id() != task {
+                            continue;
+                        }
+
+                        if source_id.as_ref().is_some_and(|source_id| {
+                            task_key.project_key().source_id() != source_id
+                        }) {
+                            continue;
+                        }
+
+                        if queried_projects
+                            .as_ref()
+                            .is_some_and(|projects| !projects.contains(task_key.project_key()))
+                        {
+                            continue;
+                        }
+
+                        if allow_internal || !project_task.is_internal() {
+                            tasks.push(project_task);
+                        }
+                    }
+                }
+            }
             TargetLocator::DefaultProject(task_id) => {
                 let project = self.workspace_graph.get_default_project().map_err(|_| {
                     ProjectGraphError::NoDefaultProjectForTask {

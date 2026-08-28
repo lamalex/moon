@@ -66,6 +66,19 @@ impl ProcessRegistry {
     pub async fn add_running(&self, child: Child) -> SharedChild {
         let shared = SharedChild::new(child);
 
+        self.add_shared(shared).await
+    }
+
+    pub async fn add_running_group(&self, child: Child) -> SharedChild {
+        #[cfg(unix)]
+        let shared = SharedChild::new_grouped(child);
+        #[cfg(windows)]
+        let shared = SharedChild::new(child);
+
+        self.add_shared(shared).await
+    }
+
+    async fn add_shared(&self, shared: SharedChild) -> SharedChild {
         self.running
             .write()
             .await
@@ -92,6 +105,32 @@ impl ProcessRegistry {
 
     pub fn terminate_running(&self) {
         let _ = self.signal_sender.send(SignalType::Terminate);
+    }
+
+    /// Shut down child processes without broadcasting an OS-level signal event.
+    pub async fn shutdown_running(&self, signal: SignalType) {
+        let processes = Arc::clone(&self.running);
+
+        if self.threshold == 0 {
+            shutdown_processes(signal, processes, self.threshold).await;
+            return;
+        }
+
+        let timeout = Duration::from_millis(self.threshold as u64 + 1000);
+
+        if tokio::time::timeout(
+            timeout,
+            shutdown_processes(signal, Arc::clone(&processes), self.threshold),
+        )
+        .await
+        .is_err()
+        {
+            warn!(
+                timeout_ms = timeout.as_millis(),
+                "Timed out shutting down child processes; force killing remaining processes"
+            );
+            force_kill_processes(processes).await;
+        }
     }
 
     pub async fn wait_for_running_to_shutdown(&self) {
@@ -129,6 +168,14 @@ async fn shutdown_processes_from_signal(
 ) {
     let signal = receiver.recv().await.unwrap_or(SignalType::Kill);
 
+    shutdown_processes(signal, processes, threshold).await;
+}
+
+async fn shutdown_processes(
+    signal: SignalType,
+    processes: Arc<RwLock<FxHashMap<u32, SharedChild>>>,
+    threshold: u32,
+) {
     // Clone the children, otherwise we encounter a deadlock when the
     // tasks try to acquire a write lock while it is being read
     let children = { processes.read().await.clone() };
@@ -222,5 +269,21 @@ async fn kill_processes(processes: Arc<RwLock<FxHashMap<u32, SharedChild>>>) {
     }
 
     set.join_all().await;
+    processes.write().await.clear();
+}
+
+async fn force_kill_processes(processes: Arc<RwLock<FxHashMap<u32, SharedChild>>>) {
+    let children = { processes.read().await.clone() };
+
+    for (pid, child) in children {
+        if let Err(error) = child.send_signal(SignalType::Kill) {
+            warn!(
+                pid,
+                error = error.to_string(),
+                "Failed to force kill child process"
+            );
+        }
+    }
+
     processes.write().await.clear();
 }

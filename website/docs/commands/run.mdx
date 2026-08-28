@@ -19,6 +19,12 @@ $ moon run client:dev server:dev
 # Run `test` in all projects
 $ moon run :test
 
+# Run `test` in all projects across all discovered workspaces
+$ moon run ::test
+
+# Run `test` in all projects in the `frontend` workspace
+$ moon run frontend::test
+
 # Run `test` in the closest project, relative to the current working directory
 $ moon run '~:test'
 

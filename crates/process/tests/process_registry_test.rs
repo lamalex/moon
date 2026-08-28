@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use moon_process::ProcessRegistry;
+use moon_process::{ProcessRegistry, SignalType};
 use std::sync::Arc;
 use tokio::process::{Child, Command};
 
@@ -40,10 +40,27 @@ mod process_registry {
         let shared = registry.add_running(spawn_sleep()).await;
         let pid = shared.id();
 
-        registry.terminate_running();
+        registry.shutdown_running(SignalType::Terminate).await;
         registry.wait_for_running_to_shutdown().await;
 
         assert!(registry.get_running_by_pid(pid).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn internal_shutdown_does_not_broadcast_an_os_signal() {
+        let registry = ProcessRegistry::new(2000);
+        let mut signals = registry.receive_signal();
+        let shared = registry.add_running(spawn_sleep()).await;
+        let pid = shared.id();
+
+        registry.shutdown_running(SignalType::Terminate).await;
+
+        assert!(registry.get_running_by_pid(pid).await.is_none());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), signals.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
